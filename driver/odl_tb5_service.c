@@ -14,10 +14,15 @@
  * Also handles module parameters: ring_size, loopback, protocol, e2e.
  */
 
+#include <linux/debugfs.h>
+
 #include "odl_tb5_core.h"
 
 LIST_HEAD(odl_tb5_devices_list);
 DEFINE_MUTEX(odl_tb5_devices_lock);
+
+/* Module-global debugfs root — parent of the per-device stat dirs. */
+struct dentry *odl_tb5_debugfs_root;
 
 static DEFINE_IDA(odl_tb5_ida);
 
@@ -192,6 +197,20 @@ static void odl_tb5_remove(struct tb_service *svc)
 
 	odl_tb5_rings_stop(dev);
 
+	/* Disable the DMA paths while rings and hopids are still valid —
+	 * rings_free() below NULLs the rings and releases local_tx_hopid,
+	 * which would make this call a no-op and leave stale paths in the
+	 * routers (breaks the next module load until a controller reset). */
+	if (saved_state == ODL_TB5_STATE_CONNECTED ||
+	    saved_state == ODL_TB5_STATE_READY) {
+		tb_xdomain_disable_paths(dev->xd,
+					 dev->local_tx_hopid,
+					 dev->tx.ring ? dev->tx.ring->hop : -1,
+					 dev->remote_tx_hopid,
+					 dev->rx.ring ? dev->rx.ring->hop : -1);
+		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
+	}
+
 	synchronize_rcu();
 
 	mutex_lock(&odl_tb5_devices_lock);
@@ -205,16 +224,6 @@ static void odl_tb5_remove(struct tb_service *svc)
 	odl_tb5_batch_pool_free(dev);
 	odl_tb5_dma_bufs_free(dev);
 	odl_tb5_rings_free(dev);
-
-	if (saved_state == ODL_TB5_STATE_CONNECTED ||
-	    saved_state == ODL_TB5_STATE_READY) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring ? dev->tx.ring->hop : -1,
-					 dev->remote_tx_hopid,
-					 dev->rx.ring ? dev->rx.ring->hop : -1);
-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
-	}
 
 	odl_tb5_chardev_destroy(dev);
 
@@ -247,6 +256,10 @@ static int __init odl_tb5_init(void)
 	ret = odl_tb5_chardev_init();
 	if (ret)
 		return ret;
+
+	/* Create the debugfs root before any device probe so per-device
+	 * subdirs have a parent. Non-fatal if debugfs is unavailable. */
+	odl_tb5_debugfs_root = debugfs_create_dir("odl_tb5", NULL);
 
 	/* If loopback=1 or more, create software-only devices.
 	 * Loopback devices work without Thunderbolt hardware and
@@ -342,6 +355,8 @@ err_dir:
 	}
 	tb_property_free_dir(odl_tb5_property_dir);
 err_chardev:
+	debugfs_remove_recursive(odl_tb5_debugfs_root);
+	odl_tb5_debugfs_root = NULL;
 	odl_tb5_chardev_exit();
 	return ret;
 }
@@ -401,6 +416,8 @@ static void __exit odl_tb5_exit(void)
 		tb_property_free_dir(odl_tb5_apple_property_dir);
 	}
 out:
+	debugfs_remove_recursive(odl_tb5_debugfs_root);
+	odl_tb5_debugfs_root = NULL;
 	odl_tb5_chardev_exit();
 	ida_destroy(&odl_tb5_ida);
 	pr_info("odl_tb5: OdinLink TB5 driver unloaded\n");

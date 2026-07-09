@@ -226,6 +226,52 @@ struct odl_tb5_ring_ctx {
 	bool			swapped_since_post;
 };
 
+/* ── Observability counters (debugfs-exported) ───────────────────────── */
+
+/*
+ * Single source of truth for the per-device statistics counters.  The
+ * X-macro is expanded three times: once to declare the atomic64_t struct
+ * members, once to print them in the debugfs seq_file, and once to zero
+ * them on reset.  This guarantees the three lists never drift apart.
+ */
+#define ODL_TB5_STATS_FIELDS(X)			\
+	/* TX path */				\
+	X(tx_send_calls)			\
+	X(tx_bytes_submitted)			\
+	X(tx_frames_submitted)			\
+	X(tx_frames_completed)			\
+	X(tx_frames_canceled)			\
+	/* RX path */				\
+	X(rx_frames_legacy)			\
+	X(rx_frames_seen)			\
+	X(rx_frames_canceled)			\
+	X(rx_frames_ctrl)			\
+	X(rx_frames_stream)			\
+	X(rx_frames_no_stream)			\
+	X(rx_frames_runt)			\
+	X(rx_asm_start)				\
+	X(rx_asm_reset_incomplete)		\
+	X(rx_asm_grow_fail)			\
+	X(rx_asm_append_skipped)		\
+	X(rx_msgs_enqueued)			\
+	X(rx_bytes_enqueued)			\
+	X(rx_msgs_drop_overflow)		\
+	X(rx_msgs_drop_alloc)			\
+	X(rx_repost_pool_empty)			\
+	X(rx_repost_ring_fail)
+
+struct odl_tb5_stats {
+#define ODL_TB5_STATS_DECL(name)	atomic64_t name;
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_DECL)
+#undef ODL_TB5_STATS_DECL
+};
+
+/* Hot-path counter helpers — plain atomic64 ops, no locking. */
+#define ODL_STAT_INC(dev, field)	\
+	atomic64_inc(&(dev)->stats.field)
+#define ODL_STAT_ADD(dev, field, n)	\
+	atomic64_add((n), &(dev)->stats.field)
+
 /* ── Main device structure ───────────────────────────────────────────── */
 
 struct odl_tb5_device {
@@ -302,6 +348,10 @@ struct odl_tb5_device {
 
 	struct list_head	list;
 
+	/* Observability counters + per-device debugfs directory */
+	struct odl_tb5_stats	stats;
+	struct dentry		*dbg_dir;
+
     /* Cleanup synchronization — set to true when remove begins.
      * Used by callbacks for early exit during module unload,
      * preventing use-after-free after the device memory is released. */
@@ -311,6 +361,10 @@ struct odl_tb5_device {
 extern struct list_head odl_tb5_devices_list;
 extern struct mutex     odl_tb5_devices_lock;
 extern unsigned int     odl_ring_size;
+
+/* Module-global debugfs root (created in module init, may be NULL/ERR
+ * if debugfs is unavailable — debugfs_* calls tolerate that). */
+extern struct dentry   *odl_tb5_debugfs_root;
 
 /* ── Service lifecycle ───────────────────────────────────────────────── */
 

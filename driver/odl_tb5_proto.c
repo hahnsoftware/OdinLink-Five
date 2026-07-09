@@ -565,9 +565,15 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 	 * Don't post pool frames yet — legacy consumers (daemon, CLI)
 	 * don't use stream headers.  Pool RX repost starts when the
 	 * first stream is opened via STREAM_OPEN ioctl.
+	 *
+	 * Do NOT force rx_posted to 0 here: the ring reset above cancels
+	 * all posted pool frames and each cancel callback already
+	 * decrements rx_posted.  Zeroing it as well double-accounts the
+	 * cancels that arrive afterwards, driving rx_posted negative —
+	 * the next repost then overshoots by that amount and starves the
+	 * frame pool below the TX reserve (handshake sends block forever).
 	 */
 	dev->rx_target = 0;
-	atomic_set(&dev->rx_posted, 0);
 
 	/* Restart the hrtimer poll for stream data — NHI MSI-X
 	 * interrupts fire but descriptor write-back can lag, so we poll

@@ -62,7 +62,16 @@ typedef int64_t  __s64;
 /* ── Stream header (5 bytes, prepended to every DMA frame) ──────────── */
 
 #define ODL_TB5_STREAM_HDR_SIZE      5
-#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE)
+
+/*
+ * Max on-wire frame length is ODL_TB5_FRAME_SIZE - 1 (4095), NOT 4096:
+ * struct ring_frame.size (and the NHI descriptor length) is a 12-bit
+ * field, so a frame length of exactly 4096 silently truncates to 0 and
+ * the frame is transmitted empty — the receiver then discards it as a
+ * runt.  This was the root cause of ~99.6 % bulk data loss.
+ */
+#define ODL_TB5_FRAME_LEN_MAX        (ODL_TB5_FRAME_SIZE - 1)
+#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_LEN_MAX - ODL_TB5_STREAM_HDR_SIZE)
 
 #define ODL_TB5_STREAM_ID_CTRL       0
 #define ODL_TB5_STREAM_ID_MAX        255

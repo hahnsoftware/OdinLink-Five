@@ -17,11 +17,59 @@
 
 #include <linux/poll.h>
 #include <linux/uaccess.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
 
 #include "odl_tb5_core.h"
 
 static dev_t odl_tb5_devt;
 static struct class *odl_tb5_class;
+
+/* ── debugfs: per-device observability counters ─────────────────────── */
+
+static int odl_tb5_stats_show(struct seq_file *m, void *v)
+{
+	struct odl_tb5_device *dev = m->private;
+	struct odl_tb5_stats *s = &dev->stats;
+
+#define ODL_TB5_STATS_PRINT(name)					\
+	seq_printf(m, "%s %lld\n", #name,				\
+		   (long long)atomic64_read(&s->name));
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_PRINT)
+#undef ODL_TB5_STATS_PRINT
+
+	/* Current state values (not counters) */
+	seq_printf(m, "cur_rx_posted %d\n", atomic_read(&dev->rx_posted));
+	seq_printf(m, "cur_rx_target %d\n", dev->rx_target);
+	seq_printf(m, "cur_frame_pool_free %d\n", dev->frame_pool.free_count);
+	seq_printf(m, "cur_batch_pool_free %d\n", dev->batch_pool.free_count);
+	seq_printf(m, "cur_tx_mode %d\n", dev->tx_adaptive.mode);
+	seq_printf(m, "cur_state %d\n", dev->state);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(odl_tb5_stats);
+
+static ssize_t odl_tb5_stats_reset_write(struct file *file,
+					 const char __user *ubuf,
+					 size_t count, loff_t *ppos)
+{
+	struct odl_tb5_device *dev = file->private_data;
+	struct odl_tb5_stats *s = &dev->stats;
+
+#define ODL_TB5_STATS_ZERO(name)	atomic64_set(&s->name, 0);
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_ZERO)
+#undef ODL_TB5_STATS_ZERO
+
+	return count;
+}
+
+static const struct file_operations odl_tb5_stats_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= odl_tb5_stats_reset_write,
+	.llseek		= default_llseek,
+};
 
 static int odl_tb5_open(struct inode *inode, struct file *filp)
 {
@@ -561,6 +609,20 @@ int odl_tb5_chardev_create(struct odl_tb5_device *dev)
 		goto err_cdev_del;
 	}
 
+	/* Per-device debugfs directory (e.g. odl_tb5/odl_tb5_0).
+	 * debugfs failures are non-fatal — the driver works without it. */
+	{
+		char name[32];
+
+		snprintf(name, sizeof(name), "%s_%d",
+			 ODL_TB5_DEVICE_NAME, dev->index);
+		dev->dbg_dir = debugfs_create_dir(name, odl_tb5_debugfs_root);
+		debugfs_create_file("stats", 0444, dev->dbg_dir, dev,
+				    &odl_tb5_stats_fops);
+		debugfs_create_file("stats_reset", 0200, dev->dbg_dir, dev,
+				    &odl_tb5_stats_reset_fops);
+	}
+
 	return 0;
 
 err_cdev_del:
@@ -570,6 +632,8 @@ err_cdev_del:
 
 void odl_tb5_chardev_destroy(struct odl_tb5_device *dev)
 {
+	debugfs_remove_recursive(dev->dbg_dir);
+	dev->dbg_dir = NULL;
 	device_destroy(odl_tb5_class, dev->devt);
 	cdev_del(&dev->cdev);
 }

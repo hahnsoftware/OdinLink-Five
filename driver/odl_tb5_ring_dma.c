@@ -117,6 +117,10 @@ void odl_tb5_tx_callback(struct tb_ring *ring,
 
 	if (slot >= dev->frame_pool.slots &&
 	    slot < dev->frame_pool.slots + dev->frame_pool.size) {
+		ODL_STAT_INC(dev, tx_frames_completed);
+		if (canceled)
+			ODL_STAT_INC(dev, tx_frames_canceled);
+
 		msg = slot->tx_msg;
 		odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 
@@ -181,6 +185,10 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 	if (WARN_ON_ONCE(!batch))
 		return;
 
+	ODL_STAT_INC(dev, tx_frames_completed);
+	if (canceled)
+		ODL_STAT_INC(dev, tx_frames_canceled);
+
 	msg = batch->tx_msg;
 
 	/* Return batch buffer to pool when all its frames complete */
@@ -223,12 +231,25 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 		    slot < dev->frame_pool.slots + dev->frame_pool.size) {
 			void *data = slot->virt;
 
+			ODL_STAT_INC(dev, rx_frames_seen);
+
 			atomic_dec(&dev->rx_posted);
 
 			if (canceled) {
+				ODL_STAT_INC(dev, rx_frames_canceled);
 				odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 				return;
 			}
+
+			/* The 12-bit size field cannot express 4096, so a
+			 * completely filled frame wraps to 0.  Our TX caps
+			 * frames at 4095 (ODL_TB5_FRAME_LEN_MAX), but be
+			 * defensive against peers that still send full
+			 * frames: a real zero-length RX completion does not
+			 * exist, so treat 0 as "max".  The stream header's
+			 * payload_len governs the actual copy length. */
+			if (frame->size == 0)
+				frame->size = ODL_TB5_FRAME_LEN_MAX;
 
 			/* First check for raw DMA control message
 			 * (no stream header — used during verify). */
@@ -239,6 +260,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 				if (le32_to_cpu(raw_magic) == ODL_TB5_DMA_MAGIC) {
 					struct odl_tb5_dma_hdr *dhdr = data;
 					u32 type = le32_to_cpu(dhdr->type);
+
+					ODL_STAT_INC(dev, rx_frames_ctrl);
 
 					if (type == ODL_TB5_DMA_PONG) {
 						pr_info("OdinLink: DMA pong received (pool)\n");
@@ -264,6 +287,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 					struct odl_tb5_stream *stream;
 					u16 payload_len = le16_to_cpu(shdr->payload_len);
 
+					ODL_STAT_INC(dev, rx_frames_stream);
+
 					stream = odl_tb5_stream_lookup(dev, dst_id);
 					if (stream && payload_len > 0) {
 						const void *payload =
@@ -272,6 +297,10 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 
 						/* Start of new message — reset assembly */
 						if (flags & ODL_TB5_SHDR_F_MSG_START) {
+							ODL_STAT_INC(dev, rx_asm_start);
+							if (stream->rx_asm_len > 0)
+								ODL_STAT_INC(dev,
+									rx_asm_reset_incomplete);
 							kfree(stream->rx_asm_buf);
 							stream->rx_asm_buf = NULL;
 							stream->rx_asm_len = 0;
@@ -297,6 +326,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 								kfree(stream->rx_asm_buf);
 								stream->rx_asm_buf = nb;
 								stream->rx_asm_cap = new_cap;
+							} else {
+								ODL_STAT_INC(dev,
+									rx_asm_grow_fail);
 							}
 						}
 						if (stream->rx_asm_buf &&
@@ -306,6 +338,9 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 							       stream->rx_asm_len,
 							       payload, payload_len);
 							stream->rx_asm_len += payload_len;
+						} else {
+							ODL_STAT_INC(dev,
+								rx_asm_append_skipped);
 						}
 
 						/* End of message — enqueue complete msg */
@@ -328,6 +363,11 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 									rxflags);
 								if (stream->rx_queue_len <
 								    stream->rx_queue_max) {
+									ODL_STAT_INC(dev,
+										rx_msgs_enqueued);
+									ODL_STAT_ADD(dev,
+										rx_bytes_enqueued,
+										rxm->len);
 									list_add_tail(
 										&rxm->list,
 										&stream->rx_queue);
@@ -340,6 +380,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 									wake_up_interruptible(
 										&stream->rx_waitq);
 								} else {
+									ODL_STAT_INC(dev,
+										rx_msgs_drop_overflow);
 									spin_unlock_irqrestore(
 										&stream->rx_lock,
 										rxflags);
@@ -353,6 +395,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 								stream->rx_asm_len = 0;
 								stream->rx_asm_cap = 0;
 							} else {
+								ODL_STAT_INC(dev,
+									rx_msgs_drop_alloc);
 								kfree(rxm);
 								kfree(stream->rx_asm_buf);
 								stream->rx_asm_buf = NULL;
@@ -363,8 +407,12 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 
 						kref_put(&stream->refcount,
 							 odl_tb5_stream_free);
+					} else {
+						ODL_STAT_INC(dev, rx_frames_no_stream);
 					}
 				}
+			} else {
+				ODL_STAT_INC(dev, rx_frames_runt);
 			}
 
 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
@@ -374,6 +422,8 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 	}
 
 	/* Legacy path for proto layer direct ring submissions */
+	ODL_STAT_INC(dev, rx_frames_legacy);
+
 	if (canceled) {
 		pr_debug("odl_tb5: RX callback canceled\n");
 		return;
@@ -692,6 +742,9 @@ int odl_tb5_submit_tx(struct odl_tb5_device *dev,
 
 		frame->buffer_phy = buf->phys + offset +
 				    ((size_t)i * ODL_TB5_FRAME_SIZE);
+		/* NOTE: full 4096-byte slices wrap the 12-bit size field to 0
+		 * and transmit empty (legacy path; only used for small ctrl
+		 * messages today — kept unchanged, see ODL_TB5_FRAME_LEN_MAX) */
 		frame->size = min_t(size_t, ODL_TB5_FRAME_SIZE, remaining);
 		frame->callback = odl_tb5_tx_callback;
 		frame->sof = ctrl ? ODL_TB5_PDF_SOF_CTRL : ODL_TB5_PDF_SOF_DATA;
@@ -850,7 +903,9 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 
 			frame = &dev->tx.frames[frame_idx];
 
-			chunk = min3((size_t)ODL_TB5_FRAME_SIZE,
+			/* 12-bit size field: 4096 wraps to 0, cap at 4095.
+			 * RX side must chunk identically (no headers). */
+			chunk = min3((size_t)ODL_TB5_FRAME_LEN_MAX,
 				     sg_remaining, total_remaining);
 
 			frame->buffer_phy = sg_addr;
@@ -961,7 +1016,8 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 
 			frame = &dev->rx.frames[frame_idx];
 
-			chunk = min3((size_t)ODL_TB5_FRAME_SIZE,
+			/* Must match the TX-side 4095-byte chunking */
+			chunk = min3((size_t)ODL_TB5_FRAME_LEN_MAX,
 				     sg_remaining, total_remaining);
 
 			frame->buffer_phy = sg_addr;
@@ -1587,6 +1643,8 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
 			ret = -EIO;
 			goto wait_pending;
 		}
+
+		ODL_STAT_INC(dev, tx_frames_submitted);
 	}
 
 	return 0;
@@ -1737,6 +1795,8 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
 				ret = -EIO;
 				goto wait_pending;
 			}
+
+			ODL_STAT_INC(dev, tx_frames_submitted);
 		}
 
 		total_sent += batch_payload;
@@ -1790,11 +1850,15 @@ int odl_tb5_stream_send(struct odl_tb5_stream *stream,
 	struct odl_tb5_device *dev = stream->dev;
 	enum odl_tb5_tx_mode mode;
 
+	ODL_STAT_INC(dev, tx_send_calls);
+
 	if (dev->state != ODL_TB5_STATE_READY)
 		return -ENOTCONN;
 
 	if (len == 0 || len > (size_t)ODL_TB5_STREAM_PAYLOAD_MAX * 4096)
 		return -EINVAL;
+
+	ODL_STAT_ADD(dev, tx_bytes_submitted, len);
 
 	mode = odl_tb5_evaluate_tx_mode(dev, len);
 
@@ -1882,6 +1946,7 @@ void odl_tb5_tx_drain_work_fn(struct work_struct *work)
 				goto out;
 			}
 
+			ODL_STAT_INC(dev, tx_frames_submitted);
 			did_work = true;
 		}
 out:
@@ -1974,15 +2039,19 @@ int odl_tb5_stream_wait_rx(struct odl_tb5_stream *stream, u32 timeout_ms)
 
 void odl_tb5_rx_repost(struct odl_tb5_device *dev)
 {
-	int posted = atomic_read(&dev->rx_posted);
 	int target = dev->rx_target;
 
-	while (posted < target) {
+	/* Re-read rx_posted each iteration: this runs concurrently from
+	 * every RX callback and from stream_create, and a stale local
+	 * copy lets racing callers each post a full target's worth. */
+	while (atomic_read(&dev->rx_posted) < target) {
 		struct odl_tb5_frame_slot *slot;
 
 		slot = odl_tb5_frame_pool_get(&dev->frame_pool);
-		if (!slot)
+		if (!slot) {
+			ODL_STAT_INC(dev, rx_repost_pool_empty);
 			break;
+		}
 
 		slot->frame.buffer_phy = slot->phys;
 		slot->frame.size = 0; /* NHI fills this on RX completion */
@@ -1991,11 +2060,11 @@ void odl_tb5_rx_repost(struct odl_tb5_device *dev)
 		slot->frame.eof = ODL_TB5_PDF_EOF_DATA;
 
 		if (tb_ring_rx(dev->rx.ring, &slot->frame) < 0) {
+			ODL_STAT_INC(dev, rx_repost_ring_fail);
 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 			break;
 		}
 
 		atomic_inc(&dev->rx_posted);
-		posted++;
 	}
 }
