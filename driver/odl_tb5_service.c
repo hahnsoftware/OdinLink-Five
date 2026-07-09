@@ -83,20 +83,23 @@ static int odl_tb5_probe(struct tb_service *svc,
 		return ret;
 	}
 	dev->index = ret;
-	dev->local_tx_hopid = -1;
+	dev->num_paths = 1;
+	dev->paths[0].tx.dev = dev;
+	dev->paths[0].rx.dev = dev;
+	dev->paths[0].local_tx_hopid = -1;
 
 	dev->state = ODL_TB5_STATE_DISCONNECTED;
 
 	mutex_init(&dev->state_lock);
 	init_waitqueue_head(&dev->state_waitq);
-	spin_lock_init(&dev->tx.lock);
-	spin_lock_init(&dev->rx.lock);
-	init_waitqueue_head(&dev->tx.waitq);
-	init_waitqueue_head(&dev->rx.waitq);
-	atomic_set(&dev->tx.completed, 0);
-	atomic_set(&dev->tx.submitted, 0);
-	atomic_set(&dev->rx.completed, 0);
-	atomic_set(&dev->rx.submitted, 0);
+	spin_lock_init(&dev->paths[0].tx.lock);
+	spin_lock_init(&dev->paths[0].rx.lock);
+	init_waitqueue_head(&dev->paths[0].tx.waitq);
+	init_waitqueue_head(&dev->paths[0].rx.waitq);
+	atomic_set(&dev->paths[0].tx.completed, 0);
+	atomic_set(&dev->paths[0].tx.submitted, 0);
+	atomic_set(&dev->paths[0].rx.completed, 0);
+	atomic_set(&dev->paths[0].rx.submitted, 0);
 	atomic_set(&dev->open_count, 0);
 
 	/* Stream management init */
@@ -104,8 +107,8 @@ static int odl_tb5_probe(struct tb_service *svc,
 	ida_init(&dev->stream_ida);
 	mutex_init(&dev->stream_lock);
 	INIT_WORK(&dev->tx_drain_work, odl_tb5_tx_drain_work_fn);
-	atomic_set(&dev->rx_posted, 0);
-	dev->rx_target = 0;
+	atomic_set(&dev->paths[0].rx_posted, 0);
+	dev->paths[0].rx_target = 0;
 
 	atomic_set(&dev->removing, 0);
 
@@ -228,17 +231,17 @@ static void odl_tb5_remove(struct tb_service *svc)
 	if (saved_state == ODL_TB5_STATE_CONNECTED ||
 	    saved_state == ODL_TB5_STATE_READY) {
 		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring ? dev->tx.ring->hop : -1,
-					 dev->remote_tx_hopid,
-					 dev->rx.ring ? dev->rx.ring->hop : -1);
+					 dev->paths[0].local_tx_hopid,
+					 dev->paths[0].tx.ring ? dev->paths[0].tx.ring->hop : -1,
+					 dev->paths[0].remote_tx_hopid,
+					 dev->paths[0].rx.ring ? dev->paths[0].rx.ring->hop : -1);
 		/* restart_work may have released the in-hopid already
 		 * (saved_state can be stale if a restart raced us) —
 		 * releasing twice trips ida_free's WARN. */
-		if (dev->in_hopid_valid) {
+		if (dev->paths[0].in_hopid_valid) {
 			tb_xdomain_release_in_hopid(dev->xd,
-						    dev->remote_tx_hopid);
-			dev->in_hopid_valid = false;
+						    dev->paths[0].remote_tx_hopid);
+			dev->paths[0].in_hopid_valid = false;
 		}
 	}
 

@@ -39,8 +39,8 @@ static int odl_tb5_stats_show(struct seq_file *m, void *v)
 #undef ODL_TB5_STATS_PRINT
 
 	/* Current state values (not counters) */
-	seq_printf(m, "cur_rx_posted %d\n", atomic_read(&dev->rx_posted));
-	seq_printf(m, "cur_rx_target %d\n", dev->rx_target);
+	seq_printf(m, "cur_rx_posted %d\n", atomic_read(&dev->paths[0].rx_posted));
+	seq_printf(m, "cur_rx_target %d\n", dev->paths[0].rx_target);
 	seq_printf(m, "cur_frame_pool_free %d\n", dev->frame_pool.free_count);
 	seq_printf(m, "cur_batch_pool_free %d\n", dev->batch_pool.free_count);
 	seq_printf(m, "cur_tx_mode %d\n", dev->tx_adaptive.mode);
@@ -361,10 +361,10 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	case ODL_TB5_IOCTL_POLL_COMPLETION: {
 		struct odl_tb5_completion comp;
 
-		comp.tx_completed = atomic_read(&dev->tx.completed);
-		comp.rx_completed = atomic_read(&dev->rx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.tx_completed = atomic_read(&dev->paths[0].tx.completed);
+		comp.rx_completed = atomic_read(&dev->paths[0].rx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -376,18 +376,18 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		struct odl_tb5_completion comp;
 		long ret;
 
-		ret = wait_event_interruptible_timeout(dev->tx.waitq,
-			atomic_read(&dev->tx.completed) > 0,
+		ret = wait_event_interruptible_timeout(dev->paths[0].tx.waitq,
+			atomic_read(&dev->paths[0].tx.completed) > 0,
 			msecs_to_jiffies(30000));
 		if (ret == 0)
 			return -ETIMEDOUT;
 		if (ret < 0)
 			return ret;
 
-		comp.tx_completed = atomic_xchg(&dev->tx.completed, 0);
-		comp.rx_completed = atomic_read(&dev->rx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.tx_completed = atomic_xchg(&dev->paths[0].tx.completed, 0);
+		comp.rx_completed = atomic_read(&dev->paths[0].rx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -399,18 +399,18 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		struct odl_tb5_completion comp;
 		long ret;
 
-		ret = wait_event_interruptible_timeout(dev->rx.waitq,
-			atomic_read(&dev->rx.completed) > 0,
+		ret = wait_event_interruptible_timeout(dev->paths[0].rx.waitq,
+			atomic_read(&dev->paths[0].rx.completed) > 0,
 			msecs_to_jiffies(30000));
 		if (ret == 0)
 			return -ETIMEDOUT;
 		if (ret < 0)
 			return ret;
 
-		comp.rx_completed = atomic_xchg(&dev->rx.completed, 0);
-		comp.tx_completed = atomic_read(&dev->tx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.rx_completed = atomic_xchg(&dev->paths[0].rx.completed, 0);
+		comp.tx_completed = atomic_read(&dev->paths[0].tx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -450,8 +450,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	case ODL_TB5_IOCTL_GET_BUF_INFO: {
 		struct odl_tb5_buf_info info;
 
-		info.tx_buf_size  = dev->tx.bufs[0].size;
-		info.rx_buf_size  = dev->rx.bufs[0].size;
+		info.tx_buf_size  = dev->paths[0].tx.bufs[0].size;
+		info.rx_buf_size  = dev->paths[0].rx.bufs[0].size;
 		info.tx_buf_count = ODL_TB5_NUM_BUFFERS;
 		info.rx_buf_count = ODL_TB5_NUM_BUFFERS;
 
@@ -462,17 +462,17 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case ODL_TB5_IOCTL_SWAP_TX_BUF:
-		spin_lock(&dev->tx.lock);
-		swap(dev->tx.front, dev->tx.back);
-		dev->tx.swapped_since_post = true;
-		spin_unlock(&dev->tx.lock);
+		spin_lock(&dev->paths[0].tx.lock);
+		swap(dev->paths[0].tx.front, dev->paths[0].tx.back);
+		dev->paths[0].tx.swapped_since_post = true;
+		spin_unlock(&dev->paths[0].tx.lock);
 		return 0;
 
 	case ODL_TB5_IOCTL_SWAP_RX_BUF:
-		spin_lock(&dev->rx.lock);
-		swap(dev->rx.front, dev->rx.back);
-		dev->rx.swapped_since_post = true;
-		spin_unlock(&dev->rx.lock);
+		spin_lock(&dev->paths[0].rx.lock);
+		swap(dev->paths[0].rx.front, dev->paths[0].rx.back);
+		dev->paths[0].rx.swapped_since_post = true;
+		spin_unlock(&dev->paths[0].rx.lock);
 		return 0;
 
 	case ODL_TB5_IOCTL_WAIT_READY: {
@@ -514,16 +514,16 @@ static int odl_tb5_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	switch (mmap_offset) {
 	case ODL_TB5_MMAP_TX_BUF0:
-		buf = &dev->tx.bufs[0];
+		buf = &dev->paths[0].tx.bufs[0];
 		break;
 	case ODL_TB5_MMAP_TX_BUF1:
-		buf = &dev->tx.bufs[1];
+		buf = &dev->paths[0].tx.bufs[1];
 		break;
 	case ODL_TB5_MMAP_RX_BUF0:
-		buf = &dev->rx.bufs[0];
+		buf = &dev->paths[0].rx.bufs[0];
 		break;
 	case ODL_TB5_MMAP_RX_BUF1:
-		buf = &dev->rx.bufs[1];
+		buf = &dev->paths[0].rx.bufs[1];
 		break;
 	default:
 		return -EINVAL;
@@ -535,7 +535,7 @@ static int odl_tb5_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	vma->vm_pgoff = 0;
 
-	dma_dev = tb_ring_dma_device(dev->tx.ring);
+	dma_dev = tb_ring_dma_device(dev->paths[0].tx.ring);
 
 	return dma_mmap_coherent(dma_dev, vma, buf->virt, buf->phys,
 				 buf->size);
@@ -548,16 +548,16 @@ static __poll_t odl_tb5_poll(struct file *filp, poll_table *wait)
 	__poll_t mask = 0;
 
 	/* Wait for TX/RX completion events */
-	poll_wait(filp, &dev->tx.waitq, wait);
-	poll_wait(filp, &dev->rx.waitq, wait);
+	poll_wait(filp, &dev->paths[0].tx.waitq, wait);
+	poll_wait(filp, &dev->paths[0].rx.waitq, wait);
 
 	/* Readable if RX completions are available */
-	if (atomic_read(&dev->rx.completed) > 0)
+	if (atomic_read(&dev->paths[0].rx.completed) > 0)
 		mask |= EPOLLIN | EPOLLRDNORM;
 
 	/* Writable if TX has room (completed tx < submitted tx means
 	 * some TX completions have drained) */
-	if (atomic_read(&dev->tx.completed) > 0)
+	if (atomic_read(&dev->paths[0].tx.completed) > 0)
 		mask |= EPOLLOUT | EPOLLWRNORM;
 
 	/* Per-stream readability: check if any stream has pending RX */

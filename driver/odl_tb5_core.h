@@ -87,6 +87,7 @@ struct odl_tb5_stream_hdr {
 #define ODL_TB5_FRAME_POOL_SIZE		4096	/* rx window = 2048 frames */
 #define ODL_TB5_TX_POOL_RESERVE		64  /* keep free for RX repost */
 #define ODL_TB5_POLL_INTERVAL_NS	(10 * 1000)  /* 10 us */
+#define ODL_TB5_MAX_PATHS		4	/* max striped paths per device */
 
 /* ── SG batch buffer pool (throughput mode) ──────────────────────────── */
 
@@ -214,6 +215,11 @@ struct odl_tb5_dma_buf {
 /* ── NHI ring context (shared TX or RX ring) ─────────────────────────── */
 
 struct odl_tb5_ring_ctx {
+	/* Backpointer to the owning device.  The ring ctx now lives inside
+	 * struct odl_tb5_path[] so container_of() from a ctx no longer
+	 * recovers the device; callbacks use this instead. Set wherever a
+	 * ring ctx is initialised (probe / rings_alloc / loopback). */
+	struct odl_tb5_device	*dev;
 	struct tb_ring		*ring;
 	struct ring_frame	*frames;
 	int			ring_size;
@@ -231,6 +237,19 @@ struct odl_tb5_ring_ctx {
 	int			posted_buf;
 	bool			frames_posted;
 	bool			swapped_since_post;
+};
+
+/* ── Per-path state (single-path today: everything lives in paths[0]) ─── */
+
+struct odl_tb5_path {
+	struct odl_tb5_ring_ctx	tx;
+	struct odl_tb5_ring_ctx	rx;
+	int			local_tx_hopid;
+	int			remote_tx_hopid;
+	int			stale_remote_tx_hopid;
+	bool			in_hopid_valid;
+	atomic_t		rx_posted;
+	int			rx_target;
 };
 
 /* ── Observability counters (debugfs-exported) ───────────────────────── */
@@ -284,15 +303,16 @@ struct odl_tb5_stats {
 struct odl_tb5_device {
 	struct tb_service	*svc;
 	struct tb_xdomain	*xd;
-	int			local_tx_hopid;
-	int			remote_tx_hopid;
-	/* True while we own the in-hopid allocated for the peer's TX
-	 * path.  Guards tb_xdomain_release_in_hopid() against double
-	 * release (restart_work and remove() can both reach it). */
-	bool			in_hopid_valid;
 
-	struct odl_tb5_ring_ctx	tx;
-	struct odl_tb5_ring_ctx	rx;
+	/* Per-path state.  Single-path today: probe/loopback set
+	 * num_paths = 1 and everything lives in paths[0].  The per-path
+	 * hopid ownership fields (local/remote/stale tx hopid,
+	 * in_hopid_valid) and the RX repost bookkeeping (rx_posted,
+	 * rx_target) moved here from the device.  in_hopid_valid guards
+	 * tb_xdomain_release_in_hopid() against double release (restart_work
+	 * and remove() can both reach it). */
+	struct odl_tb5_path	paths[ODL_TB5_MAX_PATHS];
+	int			num_paths;
 
 	/* Login/logout handshake */
 	struct delayed_work	login_work;
@@ -301,7 +321,6 @@ struct odl_tb5_device {
 	int			login_retries;
 	bool			login_sent;
 	bool			login_received;
-	int			stale_remote_tx_hopid;
 
 	/* DMA verification (ping/pong) */
 	struct work_struct	verify_work;
@@ -352,10 +371,6 @@ struct odl_tb5_device {
 
 	/* TX drain worker */
 	struct work_struct	tx_drain_work;
-
-	/* RX repost tracking */
-	atomic_t		rx_posted;
-	int			rx_target;
 
 	struct list_head	list;
 

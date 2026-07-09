@@ -68,6 +68,9 @@ static struct odl_tb5_device *lb_create(int index)
 		return ERR_PTR(-ENOMEM);
 
 	dev->index = index;
+	dev->num_paths = 1;
+	dev->paths[0].tx.dev = dev;
+	dev->paths[0].rx.dev = dev;
 	dev->state = ODL_TB5_STATE_DISCONNECTED;
 	mutex_init(&dev->state_lock);
 	init_waitqueue_head(&dev->state_waitq);

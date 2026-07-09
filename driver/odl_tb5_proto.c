@@ -158,7 +158,7 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		resp.xd_hdr.uuid      = odl_tb5_proto_uuid;
 		resp.xd_hdr.type      = ODL_TB5_MSG_LOGIN_RSP;
 		resp.status            = 0;
-		resp.transmit_path     = dev->local_tx_hopid;
+		resp.transmit_path     = dev->paths[0].local_tx_hopid;
 
 		ret = tb_xdomain_response(dev->xd, &resp, sizeof(resp),
 					  TB_CFG_PKG_XDOMAIN_RESP);
@@ -166,14 +166,14 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			"sn=%u, tx_hopid=%d)\n",
 			ret, dev->xd->route,
 			(hdr->length_sn & XD_SN_MASK) >> 27,
-			dev->local_tx_hopid);
+			dev->paths[0].local_tx_hopid);
 
 		mutex_lock(&dev->state_lock);
 		if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
 			pr_info("OdinLink: peer restarted (our state=%d), "
 				"scheduling restart\n", dev->state);
-			dev->stale_remote_tx_hopid = dev->remote_tx_hopid;
-			dev->remote_tx_hopid = remote_tx_hopid;
+			dev->paths[0].stale_remote_tx_hopid = dev->paths[0].remote_tx_hopid;
+			dev->paths[0].remote_tx_hopid = remote_tx_hopid;
 			dev->login_received = true;
 			mutex_unlock(&dev->state_lock);
 			/* Schedule while still holding devices_lock so
@@ -184,7 +184,7 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			return 1;
 		}
 
-		dev->remote_tx_hopid = remote_tx_hopid;
+		dev->paths[0].remote_tx_hopid = remote_tx_hopid;
 		dev->login_received = true;
 		if (dev->login_sent)
 			need_complete = true;
@@ -201,7 +201,7 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		pr_info("OdinLink: received logout from peer\n");
 
 		mutex_lock(&dev->state_lock);
-		dev->stale_remote_tx_hopid = dev->remote_tx_hopid;
+		dev->paths[0].stale_remote_tx_hopid = dev->paths[0].remote_tx_hopid;
 		dev->login_received = false;
 		dev->login_sent = false;
 		mutex_unlock(&dev->state_lock);
@@ -244,7 +244,7 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	odl_tb5_xd_header_init(&msg.xd_hdr, dev->xd, ODL_TB5_MSG_LOGIN,
 			       sizeof(msg));
 	msg.proto_version = ODL_TB5_PROTOCOL_VER;
-	msg.transmit_path = dev->local_tx_hopid;
+	msg.transmit_path = dev->paths[0].local_tx_hopid;
 
 	ret = tb_xdomain_request(dev->xd, &msg, sizeof(msg),
 				 TB_CFG_PKG_XDOMAIN_REQ,
@@ -262,7 +262,7 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	if (odl_protocol_mode == 1) {
 		/* Apple mode: accept any response that looks reasonable.
 		 * The transmit_path is at a fixed offset in the response. */
-		dev->remote_tx_hopid = resp.transmit_path;
+		dev->paths[0].remote_tx_hopid = resp.transmit_path;
 		goto login_ok;
 	}
 
@@ -283,7 +283,7 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 		return -ECONNREFUSED;
 	}
 
-	dev->remote_tx_hopid = resp.transmit_path;
+	dev->paths[0].remote_tx_hopid = resp.transmit_path;
 login_ok:
 	dev->login_sent = true;
 	if (dev->login_received && dev->state == ODL_TB5_STATE_HANDSHAKE)
@@ -291,7 +291,7 @@ login_ok:
 	mutex_unlock(&dev->state_lock);
 
 	pr_info("OdinLink: login sent OK, remote_tx_hopid=%d\n",
-		dev->remote_tx_hopid);
+		dev->paths[0].remote_tx_hopid);
 
 	if (need_complete && !atomic_read(&dev->removing))
 		schedule_work(&dev->connect_work);
@@ -304,17 +304,17 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 {
 	int ret, i;
 
-	ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
+	ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->paths[0].remote_tx_hopid);
 	if (ret < 0) {
 		pr_err("OdinLink: failed to allocate input HopID: %d\n", ret);
 		return ret;
 	}
-	dev->in_hopid_valid = true;
+	dev->paths[0].in_hopid_valid = true;
 	ret = odl_tb5_rings_start(dev);
 	if (ret) {
 		pr_err("OdinLink: failed to start rings: %d\n", ret);
-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
-		dev->in_hopid_valid = false;
+		tb_xdomain_release_in_hopid(dev->xd, dev->paths[0].remote_tx_hopid);
+		dev->paths[0].in_hopid_valid = false;
 		return ret;
 	}
 
@@ -326,8 +326,8 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 			pr_err("OdinLink: failed to prime RX: %d\n", ret);
 			odl_tb5_rings_stop(dev);
 			tb_xdomain_release_in_hopid(dev->xd,
-						    dev->remote_tx_hopid);
-			dev->in_hopid_valid = false;
+						    dev->paths[0].remote_tx_hopid);
+			dev->paths[0].in_hopid_valid = false;
 			return ret;
 		}
 		pr_info("OdinLink: RX primed with 16 frames before "
@@ -336,10 +336,10 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 
 	for (i = 0; i < ODL_TB5_ENABLE_RETRIES; i++) {
 		ret = tb_xdomain_enable_paths(dev->xd,
-					      dev->local_tx_hopid,
-					      dev->tx.ring->hop,
-					      dev->remote_tx_hopid,
-					      dev->rx.ring->hop);
+					      dev->paths[0].local_tx_hopid,
+					      dev->paths[0].tx.ring->hop,
+					      dev->paths[0].remote_tx_hopid,
+					      dev->paths[0].rx.ring->hop);
 		if (!ret)
 			break;
 
@@ -357,8 +357,8 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 		       "after %d attempts: %d\n",
 		       ODL_TB5_ENABLE_RETRIES, ret);
 		odl_tb5_rings_stop(dev);
-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
-		dev->in_hopid_valid = false;
+		tb_xdomain_release_in_hopid(dev->xd, dev->paths[0].remote_tx_hopid);
+		dev->paths[0].in_hopid_valid = false;
 		return ret;
 	}
 
@@ -371,9 +371,9 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 		"(local_tx_hopid=%d, remote_tx_hopid=%d, "
 		"tx_ring_hop=%d, rx_ring_hop=%d, "
 		"ring_size=%d, E2E enabled)\n",
-		dev->local_tx_hopid, dev->remote_tx_hopid,
-		dev->tx.ring->hop, dev->rx.ring->hop,
-		dev->tx.ring_size);
+		dev->paths[0].local_tx_hopid, dev->paths[0].remote_tx_hopid,
+		dev->paths[0].tx.ring->hop, dev->paths[0].rx.ring->hop,
+		dev->paths[0].tx.ring_size);
 
 	/* Allocate frame pool early so verify uses the non-blocking
 	 * pool path for PING/PONG instead of the legacy submit_tx
@@ -457,7 +457,7 @@ static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type)
 		slot->frame.callback = odl_tb5_tx_callback;
 		slot->tx_msg = NULL;
 
-		ret = tb_ring_tx(dev->tx.ring, &slot->frame);
+		ret = tb_ring_tx(dev->paths[0].tx.ring, &slot->frame);
 		if (ret < 0) {
 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 			return ret;
@@ -470,7 +470,7 @@ static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type)
 	{
 		struct odl_tb5_dma_hdr *hdr;
 
-		hdr = dev->tx.bufs[dev->tx.front].virt;
+		hdr = dev->paths[0].tx.bufs[dev->paths[0].tx.front].virt;
 		memset(hdr, 0, sizeof(*hdr));
 		hdr->magic = cpu_to_le32(ODL_TB5_DMA_MAGIC);
 		hdr->type  = cpu_to_le32(type);
@@ -523,10 +523,10 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 	 * run out of RX frames.  The legacy submit_rx only posts 16
 	 * frames and can't repost without a ring reset. */
 	if (dev->frame_pool.slots) {
-		dev->rx_target = dev->frame_pool.size / 2;
+		dev->paths[0].rx_target = dev->frame_pool.size / 2;
 		odl_tb5_rx_repost(dev);
 		pr_info("OdinLink: verify using pool RX (target=%d)\n",
-			dev->rx_target);
+			dev->paths[0].rx_target);
 	} else {
 		size_t buf_size = (size_t)ODL_TB5_FRAME_SIZE * 16;
 
@@ -602,7 +602,7 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 	 * the next repost then overshoots by that amount and starves the
 	 * frame pool below the TX reserve (handshake sends block forever).
 	 */
-	dev->rx_target = 0;
+	dev->paths[0].rx_target = 0;
 
 	/* Restart the hrtimer poll for stream data — NHI MSI-X
 	 * interrupts fire but descriptor write-back can lag, so we poll
@@ -635,17 +635,17 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	cancel_delayed_work_sync(&dev->login_work);
 	dev->pong_received = false;
 
-	if (dev->tx.started) {
+	if (dev->paths[0].tx.started) {
 		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring->hop,
-					 dev->stale_remote_tx_hopid,
-					 dev->rx.ring->hop);
+					 dev->paths[0].local_tx_hopid,
+					 dev->paths[0].tx.ring->hop,
+					 dev->paths[0].stale_remote_tx_hopid,
+					 dev->paths[0].rx.ring->hop);
 		odl_tb5_rings_stop(dev);
-		if (dev->in_hopid_valid) {
+		if (dev->paths[0].in_hopid_valid) {
 			tb_xdomain_release_in_hopid(dev->xd,
-						    dev->stale_remote_tx_hopid);
-			dev->in_hopid_valid = false;
+						    dev->paths[0].stale_remote_tx_hopid);
+			dev->paths[0].in_hopid_valid = false;
 		}
 	}
 
