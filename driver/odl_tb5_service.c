@@ -174,7 +174,17 @@ static void odl_tb5_remove(struct tb_service *svc)
 	if (!dev)
 		return;
 
+	/* Set `removing` while holding devices_lock: the protocol
+	 * handler checks the flag and schedules restart/connect work
+	 * strictly under this lock, so once we've cycled the lock no
+	 * incoming packet can arm work on this device anymore.  Without
+	 * this fence a peer reload (login/logout packet) could schedule
+	 * restart_work AFTER the cancels below, and the work would then
+	 * run on a torn-down/freed device — kworker crash, rmmod stuck
+	 * in D-state, refcount -1, power cycle required. */
+	mutex_lock(&odl_tb5_devices_lock);
 	atomic_set(&dev->removing, 1);
+	mutex_unlock(&odl_tb5_devices_lock);
 
 	mutex_lock(&dev->state_lock);
 	saved_state = dev->state;
@@ -187,6 +197,20 @@ static void odl_tb5_remove(struct tb_service *svc)
 		odl_tb5_proto_send_logout(dev);
 
 	hrtimer_cancel(&dev->rx_poll_timer);
+
+	/* Two cancel passes: the works arm each other (restart→login,
+	 * login→connect, connect→login/verify).  A work that was already
+	 * running before `removing` was set may re-arm a work we canceled
+	 * earlier in the same pass; because every work fn gates its
+	 * scheduling on !removing, anything re-armed during pass 1 runs
+	 * as a no-op — pass 2 only makes sure nothing is left PENDING
+	 * when the device is freed. */
+	cancel_work_sync(&dev->verify_work);
+	cancel_work_sync(&dev->ctrl_reply_work);
+	cancel_work_sync(&dev->restart_work);
+	cancel_work_sync(&dev->connect_work);
+	cancel_delayed_work_sync(&dev->login_work);
+	cancel_work_sync(&dev->tx_drain_work);
 
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
@@ -208,7 +232,14 @@ static void odl_tb5_remove(struct tb_service *svc)
 					 dev->tx.ring ? dev->tx.ring->hop : -1,
 					 dev->remote_tx_hopid,
 					 dev->rx.ring ? dev->rx.ring->hop : -1);
-		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
+		/* restart_work may have released the in-hopid already
+		 * (saved_state can be stale if a restart raced us) —
+		 * releasing twice trips ida_free's WARN. */
+		if (dev->in_hopid_valid) {
+			tb_xdomain_release_in_hopid(dev->xd,
+						    dev->remote_tx_hopid);
+			dev->in_hopid_valid = false;
+		}
 	}
 
 	synchronize_rcu();
@@ -380,6 +411,13 @@ static void __exit odl_tb5_exit(void)
 		list_del_rcu(&dev->list);
 		atomic_set(&dev->removing, 1);
 		hrtimer_cancel(&dev->rx_poll_timer);
+		/* Double cancel pass — see odl_tb5_remove() for why. */
+		cancel_work_sync(&dev->verify_work);
+		cancel_work_sync(&dev->ctrl_reply_work);
+		cancel_work_sync(&dev->restart_work);
+		cancel_work_sync(&dev->connect_work);
+		cancel_delayed_work_sync(&dev->login_work);
+		cancel_work_sync(&dev->tx_drain_work);
 		cancel_work_sync(&dev->verify_work);
 		cancel_work_sync(&dev->ctrl_reply_work);
 		cancel_work_sync(&dev->restart_work);

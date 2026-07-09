@@ -286,6 +286,10 @@ struct odl_tb5_device {
 	struct tb_xdomain	*xd;
 	int			local_tx_hopid;
 	int			remote_tx_hopid;
+	/* True while we own the in-hopid allocated for the peer's TX
+	 * path.  Guards tb_xdomain_release_in_hopid() against double
+	 * release (restart_work and remove() can both reach it). */
+	bool			in_hopid_valid;
 
 	struct odl_tb5_ring_ctx	tx;
 	struct odl_tb5_ring_ctx	rx;

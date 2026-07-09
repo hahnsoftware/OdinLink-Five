@@ -408,6 +408,11 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 						kref_put(&stream->refcount,
 							 odl_tb5_stream_free);
 					} else {
+						/* stream_lookup took a ref even
+						 * when payload_len == 0 */
+						if (stream)
+							kref_put(&stream->refcount,
+								 odl_tb5_stream_free);
 						ODL_STAT_INC(dev, rx_frames_no_stream);
 					}
 				}

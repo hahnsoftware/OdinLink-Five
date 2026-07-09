@@ -109,6 +109,16 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		return 0;
 	}
 
+	/* Device is being torn down: don't touch its state and, above
+	 * all, don't schedule any work on it.  remove() sets `removing`
+	 * under devices_lock, so this check (plus scheduling only while
+	 * holding the lock below) guarantees no work is armed after
+	 * remove()'s cancel_work_sync() calls have run. */
+	if (atomic_read(&dev->removing)) {
+		mutex_unlock(&odl_tb5_devices_lock);
+		return 1;
+	}
+
 	switch (hdr->type) {
 	case ODL_TB5_MSG_LOGIN: {
 		const struct odl_tb5_login_msg *pkg = buf;
@@ -166,8 +176,11 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			dev->remote_tx_hopid = remote_tx_hopid;
 			dev->login_received = true;
 			mutex_unlock(&dev->state_lock);
-			mutex_unlock(&odl_tb5_devices_lock);
+			/* Schedule while still holding devices_lock so
+			 * remove() can fence us out (see removing check
+			 * above). */
 			schedule_work(&dev->restart_work);
+			mutex_unlock(&odl_tb5_devices_lock);
 			return 1;
 		}
 
@@ -177,9 +190,9 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			need_complete = true;
 		mutex_unlock(&dev->state_lock);
 
-		mutex_unlock(&odl_tb5_devices_lock);
 		if (need_complete)
 			schedule_work(&dev->connect_work);
+		mutex_unlock(&odl_tb5_devices_lock);
 
 		return 1;
 	}
@@ -193,8 +206,9 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		dev->login_sent = false;
 		mutex_unlock(&dev->state_lock);
 
-		mutex_unlock(&odl_tb5_devices_lock);
+		/* Schedule under devices_lock — see removing check above. */
 		schedule_work(&dev->restart_work);
+		mutex_unlock(&odl_tb5_devices_lock);
 
 		return 1;
 
@@ -279,7 +293,7 @@ login_ok:
 	pr_info("OdinLink: login sent OK, remote_tx_hopid=%d\n",
 		dev->remote_tx_hopid);
 
-	if (need_complete)
+	if (need_complete && !atomic_read(&dev->removing))
 		schedule_work(&dev->connect_work);
 
 	return 0;
@@ -295,10 +309,12 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 		pr_err("OdinLink: failed to allocate input HopID: %d\n", ret);
 		return ret;
 	}
+	dev->in_hopid_valid = true;
 	ret = odl_tb5_rings_start(dev);
 	if (ret) {
 		pr_err("OdinLink: failed to start rings: %d\n", ret);
 		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
+		dev->in_hopid_valid = false;
 		return ret;
 	}
 
@@ -311,6 +327,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 			odl_tb5_rings_stop(dev);
 			tb_xdomain_release_in_hopid(dev->xd,
 						    dev->remote_tx_hopid);
+			dev->in_hopid_valid = false;
 			return ret;
 		}
 		pr_info("OdinLink: RX primed with 16 frames before "
@@ -341,6 +358,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 		       ODL_TB5_ENABLE_RETRIES, ret);
 		odl_tb5_rings_stop(dev);
 		tb_xdomain_release_in_hopid(dev->xd, dev->remote_tx_hopid);
+		dev->in_hopid_valid = false;
 		return ret;
 	}
 
@@ -381,7 +399,8 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 	hrtimer_start(&dev->rx_poll_timer,
 		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
 		      HRTIMER_MODE_REL);
-	schedule_work(&dev->verify_work);
+	if (!atomic_read(&dev->removing))
+		schedule_work(&dev->verify_work);
 
 	return 0;
 }
@@ -393,6 +412,9 @@ static void odl_tb5_connect_work_fn(struct work_struct *work)
 		container_of(work, struct odl_tb5_device, connect_work);
 	int ret;
 
+	if (atomic_read(&dev->removing))
+		return;
+
 	ret = odl_tb5_complete_connection(dev);
 	if (ret) {
 		mutex_lock(&dev->state_lock);
@@ -402,8 +424,9 @@ static void odl_tb5_connect_work_fn(struct work_struct *work)
 
 		pr_warn("OdinLink: connection completion failed (%d), "
 			"retrying handshake\n", ret);
-		schedule_delayed_work(&dev->login_work,
-				      msecs_to_jiffies(1000));
+		if (!atomic_read(&dev->removing))
+			schedule_delayed_work(&dev->login_work,
+					      msecs_to_jiffies(1000));
 	}
 }
 
@@ -463,6 +486,9 @@ static void odl_tb5_ctrl_reply_work_fn(struct work_struct *work)
 		container_of(work, struct odl_tb5_device, ctrl_reply_work);
 	int type = dev->verify_rx_type;
 
+	if (atomic_read(&dev->removing))
+		return;
+
 	if (type == ODL_TB5_DMA_PING) {
 		pr_info("OdinLink: DMA ping received, sending pong\n");
 		odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
@@ -486,6 +512,9 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 		container_of(work, struct odl_tb5_device, verify_work);
 	long ret;
 	int attempt;
+
+	if (atomic_read(&dev->removing))
+		return;
 
 	dev->pong_received = false;
 
@@ -596,6 +625,9 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	struct odl_tb5_device *dev =
 		container_of(work, struct odl_tb5_device, restart_work);
 
+	if (atomic_read(&dev->removing))
+		return;
+
 	hrtimer_cancel(&dev->rx_poll_timer);
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
@@ -610,8 +642,11 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 					 dev->stale_remote_tx_hopid,
 					 dev->rx.ring->hop);
 		odl_tb5_rings_stop(dev);
-		tb_xdomain_release_in_hopid(dev->xd,
-					    dev->stale_remote_tx_hopid);
+		if (dev->in_hopid_valid) {
+			tb_xdomain_release_in_hopid(dev->xd,
+						    dev->stale_remote_tx_hopid);
+			dev->in_hopid_valid = false;
+		}
 	}
 
 	mutex_lock(&dev->state_lock);
@@ -622,7 +657,8 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	mutex_unlock(&dev->state_lock);
 
 	pr_info("OdinLink: connection restarted, beginning handshake\n");
-	schedule_delayed_work(&dev->login_work, 0);
+	if (!atomic_read(&dev->removing))
+		schedule_delayed_work(&dev->login_work, 0);
 }
 
 /* Delayed work handler that retries login with exponential backoff. */
@@ -633,8 +669,11 @@ static void odl_tb5_login_work_fn(struct work_struct *work)
 	unsigned long delay_ms;
 	int ret;
 
+	if (atomic_read(&dev->removing))
+		return;
+
 	ret = odl_tb5_proto_send_login(dev);
-	if (ret) {
+	if (ret && !atomic_read(&dev->removing)) {
 		dev->login_retries++;
 
 		delay_ms = ODL_TB5_LOGIN_TIMEOUT <<
