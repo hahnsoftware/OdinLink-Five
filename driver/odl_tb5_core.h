@@ -77,7 +77,14 @@ struct odl_tb5_stream_hdr {
 
 /* ── DMA frame pool (replaces old double-buffer scheme) ─────────────── */
 
-#define ODL_TB5_FRAME_POOL_SIZE		1024
+/*
+ * Pool sizing vs. throughput: the link is window-limited (in-flight
+ * bytes / completion round trip), not CPU-limited.  RX posts pool/2
+ * frames as the receive window; the batch pool bounds the TX window.
+ * Keep each window at or below half the NHI ring depth (odl_ring_size,
+ * default 4096 descriptors) so tb_ring_tx/rx never hit a full ring.
+ */
+#define ODL_TB5_FRAME_POOL_SIZE		4096	/* rx window = 2048 frames */
 #define ODL_TB5_TX_POOL_RESERVE		64  /* keep free for RX repost */
 #define ODL_TB5_POLL_INTERVAL_NS	(10 * 1000)  /* 10 us */
 
@@ -85,7 +92,7 @@ struct odl_tb5_stream_hdr {
 
 #define ODL_TB5_BATCH_BUF_SIZE		(256 * 1024)
 #define ODL_TB5_BATCH_FRAMES		(ODL_TB5_BATCH_BUF_SIZE / ODL_TB5_FRAME_SIZE)
-#define ODL_TB5_BATCH_BUF_COUNT		8
+#define ODL_TB5_BATCH_BUF_COUNT		32	/* tx window = 8 MB (2048 frames) */
 #define ODL_TB5_THROUGHPUT_THRESH	65536	/* bytes: msg > 64KB → throughput */
 #define ODL_TB5_MODE_HYSTERESIS		4	/* consecutive low polls to downshift */
 
