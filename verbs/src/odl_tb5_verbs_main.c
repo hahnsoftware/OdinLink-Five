@@ -111,6 +111,97 @@ void odl_tb5_verbs_set_debug(int level)
     odl_verbs_debug_level = level;
 }
 
+/* ── ibv_get_device_list Symbol Interposition ───────────────────────── */
+
+static void odl_free_real_device_list(struct ibv_device **real_list)
+{
+    static void (*real_ibv_free_device_list)(struct ibv_device **);
+    if (!real_ibv_free_device_list) {
+        real_ibv_free_device_list = dlsym(RTLD_NEXT, "ibv_free_device_list");
+        if (!real_ibv_free_device_list) {
+            odl_logerr("dlsym(RTLD_NEXT, ibv_free_device_list) failed: %s",
+                        dlerror());
+            return;
+        }
+    }
+    real_ibv_free_device_list(real_list);
+}
+
+struct ibv_device **ibv_get_device_list(int *num_devices)
+{
+    ODL_TRACE_ENTRY();
+
+    /* Chain to real libibverbs so genuine IB/RoCE devices stay visible */
+    static struct ibv_device **(*real_ibv_get_device_list)(int *);
+    if (!real_ibv_get_device_list) {
+        real_ibv_get_device_list = dlsym(RTLD_NEXT, "ibv_get_device_list");
+        if (!real_ibv_get_device_list)
+            odl_logwarn("dlsym(RTLD_NEXT, ibv_get_device_list) failed: %s",
+                        dlerror());
+    }
+
+    int real_n = 0;
+    struct ibv_device **real_list = NULL;
+    if (real_ibv_get_device_list)
+        real_list = real_ibv_get_device_list(&real_n);
+    if (!real_list)
+        real_n = 0;
+
+    int odl_n = odl_num_tb5_devices();
+
+    /* buf[0] stashes the real list pointer so ibv_free_device_list can
+     * hand it back to the real free function later. The array returned
+     * to the caller starts at &buf[1] and is NULL-terminated. */
+    void **buf = calloc(real_n + odl_n + 2, sizeof(void *));
+    if (!buf) {
+        if (real_list)
+            odl_free_real_device_list(real_list);
+        errno = ENOMEM;
+        ODL_TRACE_EXIT();
+        return NULL;
+    }
+    buf[0] = real_list;
+
+    struct ibv_device **list = (struct ibv_device **)&buf[1];
+    int n = 0;
+    for (int i = 0; i < real_n; i++)
+        list[n++] = real_list[i];
+    /* Append OdinLink devices from the lib-owned registry. Iterate the
+     * registry directly (not odl_find_tb5_device) so sparse dev indices
+     * are handled too. */
+    for (int i = 0; i < odl_n && i < odl_device_count; i++)
+        list[n++] = &odl_device_list[i]->base;
+    list[n] = NULL;
+
+    if (num_devices)
+        *num_devices = n;
+
+    odl_loginfo("device list: %d real + %d odl_tb5 device(s)",
+                real_n, n - real_n);
+    ODL_TRACE_EXIT();
+    return list;
+}
+
+void ibv_free_device_list(struct ibv_device **list)
+{
+    ODL_TRACE_ENTRY();
+
+    if (!list) {
+        ODL_TRACE_EXIT();
+        return;
+    }
+
+    void **buf = (void **)list - 1;
+    struct ibv_device **real_list = buf[0];
+    if (real_list)
+        odl_free_real_device_list(real_list);
+
+    /* OdinLink device structs live in the lib-owned registry
+     * (odl_device_list) — they are never freed here. */
+    free(buf);
+    ODL_TRACE_EXIT();
+}
+
 /* ── ibv_open_device Symbol Interposition ───────────────────────────── */
 
 struct ibv_context *ibv_open_device(struct ibv_device *device)
