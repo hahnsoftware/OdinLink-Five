@@ -907,7 +907,11 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 		goto err_put;
 	}
 
-	attach = dma_buf_attach(dmabuf, dev->dev);
+	/* Attach to the NHI DMA device (what actually programs the ring),
+	 * NOT dev->dev (the character device, which has no DMA ops / IOMMU
+	 * domain — mapping against it yields no usable DMA segments and the
+	 * transfer silently posts zero frames). */
+	attach = dma_buf_attach(dmabuf, tb_ring_dma_device(dev->tx.ring));
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		goto err_put;
@@ -969,6 +973,15 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 			break;
 	}
 
+	/* No frames posted means the dmabuf produced no usable DMA segments
+	 * (e.g. mapped against the wrong device).  Fail loudly rather than
+	 * satisfying the completion wait trivially and returning a silent
+	 * no-op — that masked a broken transport for the whole dmabuf path. */
+	if (frame_idx == 0) {
+		ret = -EIO;
+		goto err_unmap;
+	}
+
 	atomic_add(frame_idx, &dev->tx.submitted);
 
 	wait_event_interruptible(dev->tx.waitq,
@@ -1018,7 +1031,8 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 		goto err_put;
 	}
 
-	attach = dma_buf_attach(dmabuf, dev->dev);
+	/* Attach to the NHI DMA device, not dev->dev — see submit_tx_dmabuf. */
+	attach = dma_buf_attach(dmabuf, tb_ring_dma_device(dev->rx.ring));
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		goto err_put;
@@ -1078,6 +1092,13 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 
 		if (total_remaining == 0)
 			break;
+	}
+
+	/* See submit_tx_dmabuf: a zero-frame post is a broken mapping, not a
+	 * completed receive.  Fail instead of returning a silent no-op. */
+	if (frame_idx == 0) {
+		ret = -EIO;
+		goto err_unmap;
 	}
 
 	atomic_add(frame_idx, &dev->rx.submitted);
