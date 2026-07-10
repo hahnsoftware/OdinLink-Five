@@ -68,7 +68,11 @@ static struct odl_tb5_device *lb_create(int index)
 		return ERR_PTR(-ENOMEM);
 
 	dev->index = index;
+	/* Loopback is always single-path — no DMA rings to stripe over. */
 	dev->num_paths = 1;
+	dev->remote_path_count = 1;
+	dev->negotiated_paths = 1;
+	dev->tx_active_paths = 1;
 	dev->paths[0].tx.dev = dev;
 	dev->paths[0].rx.dev = dev;
 	dev->state = ODL_TB5_STATE_DISCONNECTED;

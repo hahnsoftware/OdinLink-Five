@@ -38,6 +38,20 @@ static int odl_tb5_stats_show(struct seq_file *m, void *v)
 	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_PRINT)
 #undef ODL_TB5_STATS_PRINT
 
+	/* Per-path frame counters (multi-path striping) */
+	{
+		int p;
+
+		for (p = 0; p < dev->num_paths; p++) {
+			seq_printf(m, "p%d_tx_frames %lld\n", p,
+				   (long long)atomic64_read(
+					   &s->path_tx_frames[p]));
+			seq_printf(m, "p%d_rx_frames %lld\n", p,
+				   (long long)atomic64_read(
+					   &s->path_rx_frames[p]));
+		}
+	}
+
 	/* Current state values (not counters) */
 	seq_printf(m, "cur_rx_posted %d\n", atomic_read(&dev->paths[0].rx_posted));
 	seq_printf(m, "cur_rx_target %d\n", dev->paths[0].rx_target);
@@ -45,6 +59,8 @@ static int odl_tb5_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "cur_batch_pool_free %d\n", dev->batch_pool.free_count);
 	seq_printf(m, "cur_tx_mode %d\n", dev->tx_adaptive.mode);
 	seq_printf(m, "cur_state %d\n", dev->state);
+	seq_printf(m, "cur_tx_active_paths %d\n", dev->tx_active_paths);
+	seq_printf(m, "cur_negotiated_paths %d\n", dev->negotiated_paths);
 
 	return 0;
 }
@@ -60,6 +76,15 @@ static ssize_t odl_tb5_stats_reset_write(struct file *file,
 #define ODL_TB5_STATS_ZERO(name)	atomic64_set(&s->name, 0);
 	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_ZERO)
 #undef ODL_TB5_STATS_ZERO
+
+	{
+		int p;
+
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++) {
+			atomic64_set(&s->path_tx_frames[p], 0);
+			atomic64_set(&s->path_rx_frames[p], 0);
+		}
+	}
 
 	return count;
 }

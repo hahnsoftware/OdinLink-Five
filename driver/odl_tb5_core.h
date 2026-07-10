@@ -166,6 +166,7 @@ struct odl_tb5_rx_msg {
 
 struct odl_tb5_stream {
 	u8			id;
+	int			path_idx;	/* pinned TX path (stripe target) */
 	struct odl_tb5_device	*dev;
 	struct odl_tb5_file_ctx	*owner;
 	struct list_head	owner_list;
@@ -290,6 +291,10 @@ struct odl_tb5_stats {
 #define ODL_TB5_STATS_DECL(name)	atomic64_t name;
 	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_DECL)
 #undef ODL_TB5_STATS_DECL
+	/* Per-path frame counters — kept outside the X-macro (indexed by
+	 * path, printed as pN_tx_frames / pN_rx_frames in debugfs). */
+	atomic64_t path_tx_frames[ODL_TB5_MAX_PATHS];
+	atomic64_t path_rx_frames[ODL_TB5_MAX_PATHS];
 };
 
 /* Hot-path counter helpers — plain atomic64 ops, no locking. */
@@ -313,6 +318,17 @@ struct odl_tb5_device {
 	 * and remove() can both reach it). */
 	struct odl_tb5_path	paths[ODL_TB5_MAX_PATHS];
 	int			num_paths;
+	/* Multi-path negotiation.  remote_path_count is what the peer
+	 * advertises in its login (>=1; 1 for a legacy peer).
+	 * negotiated_paths = min(num_paths, remote_path_count) — the paths
+	 * that are hopid-allocated and enabled.  tx_active_paths (<=
+	 * negotiated_paths, >=1) is the number of paths that passed ping/pong
+	 * verification and are therefore used as TX stripe targets; RX stays
+	 * enabled on all negotiated paths so asymmetric degradation still
+	 * lets the peer reach us. */
+	int			remote_path_count;
+	int			negotiated_paths;
+	int			tx_active_paths;
 
 	/* Login/logout handshake */
 	struct delayed_work	login_work;
@@ -327,8 +343,13 @@ struct odl_tb5_device {
 	struct work_struct	ctrl_reply_work;
 	struct hrtimer		rx_poll_timer;
 	wait_queue_head_t	verify_waitq;
-	bool			pong_received;
-	int			verify_rx_type;
+	/* Per-path verify bitmaps (indexed by path).  pong_mask bit i is set
+	 * when a PONG arrives on path i; verify_ping_mask bit i is set when a
+	 * PING arrives on path i and ctrl_reply_work must answer on that same
+	 * path.  Bitmaps (not single slots) so pings/pongs on two paths racing
+	 * in parallel don't clobber each other. */
+	atomic_t		pong_mask;
+	atomic_t		verify_ping_mask;
 
 	/* Connection state */
 	enum odl_tb5_conn_state	state;
@@ -384,6 +405,19 @@ struct odl_tb5_device {
 	atomic_t			removing;
 };
 
+/* TX stripe target for a stream.  Streams are pinned at creation; if the
+ * connection later degrades (or renegotiates) to fewer TX-verified paths,
+ * fold the pin back into the active range instead of submitting to a
+ * dead ring. */
+static inline int odl_tb5_stream_tx_path(const struct odl_tb5_stream *stream)
+{
+	int n = stream->dev->tx_active_paths;
+
+	if (n < 1)
+		n = 1;
+	return stream->path_idx < n ? stream->path_idx : stream->path_idx % n;
+}
+
 extern struct list_head odl_tb5_devices_list;
 extern struct mutex     odl_tb5_devices_lock;
 extern unsigned int     odl_ring_size;
@@ -401,13 +435,14 @@ void odl_tb5_service_exit(void);
 
 int  odl_tb5_rings_alloc(struct odl_tb5_device *dev);
 void odl_tb5_rings_free(struct odl_tb5_device *dev);
-int  odl_tb5_rings_start(struct odl_tb5_device *dev);
+int  odl_tb5_rings_start(struct odl_tb5_device *dev, int idx);
+void odl_tb5_rings_stop_path(struct odl_tb5_device *dev, int idx);
 void odl_tb5_rings_stop(struct odl_tb5_device *dev);
 void odl_tb5_rings_reset(struct odl_tb5_device *dev);
 
 /* ── DMA frame pool ──────────────────────────────────────────────────── */
 
-int  odl_tb5_frame_pool_alloc(struct odl_tb5_device *dev);
+int  odl_tb5_frame_pool_alloc(struct odl_tb5_device *dev, int size);
 void odl_tb5_frame_pool_free(struct odl_tb5_device *dev);
 struct odl_tb5_frame_slot *odl_tb5_frame_pool_get(struct odl_tb5_frame_pool *pool);
 void odl_tb5_frame_pool_put(struct odl_tb5_frame_pool *pool,
@@ -488,7 +523,7 @@ struct odl_tb5_device *odl_tb5_rx_ring_to_dev(struct tb_ring *ring);
 
 /* ── RX repost ───────────────────────────────────────────────────────── */
 
-void odl_tb5_rx_repost(struct odl_tb5_device *dev);
+void odl_tb5_rx_repost(struct odl_tb5_device *dev, int idx);
 
 /* ── Character device ────────────────────────────────────────────────── */
 
@@ -514,6 +549,7 @@ int  odl_tb5_proto_send_logout(struct odl_tb5_device *dev);
 extern int odl_loopback_count;
 extern int odl_protocol_mode;
 extern bool odl_e2e;
+extern unsigned int odl_num_paths;
 int  odl_loopback_init(void);
 void odl_loopback_exit(void);
 

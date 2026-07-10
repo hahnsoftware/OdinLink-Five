@@ -47,6 +47,13 @@ MODULE_PARM_DESC(e2e,
 	"Enable end-to-end flow control (default=1). Set 0 for TB3 controllers "
 	"that do not support RING_FLAG_E2E.");
 
+unsigned int odl_num_paths = 2;
+module_param_named(num_paths, odl_num_paths, uint, 0444);
+MODULE_PARM_DESC(num_paths,
+	"Number of parallel DMA striping paths per device (1.."
+	__stringify(ODL_TB5_MAX_PATHS) ", default 2). The router flow-control "
+	"cap is per-path, so multiple paths scale throughput.");
+
 /* Apple protocol uses its own property key and registers as an alternate
  * service so macOS ThunderboltRDMA can discover us via XDomain matching. */
 static struct tb_property_dir *odl_tb5_apple_property_dir;
@@ -83,40 +90,71 @@ static int odl_tb5_probe(struct tb_service *svc,
 		return ret;
 	}
 	dev->index = ret;
-	dev->num_paths = 1;
-	dev->paths[0].tx.dev = dev;
-	dev->paths[0].rx.dev = dev;
-	dev->paths[0].local_tx_hopid = -1;
+
+	/* Multi-path: initialise ALL slots up front (cheap, avoids special
+	 * casing elsewhere).  num_paths is the configured stripe count;
+	 * rings_alloc may reduce it if a higher path can't get NHI rings.
+	 * negotiated/tx_active/remote start at 1 so the single-path fallback
+	 * (and any code reading them before handshake) is well-defined. */
+	dev->num_paths = odl_num_paths;
+	dev->remote_path_count = 1;
+	dev->negotiated_paths = 1;
+	dev->tx_active_paths = 1;
+	{
+		int p;
+
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++) {
+			struct odl_tb5_path *path = &dev->paths[p];
+
+			path->tx.dev = dev;
+			path->rx.dev = dev;
+			path->local_tx_hopid = -1;
+			path->remote_tx_hopid = 0;
+			path->stale_remote_tx_hopid = 0;
+			path->in_hopid_valid = false;
+			spin_lock_init(&path->tx.lock);
+			spin_lock_init(&path->rx.lock);
+			init_waitqueue_head(&path->tx.waitq);
+			init_waitqueue_head(&path->rx.waitq);
+			atomic_set(&path->tx.completed, 0);
+			atomic_set(&path->tx.submitted, 0);
+			atomic_set(&path->rx.completed, 0);
+			atomic_set(&path->rx.submitted, 0);
+			atomic_set(&path->rx_posted, 0);
+			path->rx_target = 0;
+		}
+	}
 
 	dev->state = ODL_TB5_STATE_DISCONNECTED;
 
 	mutex_init(&dev->state_lock);
 	init_waitqueue_head(&dev->state_waitq);
-	spin_lock_init(&dev->paths[0].tx.lock);
-	spin_lock_init(&dev->paths[0].rx.lock);
-	init_waitqueue_head(&dev->paths[0].tx.waitq);
-	init_waitqueue_head(&dev->paths[0].rx.waitq);
-	atomic_set(&dev->paths[0].tx.completed, 0);
-	atomic_set(&dev->paths[0].tx.submitted, 0);
-	atomic_set(&dev->paths[0].rx.completed, 0);
-	atomic_set(&dev->paths[0].rx.submitted, 0);
 	atomic_set(&dev->open_count, 0);
+	atomic_set(&dev->pong_mask, 0);
+	atomic_set(&dev->verify_ping_mask, 0);
 
 	/* Stream management init */
 	hash_init(dev->streams);
 	ida_init(&dev->stream_ida);
 	mutex_init(&dev->stream_lock);
 	INIT_WORK(&dev->tx_drain_work, odl_tb5_tx_drain_work_fn);
-	atomic_set(&dev->paths[0].rx_posted, 0);
-	dev->paths[0].rx_target = 0;
 
 	atomic_set(&dev->removing, 0);
 
-	/* Adaptive TX mode defaults */
+	/* Adaptive TX mode defaults.
+	 *
+	 * Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
+	 * slots), NOT the NHI ring depth.  With a large odl_ring_size the raw
+	 * ring*3/4 exceeds the pool, so the adaptive logic can never trip and
+	 * TX flow control is miscalibrated.  Clamp to the usable pool. */
 	dev->tx_adaptive.mode = ODL_TB5_TX_LATENCY;
 	dev->tx_adaptive.consecutive_low = 0;
-	dev->tx_adaptive.high_watermark = odl_ring_size * 3 / 4;
-	dev->tx_adaptive.low_watermark  = odl_ring_size / 4;
+	dev->tx_adaptive.high_watermark =
+		min_t(unsigned int, odl_ring_size * 3 / 4,
+		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
+	dev->tx_adaptive.low_watermark  =
+		min_t(unsigned int, odl_ring_size / 4,
+		      (ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE) / 2);
 
 	ret = odl_tb5_chardev_create(dev);
 	if (ret) {
@@ -227,21 +265,29 @@ static void odl_tb5_remove(struct tb_service *svc)
 	/* Disable the DMA paths while rings and hopids are still valid —
 	 * rings_free() below NULLs the rings and releases local_tx_hopid,
 	 * which would make this call a no-op and leave stale paths in the
-	 * routers (breaks the next module load until a controller reset). */
+	 * routers (breaks the next module load until a controller reset).
+	 * in_hopid_valid marks a fully-enabled path; iterate every one. */
 	if (saved_state == ODL_TB5_STATE_CONNECTED ||
 	    saved_state == ODL_TB5_STATE_READY) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->paths[0].local_tx_hopid,
-					 dev->paths[0].tx.ring ? dev->paths[0].tx.ring->hop : -1,
-					 dev->paths[0].remote_tx_hopid,
-					 dev->paths[0].rx.ring ? dev->paths[0].rx.ring->hop : -1);
-		/* restart_work may have released the in-hopid already
-		 * (saved_state can be stale if a restart raced us) —
-		 * releasing twice trips ida_free's WARN. */
-		if (dev->paths[0].in_hopid_valid) {
+		int p;
+
+		for (p = 0; p < dev->num_paths; p++) {
+			struct odl_tb5_path *path = &dev->paths[p];
+
+			if (!path->in_hopid_valid)
+				continue;
+
+			tb_xdomain_disable_paths(dev->xd,
+						 path->local_tx_hopid,
+						 path->tx.ring ? path->tx.ring->hop : -1,
+						 path->remote_tx_hopid,
+						 path->rx.ring ? path->rx.ring->hop : -1);
+			/* restart_work may have released the in-hopid already
+			 * (saved_state can be stale if a restart raced us) —
+			 * releasing twice trips ida_free's WARN. */
 			tb_xdomain_release_in_hopid(dev->xd,
-						    dev->paths[0].remote_tx_hopid);
-			dev->paths[0].in_hopid_valid = false;
+						    path->remote_tx_hopid);
+			path->in_hopid_valid = false;
 		}
 	}
 
@@ -285,6 +331,14 @@ static int __init odl_tb5_init(void)
 		       odl_ring_size, ODL_TB5_RING_SIZE_MIN,
 		       ODL_TB5_RING_SIZE_MAX);
 		return -EINVAL;
+	}
+
+	if (odl_num_paths < 1 || odl_num_paths > ODL_TB5_MAX_PATHS) {
+		unsigned int clamped = clamp_t(unsigned int, odl_num_paths,
+					       1, ODL_TB5_MAX_PATHS);
+		pr_warn("odl_tb5: num_paths=%u out of range (1..%u), clamping to %u\n",
+			odl_num_paths, ODL_TB5_MAX_PATHS, clamped);
+		odl_num_paths = clamped;
 	}
 
 	ret = odl_tb5_chardev_init();
