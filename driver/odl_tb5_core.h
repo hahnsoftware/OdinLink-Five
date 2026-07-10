@@ -87,6 +87,15 @@ struct odl_tb5_stream_hdr {
 #define ODL_TB5_FRAME_POOL_SIZE		4096	/* rx window = 2048 frames */
 #define ODL_TB5_TX_POOL_RESERVE		64  /* keep free for RX repost */
 #define ODL_TB5_POLL_INTERVAL_NS	(10 * 1000)  /* 10 us */
+/*
+ * On-demand poll timer: after the last observed activity the fallback poll
+ * keeps running for this many ticks (grace window) to cover NHI descriptor
+ * write-back lag, then disarms so a truly idle device costs no CPU.  8 ticks
+ * = 80 us, comfortably above the ~21 us idle round trip.  The NHI ISR still
+ * kicks ring_work on real completions, so this only bounds the write-back
+ * re-check, never correctness.
+ */
+#define ODL_TB5_POLL_GRACE_TICKS	8
 #define ODL_TB5_MAX_PATHS		4	/* max striped paths per device */
 
 /* ── SG batch buffer pool (throughput mode) ──────────────────────────── */
@@ -342,6 +351,18 @@ struct odl_tb5_device {
 	struct work_struct	verify_work;
 	struct work_struct	ctrl_reply_work;
 	struct hrtimer		rx_poll_timer;
+	/* On-demand poll-timer state.  poll_active is the armed flag (0/1),
+	 * set via xchg by odl_tb5_poll_kick() and cleared by the timer fn when
+	 * it goes idle — this is the arm/disarm handshake.  tx_inflight counts
+	 * TX frames submitted-but-not-completed (bracketed at every tb_ring_tx
+	 * / TX callback): while > 0 the timer must keep polling so completions
+	 * are picked up.  poll_last_rxseen / poll_idle_ticks are owned solely
+	 * by the timer fn (it never runs concurrently with itself) and drive
+	 * the RX grace window. */
+	atomic_t		poll_active;
+	atomic_t		tx_inflight;
+	u64			poll_last_rxseen;
+	unsigned int		poll_idle_ticks;
 	wait_queue_head_t	verify_waitq;
 	/* Per-path verify bitmaps (indexed by path).  pong_mask bit i is set
 	 * when a PONG arrives on path i; verify_ping_mask bit i is set when a
@@ -509,6 +530,14 @@ void odl_tb5_tx_drain_work_fn(struct work_struct *work);
 /* ── RX poll worker (start_poll callback mechanism) ──────────────────── */
 
 enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer);
+
+/* On-demand poll-timer arming.  odl_tb5_poll_kick() (re)arms the fallback
+ * poll if it is not already running; odl_tb5_poll_disarm() cancels it and
+ * clears the armed flag.  odl_tb5_tx_submitted() brackets a successful
+ * tb_ring_tx: it bumps tx_inflight and arms on the idle→busy edge. */
+void odl_tb5_poll_kick(struct odl_tb5_device *dev);
+void odl_tb5_poll_disarm(struct odl_tb5_device *dev);
+void odl_tb5_tx_submitted(struct odl_tb5_device *dev);
 
 /* ── Ring callbacks ──────────────────────────────────────────────────── */
 

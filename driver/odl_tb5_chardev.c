@@ -57,6 +57,8 @@ static int odl_tb5_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "cur_rx_target %d\n", dev->paths[0].rx_target);
 	seq_printf(m, "cur_frame_pool_free %d\n", dev->frame_pool.free_count);
 	seq_printf(m, "cur_batch_pool_free %d\n", dev->batch_pool.free_count);
+	seq_printf(m, "cur_tx_inflight %d\n", atomic_read(&dev->tx_inflight));
+	seq_printf(m, "cur_poll_active %d\n", atomic_read(&dev->poll_active));
 	seq_printf(m, "cur_tx_mode %d\n", dev->tx_adaptive.mode);
 	seq_printf(m, "cur_state %d\n", dev->state);
 	seq_printf(m, "cur_tx_active_paths %d\n", dev->tx_active_paths);

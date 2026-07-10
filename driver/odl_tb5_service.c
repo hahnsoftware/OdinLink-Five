@@ -237,7 +237,7 @@ static void odl_tb5_remove(struct tb_service *svc)
 	    saved_state == ODL_TB5_STATE_READY)
 		odl_tb5_proto_send_logout(dev);
 
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 
 	/* Two cancel passes: the works arm each other (restart→login,
 	 * login→connect, connect→login/verify).  A work that was already
@@ -467,7 +467,7 @@ static void __exit odl_tb5_exit(void)
 		pr_warn("odl_tb5: cleaning up orphaned device at exit\n");
 		list_del_rcu(&dev->list);
 		atomic_set(&dev->removing, 1);
-		hrtimer_cancel(&dev->rx_poll_timer);
+		odl_tb5_poll_disarm(dev);
 		/* Double cancel pass — see odl_tb5_remove() for why. */
 		cancel_work_sync(&dev->verify_work);
 		cancel_work_sync(&dev->ctrl_reply_work);

@@ -31,15 +31,21 @@ static void odl_tb5_stream_free(struct kref *ref);
 
 /*
  * High-resolution fallback poll timer — kicks both TX and RX ring_work
- * every 50 us.
+ * every 10 us while there is work to chase.
  *
  * NHI MSI-X interrupts DO fire, but ring_work triggered by the ISR
  * sometimes doesn't see completions yet (descriptor write-back delay).
- * This timer ensures completions are processed within ~50 us instead of
- * waiting for the next jiffy tick.
+ * This timer ensures completions are processed within ~10 us instead of
+ * waiting for the next jiffy tick.  schedule_work is idempotent, so
+ * ISR-driven and timer-driven kicks are safely additive.
  *
- * schedule_work is idempotent, so ISR-driven and timer-driven kicks
- * are safely additive.
+ * On-demand arming: the timer is not a free-running 100 kHz heartbeat.  It
+ * runs only while TX frames are outstanding (tx_inflight > 0) or RX frames
+ * arrived within the recent grace window, and disarms otherwise so a
+ * connected-but-idle device costs zero CPU.  odl_tb5_poll_kick() re-arms it
+ * on the next submit / RX arrival.  Because the ISR independently kicks
+ * ring_work on real completions, disarming during idle only forgoes the
+ * write-back re-check — never a completion.
  */
 
 enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer)
@@ -48,10 +54,14 @@ enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer)
 		container_of(timer, struct odl_tb5_device, rx_poll_timer);
 
 	bool any_started = false;
+	bool keep;
+	u64 rxseen;
 	int i;
 
-	if (atomic_read(&dev->removing))
+	if (atomic_read(&dev->removing)) {
+		atomic_set(&dev->poll_active, 0);
 		return HRTIMER_NORESTART;
+	}
 
 	for (i = 0; i < dev->num_paths; i++) {
 		struct odl_tb5_path *path = &dev->paths[i];
@@ -66,13 +76,80 @@ enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer)
 			any_started = true;
 	}
 
-	if (dev->state >= ODL_TB5_STATE_CONNECTED && any_started) {
+	/* Reset the grace counter whenever an RX frame was seen since the last
+	 * tick; otherwise let it age.  These fields are touched only here, and
+	 * the timer never runs concurrently with itself, so no locking. */
+	rxseen = atomic64_read(&dev->stats.rx_frames_seen);
+	if (rxseen != dev->poll_last_rxseen) {
+		dev->poll_last_rxseen = rxseen;
+		dev->poll_idle_ticks = 0;
+	} else {
+		dev->poll_idle_ticks++;
+	}
+
+	keep = atomic_read(&dev->tx_inflight) > 0 ||
+	       dev->poll_idle_ticks < ODL_TB5_POLL_GRACE_TICKS;
+
+	if (dev->state >= ODL_TB5_STATE_CONNECTED && any_started && keep) {
+		hrtimer_forward_now(timer,
+				    ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS));
+		return HRTIMER_RESTART;
+	}
+
+	/*
+	 * Going idle: publish poll_active = 0 so a future odl_tb5_poll_kick()
+	 * will re-arm, then re-check for a TX submit that raced in between our
+	 * "keep" evaluation and the store.  If one did, reclaim the armed flag
+	 * (xchg) and keep polling; if poll_kick already reclaimed it we lose
+	 * the race harmlessly (it did the hrtimer_start).  The ISR remains the
+	 * correctness backstop regardless.
+	 */
+	atomic_set(&dev->poll_active, 0);
+	if (dev->state >= ODL_TB5_STATE_CONNECTED && any_started &&
+	    atomic_read(&dev->tx_inflight) > 0 &&
+	    atomic_xchg(&dev->poll_active, 1) == 0) {
 		hrtimer_forward_now(timer,
 				    ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS));
 		return HRTIMER_RESTART;
 	}
 
 	return HRTIMER_NORESTART;
+}
+
+/*
+ * (Re)arm the fallback poll if it is not already running.  Safe to call from
+ * process/workqueue context on every TX submit and RX arrival; the xchg fast
+ * path is a single atomic when the timer is already armed (the common case
+ * under load).  hrtimer_start may run concurrently with the timer callback on
+ * another CPU — the hrtimer core serialises this on the cpu_base lock.
+ */
+void odl_tb5_poll_kick(struct odl_tb5_device *dev)
+{
+	if (atomic_read(&dev->removing))
+		return;
+	if (dev->state < ODL_TB5_STATE_CONNECTED)
+		return;
+	if (atomic_xchg(&dev->poll_active, 1) == 0)
+		hrtimer_start(&dev->rx_poll_timer,
+			      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
+			      HRTIMER_MODE_REL);
+}
+
+/* Cancel the fallback poll and clear the armed flag so a later kick re-arms
+ * cleanly.  Callers that hold no timer-base lock only. */
+void odl_tb5_poll_disarm(struct odl_tb5_device *dev)
+{
+	hrtimer_cancel(&dev->rx_poll_timer);
+	atomic_set(&dev->poll_active, 0);
+}
+
+/* Bracket a successful tb_ring_tx: bump the outstanding-TX count and arm the
+ * poll on the idle→busy edge.  Paired 1:1 with the atomic_dec(&tx_inflight)
+ * in the TX completion callbacks. */
+void odl_tb5_tx_submitted(struct odl_tb5_device *dev)
+{
+	if (atomic_inc_return(&dev->tx_inflight) == 1)
+		odl_tb5_poll_kick(dev);
 }
 
 /* Find which odl_tb5_device owns a given tb_ring and return its ring_ctx. */
@@ -136,6 +213,10 @@ void odl_tb5_tx_callback(struct tb_ring *ring,
 		if (canceled)
 			ODL_STAT_INC(dev, tx_frames_canceled);
 
+		/* Paired with odl_tb5_tx_submitted() at the pool/ctrl TX
+		 * submit sites; runs for canceled frames too. */
+		atomic_dec(&dev->tx_inflight);
+
 		msg = slot->tx_msg;
 		odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 
@@ -154,7 +235,12 @@ void odl_tb5_tx_callback(struct tb_ring *ring,
 		if (canceled)
 			return;
 	} else {
-		/* Legacy path for proto layer direct ring submissions */
+		/* Legacy path for proto layer direct ring submissions.
+		 * Paired with odl_tb5_tx_submitted() at the legacy submit_tx /
+		 * dmabuf-TX sites; decrement before the canceled early-return so
+		 * canceled frames balance too. */
+		atomic_dec(&dev->tx_inflight);
+
 		if (canceled) {
 			pr_debug("odl_tb5: TX callback canceled\n");
 			return;
@@ -203,6 +289,10 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 	ODL_STAT_INC(dev, tx_frames_completed);
 	if (canceled)
 		ODL_STAT_INC(dev, tx_frames_canceled);
+
+	/* Paired with odl_tb5_tx_submitted() in the throughput submit loop;
+	 * one decrement per batch frame, canceled frames included. */
+	atomic_dec(&dev->tx_inflight);
 
 	msg = batch->tx_msg;
 
@@ -264,6 +354,11 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 				odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 				return;
 			}
+
+			/* Real RX arrival — (re)arm the fallback poll so the
+			 * write-back re-check covers frames that follow this
+			 * burst even if the device was idle (timer disarmed). */
+			odl_tb5_poll_kick(dev);
 
 			/* The 12-bit size field cannot express 4096, so a
 			 * completely filled frame wraps to 0.  Our TX caps
@@ -847,6 +942,7 @@ int odl_tb5_submit_tx(struct odl_tb5_device *dev,
 			       i, ret);
 			return ret;
 		}
+		odl_tb5_tx_submitted(dev);
 
 		remaining -= frame->size;
 	}
@@ -1008,6 +1104,7 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 			ret = tb_ring_tx(dev->paths[0].tx.ring, frame);
 			if (ret < 0)
 				goto err_unmap;
+			odl_tb5_tx_submitted(dev);
 
 			sg_addr += chunk;
 			sg_remaining -= chunk;
@@ -1757,6 +1854,7 @@ static int odl_tb5_stream_send_latency(struct odl_tb5_stream *stream,
 
 		ODL_STAT_INC(dev, tx_frames_submitted);
 		atomic64_inc(&dev->stats.path_tx_frames[tp]);
+		odl_tb5_tx_submitted(dev);
 	}
 
 	return 0;
@@ -1911,6 +2009,7 @@ static int odl_tb5_stream_send_throughput(struct odl_tb5_stream *stream,
 
 			ODL_STAT_INC(dev, tx_frames_submitted);
 			atomic64_inc(&dev->stats.path_tx_frames[tp]);
+			odl_tb5_tx_submitted(dev);
 		}
 
 		total_sent += batch_payload;
@@ -2064,6 +2163,7 @@ void odl_tb5_tx_drain_work_fn(struct work_struct *work)
 
 			ODL_STAT_INC(dev, tx_frames_submitted);
 			atomic64_inc(&dev->stats.path_tx_frames[tp]);
+			odl_tb5_tx_submitted(dev);
 			did_work = true;
 		}
 out:

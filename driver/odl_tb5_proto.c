@@ -555,9 +555,7 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 				"throughput mode disabled\n", bret);
 	}
 
-	hrtimer_start(&dev->rx_poll_timer,
-		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-		      HRTIMER_MODE_REL);
+	odl_tb5_poll_kick(dev);
 	if (!atomic_read(&dev->removing))
 		schedule_work(&dev->verify_work);
 
@@ -623,6 +621,7 @@ static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type,
 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 			return ret;
 		}
+		odl_tb5_tx_submitted(dev);
 
 		atomic64_inc(&dev->stats.path_tx_frames[path_idx]);
 		return 0;
@@ -795,7 +794,7 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 		pr_info("OdinLink: %d TX paths active\n", verified);
 
 	flush_work(&dev->ctrl_reply_work);
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 	odl_tb5_rings_reset(dev);
 
 	mutex_lock(&dev->state_lock);
@@ -820,18 +819,16 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 	for (p = 0; p < ODL_TB5_MAX_PATHS; p++)
 		dev->paths[p].rx_target = 0;
 
-	/* Restart the hrtimer poll for stream data — NHI MSI-X
-	 * interrupts fire but descriptor write-back can lag, so we poll
-	 * at 50 us to keep latency low. */
-	hrtimer_start(&dev->rx_poll_timer,
-		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-		      HRTIMER_MODE_REL);
+	/* Arm the on-demand poll for stream data — NHI MSI-X interrupts
+	 * fire but descriptor write-back can lag, so we poll at 10 us to
+	 * keep latency low.  It self-disarms once the device goes idle. */
+	odl_tb5_poll_kick(dev);
 
 	pr_info("OdinLink: entering READY state\n");
 	return;
 
 out_reset:
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 	odl_tb5_rings_reset(dev);
 
 	/* Liveness: a failed path-0 verify used to leave the device in
@@ -871,7 +868,7 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	if (atomic_read(&dev->removing))
 		return;
 
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
 	cancel_work_sync(&dev->connect_work);
@@ -993,6 +990,10 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
 	INIT_WORK(&dev->ctrl_reply_work, odl_tb5_ctrl_reply_work_fn);
 	hrtimer_setup(&dev->rx_poll_timer, odl_tb5_rx_poll_timer_fn,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	atomic_set(&dev->poll_active, 0);
+	atomic_set(&dev->tx_inflight, 0);
+	dev->poll_last_rxseen = 0;
+	dev->poll_idle_ticks = 0;
 	init_waitqueue_head(&dev->verify_waitq);
 
 	dev->login_retries  = 0;
@@ -1014,7 +1015,7 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
 /* Tear down the protocol layer for a device. */
 void odl_tb5_proto_exit(struct odl_tb5_device *dev)
 {
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
 	cancel_work_sync(&dev->restart_work);
