@@ -32,6 +32,28 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 | 🟡 | NCCL custom plugin | DMA-buf zero-copy path (legacy, use verbs transport instead) |
 | 🟡 | Async DMA-buf | Needs callback-based cleanup — stream path is already async via poll() |
 
+## Measured Performance
+
+Measured point-to-point between two AMD Ryzen AI MAX+ 395 ("Strix Halo")
+boxes over a **USB4 v1** link negotiated at **20 Gb/s × 2 lanes** (kernel
+7.0.14-3-pve). "Goodput" is application-level bytes received, not TX
+submission rate.
+
+| Configuration | Throughput | Goodput | Notes |
+|---|---|---|---|
+| Single stream, 1 DMA path | **9.3 Gb/s** (1.16 GB/s) | 100% | Per-path ceiling — router flow-control, not CPU or window |
+| 4 streams, **2 DMA paths** (MIMO) | **17.9 Gb/s** (2.24 GB/s) | 100% | Even stripe across paths (~50/50), 1.93× single path, 0 drops |
+| Idle latency (64 B round-trip) | **21.9 µs** median | — | Unchanged by multi-path |
+| Latency under 1 MB bulk load | 958 µs median | — | ⚠️ Head-of-line blocking (small messages queue behind bulk) — being worked on |
+
+**Multi-path striping** (module param `odl_num_paths`, default 2) is the
+throughput lever: the ~9.3 Gb/s cap is *per DMA path* (router credits), so
+aggregate scales with parallel ring/HopID pairs. On Strix Halo the NHI ring
+budget caps usable paths at **2** (a 3rd ring pair fails to allocate); the
+driver negotiates `min(local, remote)` paths and degrades gracefully. A
+single stream stays on one path — striping helps MIMO/collective workloads
+(NCCL/RCCL channels), which is the intended use.
+
 ## Quick Start
 
 ### Build & Run
