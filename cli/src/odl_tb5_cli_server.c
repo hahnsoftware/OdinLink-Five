@@ -42,8 +42,6 @@ int odl_cli_run_server(const struct odl_cli_params *params)
 	odl_tb5_get_peer(handle, &peer);
 	printf("Connected to peer: %s (%s)\n",
 	       peer.device_name, peer.vendor_name);
-	printf("Link speed: %u Gb/s (x%u lanes)\n\n",
-	       peer.link_speed, peer.link_width);
 
 	ret = odl_tb5_stream_open(handle, ODL_STREAM_TEST, &sid);
 	if (ret < 0) {
@@ -74,6 +72,13 @@ int odl_cli_run_server(const struct odl_cli_params *params)
 		fprintf(stderr, "Failed to send HELLO_ACK: %s\n", strerror(-ret));
 		goto out_stream;
 	}
+
+	/* Re-query the link speed only now: right after connect the link
+	 * may still be training (Gen2 10 Gb/s before the Gen3 upgrade and
+	 * lane bonding settle), so an early snapshot underreports. */
+	odl_tb5_get_peer(handle, &peer);
+	printf("Link speed: %u Gb/s (x%u lanes)\n",
+	       peer.link_speed, peer.link_width);
 
 	printf("Handshake complete. Waiting for test commands...\n\n");
 

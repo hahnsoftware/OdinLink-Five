@@ -372,26 +372,35 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 	case ODL_TB5_IOCTL_GET_PEER: {
 		struct odl_tb5_peer_info info;
+		struct tb_xdomain *xd = dev->xd;
 
 		memset(&info, 0, sizeof(info));
 
-		if (dev->xd && dev->xd->remote_uuid)
-			memcpy(info.uuid, dev->xd->remote_uuid, 16);
-
-		if (dev->xd) {
-			info.link_speed = dev->xd->link_speed;
-			info.link_width = dev->xd->link_width;
+		if (xd) {
+			/* link_speed/link_width and the name strings are
+			 * updated asynchronously by the Thunderbolt core
+			 * (property exchange, lane bonding, Gen2->Gen3
+			 * upgrade) and must be read under xd->lock.  The
+			 * values are live at ioctl time — they feed the
+			 * same fields as sysfs tx_speed/tx_lanes — but can
+			 * still show the pre-training speed if queried
+			 * immediately after connect; callers who care
+			 * should re-query once the link has settled. */
+			mutex_lock(&xd->lock);
+			if (xd->remote_uuid)
+				memcpy(info.uuid, xd->remote_uuid, 16);
+			info.link_speed = xd->link_speed;
+			info.link_width = xd->link_width;
+			if (xd->vendor_name)
+				strscpy(info.vendor_name, xd->vendor_name,
+					sizeof(info.vendor_name));
+			if (xd->device_name)
+				strscpy(info.device_name, xd->device_name,
+					sizeof(info.device_name));
+			mutex_unlock(&xd->lock);
 		}
 
 		info.state = dev->state;
-
-		if (dev->xd && dev->xd->vendor_name)
-			strscpy(info.vendor_name, dev->xd->vendor_name,
-				sizeof(info.vendor_name));
-
-		if (dev->xd && dev->xd->device_name)
-			strscpy(info.device_name, dev->xd->device_name,
-				sizeof(info.device_name));
 
 		if (copy_to_user(uarg, &info, sizeof(info)))
 			return -EFAULT;
