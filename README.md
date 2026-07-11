@@ -29,8 +29,9 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 | 🟢 | Async I/O | `poll()` + `O_NONBLOCK` ioctls end-to-end |
 | 🟢 | No-cable testing | `loopback=1` module param + mock library |
 | 🟢 | NCCL verbs transport | NCCL's built-in `NCCL_NET_PLUGIN=IB` transport auto-discovers ODL via `ibv_get_device_list` |
-| 🟡 | NCCL custom plugin | DMA-buf zero-copy path (legacy, use verbs transport instead) |
-| 🟡 | Async DMA-buf | Needs callback-based cleanup — stream path is already async via poll() |
+| 🟢 | DMA-buf zero-copy engine | `submit_tx/rx_dmabuf` verified end-to-end (64K–8M, integrity OK, no hang); shared by the verbs `ibv_reg_dmabuf_mr` path |
+| 🟡 | NCCL custom plugin | Deprecated — prefer the verbs transport, which drives the same zero-copy DMA engine |
+| 🟡 | Async / persistent DMA-buf | Transport is correct but synchronous and maps per transfer; completion callbacks exist — async cleanup + map-once (persistent MR) are TODO |
 
 ## Measured Performance
 
