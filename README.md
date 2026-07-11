@@ -55,6 +55,30 @@ driver negotiates `min(local, remote)` paths and degrades gracefully. A
 single stream stays on one path — striping helps MIMO/collective workloads
 (NCCL/RCCL channels), which is the intended use.
 
+### Zero-copy DMA-buf over verbs (the GPU / RCCL transport)
+
+Symmetric zero-copy `ibv_reg_dmabuf_mr` send **and** receive — the path an
+RCCL/GPU workload actually takes — measured with a two-box verbs ping-pong
+(`verbs/tests/bench_verbs_dmabuf.c`) over real `/dev/dma_heap/system` buffers.
+Bytes are verified across the link every run (integrity OK), and the DMA path
+through the NHI is identical for a GPU (amdgpu/CUDA) dmabuf. This is the
+synchronous single-path (`paths[0]`) engine — no striping or pipelining yet.
+
+| Transfer size | One-way throughput | Integrity |
+|---|---|---|
+| 64 KB  | ~5.8 Gb/s (0.73 GB/s) | OK |
+| 256 KB | 8.07 Gb/s (1.01 GB/s) | OK |
+| 1 MB   | 9.27 Gb/s (1.16 GB/s) | OK |
+| 4 MB   | 9.74 Gb/s (1.22 GB/s) | OK |
+| 8 MB   | **9.79 Gb/s** (1.22 GB/s) | OK |
+
+Large transfers reach the same ~9.8 Gb/s single-path ceiling as the stream
+path. Small-message latency is dominated by the synchronous round trip; the
+host-memory path (stock perftest over the provider) measures `ib_send_lat`
+**t_min 5.25 µs** / typical 10.8 µs and `ib_send_bw` (64 KB) **967 MiB/s**.
+Multi-path striping for this DMA-buf path is the next throughput lever (the
+2-path stream result above shows the headroom).
+
 ## Quick Start
 
 ### Build & Run
