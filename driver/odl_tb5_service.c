@@ -208,6 +208,24 @@ static void odl_tb5_remove(struct tb_service *svc)
 	if (!dev)
 		return;
 
+	/* Shutdown/reboot fast-path.  On reboot this runs from
+	 *   device_shutdown -> pci_device_shutdown(nhi) -> tb_domain_remove ->
+	 *   tb_xdomain_remove -> unregister_service -> device_release_driver
+	 * i.e. the entire Thunderbolt stack is being torn down under us.  The
+	 * normal teardown calls odl_tb5_rings_stop() -> tb_ring_stop(), which
+	 * blocks in flush_work() waiting for ring work the already-dying NHI will
+	 * never run again — wedging systemd-shutdown in D state with no console,
+	 * pinging but no sshd, recoverable only by a physical power cycle (this
+	 * is the ACTUAL stack we captured, not the domain-mutex path guessed at
+	 * earlier).  The imminent reboot resets the NHI and all of memory, so the
+	 * only safe move is to touch nothing and return: leaked structs and
+	 * in-flight DMA are irrelevant when the controller is about to reset. */
+	if (system_state != SYSTEM_RUNNING) {
+		pr_info("odl_tb5: shutdown fast-path — skipping teardown (index %d)\n",
+			dev->index);
+		return;
+	}
+
 	atomic_set(&dev->removing, 1);
 
 	mutex_lock(&dev->state_lock);
