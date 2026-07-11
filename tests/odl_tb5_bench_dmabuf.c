@@ -45,8 +45,10 @@
 
 #include <odl_tb5/odl_tb5.h>
 
-/* Default size sweep (bytes) and iteration counts. */
-static size_t g_sizes[]   = { 65536, 262144, 1048576, 4194304, 16777216 };
+/* Default size sweep (bytes) and iteration counts.  Capacity is 16 to match
+ * the --sizes parser's cap; sizing it to the initializer (5) let >5 sizes
+ * overflow into the globals below (corrupting g_iters/g_num_sizes). */
+static size_t g_sizes[16] = { 65536, 262144, 1048576, 4194304, 16777216 };
 static int    g_num_sizes = 5;
 static int    g_iters     = 200;
 static int    g_warmup    = 20;
