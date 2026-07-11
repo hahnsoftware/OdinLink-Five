@@ -261,6 +261,41 @@ int ibv_dereg_mr(struct ibv_mr *mr)
     return real_fn ? real_fn(mr) : -ENOSYS;
 }
 
+/* Modern <infiniband/verbs.h> expands ibv_reg_mr(...) to a call to
+ * ibv_reg_mr_iova2(), so a caller compiled against current rdma-core (e.g.
+ * perftest) never reaches our ibv_reg_mr symbol above — it lands here.
+ * Route odl PDs to the same odl_reg_mr; forward everything else. */
+struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
+                                uint64_t iova, unsigned int access)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_pd(pd))
+        return odl_reg_mr(pd, addr, length, iova, (int)access);
+    static struct ibv_mr *(*real_fn)(struct ibv_pd *, void *, size_t,
+                                     uint64_t, unsigned int);
+    if (!real_fn) { real_fn = dlsym(RTLD_NEXT, "ibv_reg_mr_iova2"); }
+    return real_fn ? real_fn(pd, addr, length, iova, access) : NULL;
+}
+
+/* ── ibv_query_gid ──────────────────────────────────────────────────────
+ * perftest queries the local GID to build its connection address vector.
+ * We have no real GID table; return an all-zero GID (consistent with the
+ * zero LID/GID query_port reports) so the standard tool can proceed instead
+ * of falling through to real libibverbs on our synthetic context. */
+int ibv_query_gid(struct ibv_context *context, uint8_t port_num,
+                  int index, union ibv_gid *gid)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_ctx(context)) {
+        if (gid)
+            memset(gid, 0, sizeof(*gid));
+        return 0;
+    }
+    int (*real_fn)(struct ibv_context *, uint8_t, int, union ibv_gid *) =
+        resolve_verbs_func("ibv_query_gid");
+    return real_fn ? real_fn(context, port_num, index, gid) : -ENOSYS;
+}
+
 /* ── ibv_create_cq / ibv_destroy_cq ─────────────────────────────────── */
 
 struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,

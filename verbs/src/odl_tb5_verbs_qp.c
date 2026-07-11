@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sched.h>
 
 /* ── Worker Thread ──────────────────────────────────────────────────── */
 
@@ -61,6 +62,74 @@ static int odl_lookup_dmabuf(struct odl_verbs_context *ctx, uint32_t lkey)
     return -1;
 }
 
+/* Drain at most one posted receive if stream data is ready.  Returns true if
+ * a completion was posted.  Non-blocking: the worker must stay free to also
+ * service sends, so we only touch the RQ when POLLIN says data has arrived. */
+static bool odl_qp_drain_recv(struct odl_verbs_qp *qp)
+{
+    struct odl_verbs_context *ctx = qp->ctx;
+    int dev_fd = ctx->base.cmd_fd;
+
+    (void)dev_fd;
+    pthread_mutex_lock(&qp->rq_lock);
+    bool have = qp->rq_count > 0;
+    pthread_mutex_unlock(&qp->rq_lock);
+    if (!have)
+        return false;
+
+    pthread_mutex_lock(&qp->rq_lock);
+    if (qp->rq_count == 0) {
+        pthread_mutex_unlock(&qp->rq_lock);
+        return false;
+    }
+    struct ibv_recv_wr *rwr = qp->rq[qp->rq_head];
+    qp->rq_head = (qp->rq_head + 1) % ODL_VERBS_RQ_DEPTH;
+    qp->rq_count--;
+    pthread_mutex_unlock(&qp->rq_lock);
+
+    uint8_t src_id = 0;
+    uint32_t actual = 0;
+    int ret = 0;
+    struct ibv_sge *sge = (rwr->num_sge > 0) ? &rwr->sg_list[0] : NULL;
+
+    if (sge) {
+        ret = odl_tb5_stream_recv(ctx->handle, qp->stream_id,
+                                  (void *)(uintptr_t)sge->addr,
+                                  sge->length, &src_id, &actual);
+        if (ret != -EAGAIN)
+            odl_logverbose("RX drain stream=%u ret=%d actual=%u src=%u",
+                        qp->stream_id, ret, actual, src_id);
+        if (ret == -EAGAIN) {
+            /* Data vanished between poll and recv (rare) — re-post at the
+             * head so ordering is preserved and retry on a later tick. */
+            pthread_mutex_lock(&qp->rq_lock);
+            qp->rq_head = (qp->rq_head + ODL_VERBS_RQ_DEPTH - 1)
+                          % ODL_VERBS_RQ_DEPTH;
+            qp->rq[qp->rq_head] = rwr;
+            qp->rq_count++;
+            pthread_mutex_unlock(&qp->rq_lock);
+            return false;
+        }
+    }
+
+    struct ibv_wc wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.wr_id    = rwr->wr_id;
+    wc.qp_num   = qp->base.qp_num;
+    wc.src_qp   = src_id;
+    wc.opcode   = IBV_WC_RECV;
+    wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+    wc.byte_len = (ret == 0) ? actual : 0;
+
+    if (ret != 0)
+        odl_logerr("recv failed: stream=%u ret=%d", qp->stream_id, ret);
+
+    if (qp->recv_cq)
+        odl_cq_post(qp->recv_cq, &wc);
+    atomic_fetch_sub(&qp->pending_recvs, 1);
+    return true;
+}
+
 static void *odl_qp_worker(void *arg)
 {
     struct odl_verbs_qp *qp = arg;
@@ -80,31 +149,25 @@ static void *odl_qp_worker(void *arg)
         pthread_mutex_unlock(&qp->sq_lock);
 
         if (!wr) {
-            /* No work — poll for TX readiness with 100ms timeout.
-             * This also yields the CPU when idle instead of busy-waiting. */
-            odl_worker_poll_fd(qp, 100);
+            /* No send work — drain a posted receive if data is ready.  If
+             * there was nothing to do either way, block briefly on the
+             * device fd (either direction wakes us) to yield the CPU. */
+            if (!odl_qp_drain_recv(qp)) {
+                /* Busy-poll: perftest posts the next send to the SQ without
+                 * signalling the device fd, and RX arrives within microseconds,
+                 * so a blocking poll would cap latency at its timeout.  Spin
+                 * (RDMA polling-mode style) and yield the CPU cheaply so we
+                 * pick up either a new send or an arriving recv immediately. */
+                sched_yield();
+            }
             continue;
         }
 
-        /* Poll the device fd until it signals TX readiness.
-         * Since the fd is O_NONBLOCK, the stream_send ioctl will
-         * return -EAGAIN immediately if frames aren't available.
-         * We poll first to avoid unnecessary ioctl calls.
-         *
-         * If poll fails (e.g., bad fd in mock mode), fall back to
-         * immediate non-blocking send without waiting. */
-        int poll_ret = odl_worker_poll_fd(qp, 5000);
-        if (poll_ret == -ETIMEDOUT) {
-            /* No response in 5s — try anyway, the send may still work */
-        } else if (poll_ret != 0) {
-            /* Bad fd or signal — try a non-blocking send directly,
-             * then back off if it fails. */
-            odl_logverbose("worker poll failed for stream %u: %d, "
-                            "falling back to direct send",
-                            qp->stream_id, poll_ret);
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-            nanosleep(&ts, NULL);
-        }
+        /* stream_send is non-blocking (O_NONBLOCK fd) and returns -EAGAIN if
+         * no TX frames are available; the EAGAIN path below re-queues.  Do
+         * NOT gate on poll(POLLOUT) here: the driver only raises EPOLLOUT on
+         * path-level tx.completed, which stream sends never bump, so polling
+         * it stalls for the full timeout on every send. */
 
         /* Execute the send (non-blocking — fd is O_NONBLOCK) */
         int ret;
@@ -117,15 +180,19 @@ static void *odl_qp_worker(void *arg)
 
             if (dmabuf_fd >= 0) {
                 ret = odl_tb5_stream_send_dmabuf(
-                    h, qp->stream_id, 0,
+                    h, qp->stream_id, qp->dest_stream_id,
                     dmabuf_fd, 0, sge->length);
             } else {
                 void *data = (void *)(uintptr_t)sge->addr;
                 ret = odl_tb5_stream_send(
-                    h, qp->stream_id, 0,
+                    h, qp->stream_id, qp->dest_stream_id,
                     data, sge->length);
             }
 
+            if (ret != -EAGAIN)
+                odl_logverbose("TX stream=%u dst=%u ret=%d len=%u",
+                            qp->stream_id, qp->dest_stream_id, ret,
+                            sge->length);
             if (ret == -EAGAIN) {
                 /* Non-blocking send couldn't proceed — re-queue and retry */
                 odl_logverbose("send EAGAIN stream=%u, re-queueing", qp->stream_id);
@@ -159,6 +226,10 @@ static void *odl_qp_worker(void *arg)
             odl_cq_post(qp->send_cq, &wc);
 
         atomic_fetch_sub(&qp->pending_sends, 1);
+
+        /* Service any receive that arrived while we were sending — keeps
+         * ping-pong latency low instead of waiting for the next idle tick. */
+        odl_qp_drain_recv(qp);
     }
 
     return NULL;
@@ -212,6 +283,12 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
     qp->sq_tail  = 0;
     qp->sq_count = 0;
 
+    /* Initialize RQ */
+    pthread_mutex_init(&qp->rq_lock, NULL);
+    qp->rq_head  = 0;
+    qp->rq_tail  = 0;
+    qp->rq_count = 0;
+
     atomic_init(&qp->pending_sends, 0);
     atomic_init(&qp->pending_recvs, 0);
 
@@ -221,6 +298,7 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
         pthread_mutex_unlock(&ctx->qp_lock);
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
+        pthread_mutex_destroy(&qp->rq_lock);
         free(qp);
         errno = ENOMEM;
         return NULL;
@@ -236,6 +314,7 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
         qp->worker_running = false;
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
+        pthread_mutex_destroy(&qp->rq_lock);
         free(qp);
         errno = EAGAIN;
         return NULL;
@@ -275,6 +354,7 @@ int odl_destroy_qp(struct ibv_qp *qp)
     pthread_mutex_unlock(&ctx->qp_lock);
 
     pthread_mutex_destroy(&oqp->sq_lock);
+    pthread_mutex_destroy(&oqp->rq_lock);
     free(oqp);
 
     odl_loginfo("destroy_qp: stream=%u", oqp->stream_id);
@@ -288,6 +368,17 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 {
     ODL_TRACE_ENTRY();
     ODL_RETURN_EINVAL_IF(!qp, "null qp");
+
+    /* Capture the peer's stream id from the RDMA connection handshake.
+     * qp_num == stream_id on both ends, so dest_qp_num is the peer's stream;
+     * the send worker uses it as the dst_id so data lands in the peer QP's
+     * receive stream instead of a hardcoded 0. */
+    if (attr_mask & IBV_QP_DEST_QPN) {
+        struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
+        oqp->dest_stream_id = (uint8_t)attr->dest_qp_num;
+        odl_loginfo("modify_qp: qp_num=%u dest_stream=%u",
+                     qp->qp_num, oqp->dest_stream_id);
+    }
 
     if (attr_mask & IBV_QP_STATE) {
         qp->state = attr->qp_state;
@@ -334,77 +425,36 @@ int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
     return 0;
 }
 
-/* ── Post Recv (async via poll + non-blocking) ──────────────────────── */
-
+/* ── Post Recv (async: enqueue only, worker drains) ─────────────────────
+ * RDMA semantics require post_recv to enqueue the receive buffer and return
+ * immediately — the completion is delivered later via the CQ once data
+ * arrives.  (The old implementation blocked here doing an inline stream_recv,
+ * which fails for any app that posts receives before data exists, e.g.
+ * perftest.)  We mirror the send path: enqueue into the RQ ring and let the
+ * QP worker (odl_qp_drain_recv) consume arriving data and post IBV_WC_RECV. */
 int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                    struct ibv_recv_wr **bad_wr)
 {
     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
-    struct odl_verbs_context *ctx = oqp->ctx;
-    int dev_fd = ctx->base.cmd_fd;
     *bad_wr = NULL;
 
+    pthread_mutex_lock(&oqp->rq_lock);
     while (wr) {
-        if (wr->num_sge > 0) {
-            struct ibv_sge *sge = &wr->sg_list[0];
-            uint8_t src_id = 0;
-            uint32_t actual = 0;
-
-            /* Poll for RX readiness (up to 5 second timeout).
-             * Since the fd is O_NONBLOCK, stream_recv returns -EAGAIN
-             * immediately if no data is available. */
-            if (dev_fd >= 0) {
-                struct pollfd pfd = {
-                    .fd     = dev_fd,
-                    .events = POLLIN,
-                };
-                int pr = poll(&pfd, 1, 5000);
-                if (pr <= 0 || !(pfd.revents & POLLIN)) {
-                    *bad_wr = wr;
-                    return pr == 0 ? -ETIMEDOUT : -EAGAIN;
-                }
-            }
-
-            /* Non-blocking recv */
-            int ret = odl_tb5_stream_recv(
-                ctx->handle, oqp->stream_id,
-                (void *)(uintptr_t)sge->addr,
-                sge->length,
-                &src_id, &actual);
-
-            if (ret == -EAGAIN) {
-                /* No data yet despite poll saying ready — rare race.
-                 * Return the bad WR and let the caller retry. */
-                *bad_wr = wr;
-                return -EAGAIN;
-            }
-
-            struct ibv_wc wc;
-            memset(&wc, 0, sizeof(wc));
-            wc.qp_num   = qp->qp_num;
-            wc.src_qp   = src_id;
-            wc.opcode   = IBV_WC_RECV;
-            wc.slid     = 0;
-            wc.sl       = 0;
-            wc.vendor_err = 0;
-
-            if (ret == 0) {
-                wc.status   = IBV_WC_SUCCESS;
-                wc.byte_len = actual;
-            } else {
-                wc.status   = IBV_WC_GENERAL_ERR;
-                wc.byte_len = 0;
-                odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
-            }
-
-            if (oqp->recv_cq)
-                odl_cq_post(oqp->recv_cq, &wc);
-
-            atomic_fetch_sub(&oqp->pending_recvs, 1);
+        if (oqp->rq_count >= ODL_VERBS_RQ_DEPTH) {
+            *bad_wr = wr;
+            pthread_mutex_unlock(&oqp->rq_lock);
+            odl_logerr("post_recv: RQ full on QP %u", qp->qp_num);
+            return -ENOMEM;
         }
+
+        oqp->rq[oqp->rq_tail] = wr;
+        oqp->rq_tail = (oqp->rq_tail + 1) % ODL_VERBS_RQ_DEPTH;
+        oqp->rq_count++;
+        atomic_fetch_add(&oqp->pending_recvs, 1);
+
         wr = wr->next;
     }
-
+    pthread_mutex_unlock(&oqp->rq_lock);
     return 0;
 }
 

@@ -66,6 +66,7 @@
 #define ODL_VERBS_MAX_CQS               128
 #define ODL_VERBS_COMP_CHANNEL_BACKLOG   64
 #define ODL_VERBS_SQ_DEPTH              64
+#define ODL_VERBS_RQ_DEPTH              512
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 
@@ -135,7 +136,9 @@ struct odl_verbs_qp {
     struct odl_verbs_pd      *pd;
     struct odl_verbs_cq      *send_cq;
     struct odl_verbs_cq      *recv_cq;
-    uint8_t                   stream_id;
+    uint8_t                   stream_id;      /* local stream (== qp_num) */
+    uint8_t                   dest_stream_id; /* peer stream, from modify_qp
+                                               * dest_qp_num at RTR */
 
     /* Work submission queue (async via worker thread) */
     pthread_mutex_t           sq_lock;
@@ -143,6 +146,15 @@ struct odl_verbs_qp {
     int                       sq_head;
     int                       sq_tail;
     int                       sq_count;
+
+    /* Receive queue: post_recv enqueues posted buffers here and returns
+     * immediately (RDMA semantics); the worker drains them into arriving
+     * stream data and posts IBV_WC_RECV completions. */
+    pthread_mutex_t           rq_lock;
+    struct ibv_recv_wr       *rq[ODL_VERBS_RQ_DEPTH];
+    int                       rq_head;
+    int                       rq_tail;
+    int                       rq_count;
 
     /* Worker thread */
     pthread_t                 worker;
