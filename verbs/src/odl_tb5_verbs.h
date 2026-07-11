@@ -64,7 +64,11 @@
 #define ODL_VERBS_MAX_MRS               512
 #define ODL_VERBS_MAX_QPS               256
 #define ODL_VERBS_MAX_CQS               128
-#define ODL_VERBS_COMP_CHANNEL_BACKLOG   64
+/* Completion-ring depth.  odl_cq_post drops (and only logs) completions when
+ * this fills — a dropped WC hangs the app forever — so it must comfortably
+ * exceed the largest CQ an app creates (perftest bw uses tx_depth up to 128
+ * per QP, ×N QPs sharing one CQ).  64 was far too small under load. */
+#define ODL_VERBS_COMP_CHANNEL_BACKLOG   4096
 #define ODL_VERBS_SQ_DEPTH              64
 #define ODL_VERBS_RQ_DEPTH              512
 
