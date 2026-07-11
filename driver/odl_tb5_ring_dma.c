@@ -718,6 +718,22 @@ static int odl_tb5_ring_pair_alloc(struct odl_tb5_device *dev, int idx,
 		goto err_free_tx_ring;
 	}
 
+	/* Ensure the NHI DMA device advertises a 64-bit streaming mask.  All
+	 * our dmabuf/frame-pool mappings (dma_buf_map_attachment, dma_map_sg)
+	 * go through tb_ring_dma_device(); if that device has no streaming
+	 * dma_mask, dma_map_sg WARNs and, with an IOMMU active, can hand back
+	 * wrong addresses.  Today amd_iommu=off masks this (direct mapping),
+	 * but setting the mask makes the path correct with the IOMMU on too.
+	 * The NHI device is shared across paths, so this is idempotent. */
+	{
+		struct device *dma_dev = tb_ring_dma_device(path->tx.ring);
+
+		if (dma_dev && dma_set_mask_and_coherent(dma_dev,
+							 DMA_BIT_MASK(64)))
+			pr_warn("odl_tb5: 64-bit DMA mask unavailable on NHI "
+				"device; leaving existing mask\n");
+	}
+
 	pr_info("odl_tb5: rings allocated: TX hop=%d, RX hop=%d, "
 		"local_tx_hopid=%d (E2E enabled, e2e_tx_hop=%d)\n",
 		path->tx.ring->hop, path->rx.ring->hop,
