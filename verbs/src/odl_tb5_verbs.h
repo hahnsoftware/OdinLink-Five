@@ -160,9 +160,13 @@ struct odl_verbs_qp {
     int                       rq_tail;
     int                       rq_count;
 
-    /* Worker thread */
-    pthread_t                 worker;
+    /* Worker threads.  Send and receive run on separate threads so a
+     * blocking zero-copy dmabuf recv (odl_tb5_stream_recv_dmabuf is
+     * synchronous) can never stall a pending send the peer is waiting on. */
+    pthread_t                 worker;          /* send worker */
     bool                      worker_running;
+    pthread_t                 recv_worker;     /* recv worker (drains RQ) */
+    bool                      recv_worker_running;
 
     /* Async tracking */
     atomic_int                pending_sends;

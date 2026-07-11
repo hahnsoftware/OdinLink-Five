@@ -277,6 +277,26 @@ struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
     return real_fn ? real_fn(pd, addr, length, iova, access) : NULL;
 }
 
+/* ── ibv_reg_dmabuf_mr ──────────────────────────────────────────────────
+ * The zero-copy GPU path (RCCL, and any app registering GPU/dma_heap memory)
+ * registers through ibv_reg_dmabuf_mr, a real libibverbs symbol that would
+ * otherwise dispatch through the verbs_context our standalone lib doesn't wrap
+ * (garbage/EOPNOTSUPP on our fake context — same reason ibv_reg_mr_iova2 is
+ * interposed).  Route odl PDs to odl_reg_dmabuf_mr (mr_type=1, zero-copy send
+ * AND recv); forward everything else. */
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+                                 size_t length, uint64_t iova,
+                                 int fd, int access)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_pd(pd))
+        return odl_reg_dmabuf_mr(pd, offset, length, iova, fd, access);
+    static struct ibv_mr *(*real_fn)(struct ibv_pd *, uint64_t, size_t,
+                                     uint64_t, int, int);
+    if (!real_fn) { real_fn = dlsym(RTLD_NEXT, "ibv_reg_dmabuf_mr"); }
+    return real_fn ? real_fn(pd, offset, length, iova, fd, access) : NULL;
+}
+
 /* ── ibv_query_gid ──────────────────────────────────────────────────────
  * perftest queries the local GID to build its connection address vector.
  * We have no real GID table; return an all-zero GID (consistent with the

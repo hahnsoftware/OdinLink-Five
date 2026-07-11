@@ -62,20 +62,17 @@ static int odl_lookup_dmabuf(struct odl_verbs_context *ctx, uint32_t lkey)
     return -1;
 }
 
-/* Drain at most one posted receive if stream data is ready.  Returns true if
- * a completion was posted.  Non-blocking: the worker must stay free to also
- * service sends, so we only touch the RQ when POLLIN says data has arrived. */
+/* Drain at most one posted receive.  Returns true if a completion was posted.
+ *
+ * Runs on the dedicated recv worker (never the send worker), so it is free to
+ * block: a dmabuf MR takes the zero-copy path (odl_tb5_stream_recv_dmabuf,
+ * which blocks in the kernel until the DMA completes), mirroring the send-side
+ * odl_lookup_dmabuf dispatch.  Host MRs keep the non-blocking stream_recv with
+ * EAGAIN re-post, so an app that posts a receive before data arrives (perftest)
+ * still works. */
 static bool odl_qp_drain_recv(struct odl_verbs_qp *qp)
 {
     struct odl_verbs_context *ctx = qp->ctx;
-    int dev_fd = ctx->base.cmd_fd;
-
-    (void)dev_fd;
-    pthread_mutex_lock(&qp->rq_lock);
-    bool have = qp->rq_count > 0;
-    pthread_mutex_unlock(&qp->rq_lock);
-    if (!have)
-        return false;
 
     pthread_mutex_lock(&qp->rq_lock);
     if (qp->rq_count == 0) {
@@ -93,22 +90,37 @@ static bool odl_qp_drain_recv(struct odl_verbs_qp *qp)
     struct ibv_sge *sge = (rwr->num_sge > 0) ? &rwr->sg_list[0] : NULL;
 
     if (sge) {
-        ret = odl_tb5_stream_recv(ctx->handle, qp->stream_id,
-                                  (void *)(uintptr_t)sge->addr,
-                                  sge->length, &src_id, &actual);
-        if (ret != -EAGAIN)
-            odl_logverbose("RX drain stream=%u ret=%d actual=%u src=%u",
-                        qp->stream_id, ret, actual, src_id);
-        if (ret == -EAGAIN) {
-            /* Data vanished between poll and recv (rare) — re-post at the
-             * head so ordering is preserved and retry on a later tick. */
-            pthread_mutex_lock(&qp->rq_lock);
-            qp->rq_head = (qp->rq_head + ODL_VERBS_RQ_DEPTH - 1)
-                          % ODL_VERBS_RQ_DEPTH;
-            qp->rq[qp->rq_head] = rwr;
-            qp->rq_count++;
-            pthread_mutex_unlock(&qp->rq_lock);
-            return false;
+        int dmabuf_fd = odl_lookup_dmabuf(ctx, sge->lkey);
+
+        if (dmabuf_fd >= 0) {
+            /* Zero-copy GPU RX: DMA straight into the dmabuf.  Blocking —
+             * safe here because sends run on the other worker.  Mirrors the
+             * send side's offset 0 / full-length convention. */
+            ret = odl_tb5_stream_recv_dmabuf(ctx->handle, qp->stream_id,
+                                             dmabuf_fd, 0, sge->length);
+            actual = (ret == 0) ? sge->length : 0;
+            src_id = qp->dest_stream_id;
+            if (ret != 0)
+                odl_logverbose("RX dmabuf stream=%u ret=%d len=%u",
+                            qp->stream_id, ret, sge->length);
+        } else {
+            ret = odl_tb5_stream_recv(ctx->handle, qp->stream_id,
+                                      (void *)(uintptr_t)sge->addr,
+                                      sge->length, &src_id, &actual);
+            if (ret != -EAGAIN)
+                odl_logverbose("RX drain stream=%u ret=%d actual=%u src=%u",
+                            qp->stream_id, ret, actual, src_id);
+            if (ret == -EAGAIN) {
+                /* Data not here yet — re-post at the head so ordering is
+                 * preserved and retry on a later tick. */
+                pthread_mutex_lock(&qp->rq_lock);
+                qp->rq_head = (qp->rq_head + ODL_VERBS_RQ_DEPTH - 1)
+                              % ODL_VERBS_RQ_DEPTH;
+                qp->rq[qp->rq_head] = rwr;
+                qp->rq_count++;
+                pthread_mutex_unlock(&qp->rq_lock);
+                return false;
+            }
         }
     }
 
@@ -149,17 +161,12 @@ static void *odl_qp_worker(void *arg)
         pthread_mutex_unlock(&qp->sq_lock);
 
         if (!wr) {
-            /* No send work — drain a posted receive if data is ready.  If
-             * there was nothing to do either way, block briefly on the
-             * device fd (either direction wakes us) to yield the CPU. */
-            if (!odl_qp_drain_recv(qp)) {
-                /* Busy-poll: perftest posts the next send to the SQ without
-                 * signalling the device fd, and RX arrives within microseconds,
-                 * so a blocking poll would cap latency at its timeout.  Spin
-                 * (RDMA polling-mode style) and yield the CPU cheaply so we
-                 * pick up either a new send or an arriving recv immediately. */
-                sched_yield();
-            }
+            /* No send work.  Receives are drained on the dedicated recv
+             * worker, so just yield the CPU and re-check the SQ.  Busy-poll
+             * (RDMA polling-mode style): perftest posts the next send to the
+             * SQ without signalling the device fd, so a blocking poll would
+             * cap latency at its timeout. */
+            sched_yield();
             continue;
         }
 
@@ -226,10 +233,21 @@ static void *odl_qp_worker(void *arg)
             odl_cq_post(qp->send_cq, &wc);
 
         atomic_fetch_sub(&qp->pending_sends, 1);
+    }
 
-        /* Service any receive that arrived while we were sending — keeps
-         * ping-pong latency low instead of waiting for the next idle tick. */
-        odl_qp_drain_recv(qp);
+    return NULL;
+}
+
+/* Dedicated recv worker: owns the RQ so a blocking dmabuf recv here can never
+ * hold up a send (which runs on odl_qp_worker).  Busy-polls like the send side
+ * for the host path; a dmabuf recv parks in the kernel until the DMA lands. */
+static void *odl_qp_recv_worker(void *arg)
+{
+    struct odl_verbs_qp *qp = arg;
+
+    while (qp->recv_worker_running) {
+        if (!odl_qp_drain_recv(qp))
+            sched_yield();
     }
 
     return NULL;
@@ -306,12 +324,28 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
     ctx->qps[ctx->nqps++] = qp;
     pthread_mutex_unlock(&ctx->qp_lock);
 
-    /* Start async worker thread */
+    /* Start async worker threads: one for sends, one for receives.  Splitting
+     * them lets a blocking dmabuf recv run without stalling pending sends. */
     qp->worker_running = true;
     ret = pthread_create(&qp->worker, NULL, odl_qp_worker, qp);
     if (ret != 0) {
-        odl_logerr("pthread_create failed: %d", ret);
+        odl_logerr("pthread_create (send) failed: %d", ret);
         qp->worker_running = false;
+        odl_tb5_stream_close(ctx->handle, stream_id);
+        pthread_mutex_destroy(&qp->sq_lock);
+        pthread_mutex_destroy(&qp->rq_lock);
+        free(qp);
+        errno = EAGAIN;
+        return NULL;
+    }
+
+    qp->recv_worker_running = true;
+    ret = pthread_create(&qp->recv_worker, NULL, odl_qp_recv_worker, qp);
+    if (ret != 0) {
+        odl_logerr("pthread_create (recv) failed: %d", ret);
+        qp->recv_worker_running = false;
+        qp->worker_running = false;
+        pthread_join(qp->worker, NULL);
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
         pthread_mutex_destroy(&qp->rq_lock);
@@ -335,9 +369,13 @@ int odl_destroy_qp(struct ibv_qp *qp)
     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
     struct odl_verbs_context *ctx = oqp->ctx;
 
-    /* Stop worker thread */
+    /* Stop worker threads.  The recv worker only blocks in a dmabuf recv while
+     * a receive is posted; a well-behaved app drains its receives before
+     * destroy, so it is spinning on an empty RQ and joins promptly. */
     oqp->worker_running = false;
+    oqp->recv_worker_running = false;
     pthread_join(oqp->worker, NULL);
+    pthread_join(oqp->recv_worker, NULL);
 
     /* Close the OdinLink-Five stream */
     if (oqp->stream_id > 0)
