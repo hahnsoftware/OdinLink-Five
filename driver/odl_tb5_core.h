@@ -548,6 +548,14 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 void odl_tb5_rx_callback(struct tb_ring *ring,
 			 struct ring_frame *frame, bool canceled);
 
+/* Dedicated completions for the synchronous dmabuf path.  Those frames carry
+ * raw dmabuf payload with no proto/ctrl framing, so they must NOT be run
+ * through the shared callbacks' legacy double-buffer / ctrl-magic peek. */
+void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled);
+void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled);
+
 struct odl_tb5_device *odl_tb5_rx_ring_to_dev(struct tb_ring *ring);
 
 /* ── RX repost ───────────────────────────────────────────────────────── */

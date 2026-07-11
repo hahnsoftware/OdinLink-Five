@@ -590,6 +590,74 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 	wake_up_interruptible(&ctx->waitq);
 }
 
+/*
+ * Completions for the synchronous dmabuf path (submit_tx_dmabuf /
+ * submit_rx_dmabuf).  These frames live in path->{tx,rx}.frames[] and carry
+ * raw dmabuf payload — no proto double-buffer, no stream/ctrl header.
+ *
+ * The shared odl_tb5_rx_callback's legacy branch peeks at
+ * ctx->bufs[posted_buf].virt (the proto double-buffer) and treats a stale
+ * ODL_TB5_DMA_MAGIC there as a ctrl PING/PONG, returning WITHOUT bumping
+ * ctx->completed.  For dmabuf frames that buffer is unrelated to where the
+ * data actually DMAed, so a coincidental magic match silently drops one
+ * completion per transfer — the send/recv_dmabuf wait then never satisfies
+ * (and, under E2E, the dropped RX also starves a credit and stalls one peer
+ * TX frame).  A dedicated callback that only counts the completion avoids the
+ * whole misinterpretation.
+ */
+void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled)
+{
+	struct odl_tb5_ring_ctx *ctx;
+	struct odl_tb5_device *dev;
+
+	ctx = odl_tb5_ring_to_ctx(ring);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	dev = ctx->dev;
+	if (!dev || atomic_read(&dev->removing))
+		return;
+
+	/* Paired with odl_tb5_tx_submitted() in submit_tx_dmabuf; runs for
+	 * canceled frames too so tx_inflight stays balanced. */
+	atomic_dec(&dev->tx_inflight);
+
+	if (canceled)
+		return;
+
+	atomic_inc(&ctx->completed);
+	wake_up_interruptible(&ctx->waitq);
+}
+
+void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled)
+{
+	struct odl_tb5_ring_ctx *ctx;
+	struct odl_tb5_device *dev;
+
+	ctx = odl_tb5_ring_to_ctx(ring);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	dev = ctx->dev;
+	if (!dev || atomic_read(&dev->removing))
+		return;
+
+	if (canceled)
+		return;
+
+	/* Count this arrival as RX activity so the poll timer's idle-grace
+	 * resets, and re-arm it if it had disarmed — keeps the completion pump
+	 * running for the remaining posted frames of this recv (see
+	 * submit_rx_dmabuf). */
+	ODL_STAT_INC(dev, rx_frames_seen);
+	odl_tb5_poll_kick(dev);
+
+	atomic_inc(&ctx->completed);
+	wake_up_interruptible(&ctx->waitq);
+}
+
 /* Allocate the TX/RX ring pair + output HopID for one path. */
 static int odl_tb5_ring_pair_alloc(struct odl_tb5_device *dev, int idx,
 				   unsigned int rs)
@@ -1102,7 +1170,7 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 
 			frame->buffer_phy = sg_addr;
 			frame->size = chunk;
-			frame->callback = odl_tb5_tx_callback;
+			frame->callback = odl_tb5_tx_dmabuf_callback;
 			frame->sof = ODL_TB5_PDF_SOF_DATA;
 			frame->eof = ODL_TB5_PDF_EOF_DATA;
 
@@ -1226,7 +1294,7 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 
 			frame->buffer_phy = sg_addr;
 			frame->size = chunk;
-			frame->callback = odl_tb5_rx_callback;
+			frame->callback = odl_tb5_rx_dmabuf_callback;
 			frame->sof = ODL_TB5_PDF_SOF_DATA;
 			frame->eof = ODL_TB5_PDF_EOF_DATA;
 
@@ -1252,6 +1320,15 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 	}
 
 	atomic_add(frame_idx, &dev->paths[0].rx.submitted);
+
+	/* Arm the fallback poll to chase these RX completions.  Unlike TX
+	 * (submit_tx_dmabuf raises tx_inflight, which keeps the poll timer
+	 * self-restarting), a pure recv wait has tx_inflight == 0 and submits
+	 * nothing, so without this the completions rely on the ISR alone and a
+	 * write-back miss stalls the wait for a full grace window — or forever.
+	 * The dmabuf RX callback re-bumps rx_frames_seen so the grace resets
+	 * while frames keep arriving. */
+	odl_tb5_poll_kick(dev);
 
 	wait_event_interruptible(dev->paths[0].rx.waitq,
 		atomic_read(&dev->paths[0].rx.completed) >=
