@@ -232,6 +232,11 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (!stream)
 			return -ENOENT;
 
+		/* Arm the RX pool on the first recv attempt — BEFORE the
+		 * O_NONBLOCK short-circuit, else a non-blocking verbs recv
+		 * worker returns EAGAIN here forever and the pool never arms. */
+		odl_tb5_rx_arm(dev);
+
 		/* Non-blocking recv: fail if no data available */
 		if (nonblock && !odl_tb5_stream_can_recv(stream)) {
 			odl_tb5_stream_put(stream);
@@ -283,6 +288,10 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+
+		/* Arm the RX pool before the O_NONBLOCK short-circuit, same
+		 * reason as STREAM_RECV. */
+		odl_tb5_rx_arm(dev);
 
 		if (nonblock)
 			return -EAGAIN; /* Use poll() for non-blocking wait */

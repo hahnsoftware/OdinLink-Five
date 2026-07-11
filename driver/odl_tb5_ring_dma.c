@@ -1277,6 +1277,12 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 		goto err_detach;
 	}
 
+	/* No stream-vs-dmabuf RX contention to resolve here: the stream RX pool
+	 * is armed only on the first host stream_recv (odl_tb5_rx_arm), which a
+	 * dmabuf-only QP never calls, so rx_target stays 0 and this ring is ours.
+	 * (An earlier attempt to tb_ring_stop/start-flush the pool frames here
+	 * broke RX reception outright — never disturb a live RX ring mid-op.) */
+
 	skip = offset;
 	total_remaining = len;
 
@@ -1729,20 +1735,10 @@ struct odl_tb5_stream *odl_tb5_stream_create(struct odl_tb5_device *dev,
 		spin_unlock(&owner->lock);
 	}
 
-	/* Start RX repost on first stream open — the RX window (pool/2)
-	 * is split evenly across all negotiated paths. */
-	if (dev->paths[0].rx_target == 0 && dev->frame_pool.slots) {
-		int nps = max_t(int, dev->negotiated_paths, 1);
-		int per_path = (dev->frame_pool.size / 2) / nps;
-		int p;
-
-		for (p = 0; p < nps; p++) {
-			dev->paths[p].rx_target = per_path;
-			odl_tb5_rx_repost(dev, p);
-		}
-		pr_info("odl_tb5: RX repost started (target=%d)\n",
-			dev->paths[0].rx_target);
-	}
+	/* RX pool repost is armed lazily on the first host stream_recv
+	 * (odl_tb5_rx_arm), NOT here: a dmabuf-only QP opens a stream for its
+	 * qp_num but must leave the RX ring empty so its dmabuf frames receive
+	 * the data.  See odl_tb5_rx_arm for the full rationale. */
 
 	pr_info("odl_tb5: stream %u created (owner=%px)\n",
 		stream->id, owner);
@@ -2308,6 +2304,39 @@ int odl_tb5_stream_wait_tx(struct odl_tb5_stream *stream, u32 timeout_ms)
 /* ══════════════════════════════════════════════════════════════════════
  * Stream RX Path
  * ══════════════════════════════════════════════════════════════════════ */
+
+/* Arm the stream RX pool frames the first time a host stream recv is
+ * ATTEMPTED.  Called from the STREAM_RECV / STREAM_WAIT_RX ioctl handlers
+ * (odl_tb5_chardev.c) — deliberately BEFORE their O_NONBLOCK/can_recv check,
+ * because the verbs provider opens the device non-blocking: its recv worker
+ * gets -EAGAIN and never reaches odl_tb5_stream_recv() below, so arming inside
+ * that function would never fire (pool never armed -> no data -> EAGAIN
+ * forever -> host RX hang).
+ *
+ * Deliberately NOT armed in odl_tb5_stream_create: a QP that only does
+ * zero-copy dmabuf recv opens a stream (for its qp_num) but issues only
+ * STREAM_RECV_DMABUF (submit_rx_dmabuf), never STREAM_RECV, so its RX ring
+ * stays empty and the posted dmabuf frames are the sole consumers — matching
+ * the raw dmabuf path that works.  Arming at open instead filled the shared
+ * paths[0].rx ring with auto-reposting pool frames that swallowed the dmabuf
+ * payload.  Lock-free: a redundant concurrent call just re-runs rx_repost,
+ * which caps at rx_target, so at worst the pool is topped up twice. */
+void odl_tb5_rx_arm(struct odl_tb5_device *dev)
+{
+	int nps, per_path, p;
+
+	if (dev->paths[0].rx_target != 0 || !dev->frame_pool.slots)
+		return;
+
+	nps = max_t(int, dev->negotiated_paths, 1);
+	per_path = (dev->frame_pool.size / 2) / nps;
+	for (p = 0; p < nps; p++) {
+		dev->paths[p].rx_target = per_path;
+		odl_tb5_rx_repost(dev, p);
+	}
+	pr_info("odl_tb5: RX pool armed on first host recv (target=%d)\n",
+		dev->paths[0].rx_target);
+}
 
 int odl_tb5_stream_recv(struct odl_tb5_stream *stream,
 			void __user *buf, size_t buf_len,

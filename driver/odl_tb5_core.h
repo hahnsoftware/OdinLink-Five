@@ -562,6 +562,12 @@ struct odl_tb5_device *odl_tb5_rx_ring_to_dev(struct tb_ring *ring);
 
 void odl_tb5_rx_repost(struct odl_tb5_device *dev, int idx);
 
+/* Arm the stream RX pool on the first host stream recv attempt (idempotent,
+ * lock-free).  Called from the STREAM_RECV/STREAM_WAIT_RX ioctl handlers,
+ * before their O_NONBLOCK short-circuit.  NOT called for dmabuf recv, which
+ * must keep the RX ring empty for its own frames. */
+void odl_tb5_rx_arm(struct odl_tb5_device *dev);
+
 /* ── Character device ────────────────────────────────────────────────── */
 
 int  odl_tb5_chardev_init(void);
