@@ -96,17 +96,51 @@ static int fill_fd(int fd, size_t size, unsigned char byte)
     return 0;
 }
 
-/* Returns count of mismatching bytes (0 = clean round-trip). */
-static size_t verify_fd(int fd, size_t size, unsigned char expect)
+/* Position-dependent byte pattern — reveals offset desync (a shifted region
+ * still mismatches) and gaps (unwritten bytes read back as 0 that don't equal
+ * the expected non-zero pattern), unlike a constant fill. */
+static inline unsigned char seq_byte(size_t i, unsigned int salt)
 {
+    unsigned int x = (unsigned int)i ^ salt;
+    x ^= x >> 8; x ^= x >> 16;
+    return (unsigned char)(x | 1);   /* never 0, so a 0 gap always shows */
+}
+
+static int fill_fd_seq(int fd, size_t size, unsigned int salt)
+{
+    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED)
+        return -1;
+    unsigned char *b = m;
+    for (size_t i = 0; i < size; i++)
+        b[i] = seq_byte(i, salt);
+    munmap(m, size);
+    return 0;
+}
+
+/* Counts mismatching bytes against the position-dependent pattern.  On the
+ * first mismatch, records its offset and whether it is a gap (unwritten 0) or
+ * a wrong value (offset desync) — a constant fill would have caught neither a
+ * shift nor, at byte 0x00 anywhere, a hole.  first_off == (size_t)-1 if clean. */
+static size_t verify_fd_seq(int fd, size_t size, unsigned int salt,
+                            size_t *first_off, unsigned char *exp_b,
+                            unsigned char *got_b)
+{
+    *first_off = (size_t)-1; *exp_b = 0; *got_b = 0;
     void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED)
         return size;
     const unsigned char *b = m;
     size_t bad = 0;
-    for (size_t i = 0; i < size; i++)
-        if (b[i] != expect)
+    for (size_t i = 0; i < size; i++) {
+        unsigned char e = seq_byte(i, salt);
+        if (b[i] != e) {
+            if (*first_off == (size_t)-1) {
+                *first_off = i; *exp_b = e; *got_b = b[i];
+            }
             bad++;
+        }
+    }
     munmap(m, size);
     return bad;
 }
@@ -300,12 +334,11 @@ static int run_client(struct vconn *c)
     int any_fail = 0;
     for (int s = 0; s < g_num_sizes; s++) {
         size_t size = g_sizes[s];
-        unsigned char pat = (unsigned char)(0x41 + s);
 
         int sfd = alloc_dmabuf(size);
         int rfd = alloc_dmabuf(size);
         if (sfd < 0 || rfd < 0) { free(rtt); return 1; }
-        fill_fd(sfd, size, pat);
+        fill_fd_seq(sfd, size, (unsigned int)s);
         fill_fd(rfd, size, 0x00);
 
         struct ibv_mr *smr = ibv_reg_dmabuf_mr(c->pd, 0, size, 0, sfd,
@@ -337,7 +370,14 @@ static int run_client(struct vconn *c)
                 rtt[i - g_warmup] = now_ns() - t0;
         }
 
-        size_t bad = fail ? size : verify_fd(rfd, size, pat);
+        size_t v_off = 0; unsigned char v_exp = 0, v_got = 0;
+        size_t bad = fail ? size
+                          : verify_fd_seq(rfd, size, (unsigned int)s,
+                                          &v_off, &v_exp, &v_got);
+        if (bad && !fail)
+            fprintf(stderr, "  [integrity] size=%zu bad=%zu first_off=%zu "
+                    "exp=0x%02x got=0x%02x (%s)\n", size, bad, v_off, v_exp,
+                    v_got, v_got == 0 ? "gap/unwritten" : "wrong value/shift");
         ibv_dereg_mr(smr); ibv_dereg_mr(rmr);
         close(sfd); close(rfd);
         if (fail) { free(rtt); return 1; }
@@ -368,7 +408,7 @@ static int run_client(struct vconn *c)
 
     free(rtt);
     printf("\n  (one-way-thru = size / (avg-rtt/2); zero-copy dmabuf verbs — "
-           "paths[0], synchronous, no striping)\n");
+           "synchronous, block-striped across negotiated DMA paths)\n");
     if (any_fail) {
         printf("  *** INTEGRITY FAILURES — throughput above is meaningless "
                "until data actually transfers ***\n");
