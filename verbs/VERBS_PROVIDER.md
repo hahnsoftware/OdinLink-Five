@@ -148,6 +148,16 @@ Key points:
 - **Both ends run this provider**, so the framing is private and self-consistent
   (header fields are native little-endian; both test boxes are x86-64).
 
+### Bootstrap ordering caveat
+
+A *simultaneous* bidirectional first-contact SEND — both peers posting a send on
+a fresh QP before either has received anything — can drop one message on this
+transport. Real apps never do this: perftest and RCCL/NCCL exchange QP
+parameters over their own TCP bootstrap, and ping-pong benchmarks alternate
+directions. The `test_verbs_write_imm` rendezvous is therefore ordered
+(client sends first, server replies). RDMA WRITE/READ are unaffected — only the
+initial QP-level SEND handshake needs to avoid a dead heat.
+
 ### Not yet implemented: RDMA CM
 
 `rdma_cm`/`librdmacm` connection management (`rping`, perftest `-R`) is **not**
