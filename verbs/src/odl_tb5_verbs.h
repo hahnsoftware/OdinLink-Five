@@ -72,6 +72,86 @@
 #define ODL_VERBS_SQ_DEPTH              64
 #define ODL_VERBS_RQ_DEPTH              512
 
+/* ── One-sided RDMA emulation over the stream transport ─────────────────
+ *
+ * The NHI stream transport is two-sided (SEND/RECV) and has no notion of a
+ * remote address.  To carry RDMA WRITE/READ — which RCCL/NCCL's IB net
+ * transport and ib_write_bw/ib_read_bw require — we layer a tiny operation
+ * header on top of every stream message.  Because the transport preserves
+ * message boundaries (1 stream_send == 1 stream_recv), each verb becomes:
+ *
+ *     [ odl_rdma_hdr ]                 (one small message)
+ *     [ payload ]                      (a second message, if length > 0)
+ *
+ * The responder's recv worker reads the header FIRST (no posted receive
+ * needed — one-sided ops are passive on the target) and dispatches:
+ *   WRITE      → look up local MR by rkey, place payload at remote_addr
+ *   WRITE_IMM  → as WRITE, plus consume an RQ WR and post RECV_RDMA_WITH_IMM
+ *   READ_REQ   → look up local MR by rkey, send READ_RESP + payload back
+ *   READ_RESP  → match read_id, place payload in the initiator's buffer,
+ *                complete the pending IBV_WR_RDMA_READ
+ *   SEND       → consume an RQ WR, place payload, post IBV_WC_RECV
+ *
+ * Both ends run this provider, so the framing is private and self-consistent.
+ * Header fields are little-endian native (both test boxes are x86_64). */
+
+#define ODL_RDMA_MAGIC 0x314c444fu /* "ODL1" */
+
+enum odl_rdma_op {
+    ODL_OP_SEND      = 1,
+    ODL_OP_WRITE     = 2,
+    ODL_OP_WRITE_IMM = 3,
+    ODL_OP_READ_REQ  = 4,
+    ODL_OP_READ_RESP = 5,
+};
+
+struct odl_rdma_hdr {
+    uint32_t magic;        /* ODL_RDMA_MAGIC */
+    uint32_t op;           /* enum odl_rdma_op */
+    uint32_t length;       /* payload byte count (0 => no payload message) */
+    uint32_t imm_data;     /* immediate for WRITE_WITH_IMM */
+    uint64_t remote_addr;  /* target VA (WRITE / READ_REQ) */
+    uint32_t rkey;         /* target MR key (WRITE / READ_REQ) */
+    uint32_t _pad;
+    uint64_t read_id;      /* matches READ_RESP to a pending READ WR */
+};
+
+/* Internal TX work descriptor.  post_send copies the app WR's fields here
+ * (so the app may reuse its ibv_send_wr immediately, per the verbs spec), and
+ * the recv worker enqueues READ_RESP descriptors here too — keeping ALL stream
+ * TX on the single send worker, which serialises the [hdr][payload] pair. */
+struct odl_tx_desc {
+    uint32_t              op;          /* enum odl_rdma_op */
+    uint64_t              wr_id;
+    struct odl_verbs_cq  *cq;          /* local completion target (NULL = none) */
+    int                   wc_opcode;   /* enum ibv_wc_opcode for completion */
+    bool                  signaled;    /* post a completion when done */
+    /* Payload source */
+    int                   dmabuf_fd;   /* >= 0 => zero-copy GPU source */
+    uint64_t              dmabuf_offset;
+    void                 *host_addr;   /* host payload source */
+    uint32_t              length;
+    bool                  free_host;   /* free host_addr after send (READ_RESP) */
+    /* Wire header */
+    uint32_t              rkey;
+    uint64_t              remote_addr;
+    uint32_t              imm_data;
+    uint64_t              read_id;
+};
+
+/* Outstanding RDMA READ awaiting its READ_RESP (FIFO per QP). */
+struct odl_read_pending {
+    uint64_t              read_id;
+    uint64_t              wr_id;
+    struct odl_verbs_cq  *cq;
+    bool                  signaled;
+    /* Local destination */
+    int                   dmabuf_fd;   /* >= 0 => zero-copy GPU dest */
+    uint64_t              dmabuf_offset;
+    void                 *host_addr;
+    uint32_t              length;
+};
+
 /* ── Forward declarations ───────────────────────────────────────────── */
 
 struct odl_verbs_context;
@@ -144,12 +224,22 @@ struct odl_verbs_qp {
     uint8_t                   dest_stream_id; /* peer stream, from modify_qp
                                                * dest_qp_num at RTR */
 
-    /* Work submission queue (async via worker thread) */
+    /* Work submission queue (async via worker thread).  Holds internal
+     * descriptors copied from the app WR (or synthesised for READ_RESP), so
+     * the app may reuse its ibv_send_wr the moment post_send returns. */
     pthread_mutex_t           sq_lock;
-    struct ibv_send_wr       *sq[ODL_VERBS_SQ_DEPTH];
+    struct odl_tx_desc        sq[ODL_VERBS_SQ_DEPTH];
     int                       sq_head;
     int                       sq_tail;
     int                       sq_count;
+
+    /* Outstanding RDMA READs awaiting their READ_RESP (FIFO). */
+    pthread_mutex_t           rp_lock;
+    struct odl_read_pending   rp[ODL_VERBS_SQ_DEPTH];
+    int                       rp_head;
+    int                       rp_tail;
+    int                       rp_count;
+    atomic_uint_least64_t     read_id_next;
 
     /* Receive queue: post_recv enqueues posted buffers here and returns
      * immediately (RDMA semantics); the worker drains them into arriving
@@ -255,6 +345,9 @@ int odl_dealloc_pd(struct ibv_pd *);
 struct ibv_mr *odl_reg_mr(struct ibv_pd *, void *, size_t, uint64_t, int);
 struct ibv_mr *odl_reg_dmabuf_mr(struct ibv_pd *, uint64_t, size_t, uint64_t, int, int);
 int odl_dereg_mr(struct ibv_mr *);
+/* Reverse lookup for one-sided ops: find the local MR a remote peer named by
+ * rkey, so the responder can place/fetch data.  Returns NULL if unknown. */
+struct odl_verbs_mr *odl_find_mr_by_rkey(struct odl_verbs_context *, uint32_t);
 
 /* CQ */
 struct ibv_cq *odl_create_cq(struct ibv_context *, int, struct ibv_comp_channel *, int);

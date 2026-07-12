@@ -61,6 +61,13 @@ static int odl_compat_query_device(struct ibv_context *context,
     attr->max_mr           = ODL_VERBS_MAX_MRS;
     attr->max_pd           = ODL_VERBS_MAX_PDS;
     attr->max_mr_size      = SIZE_MAX;
+    /* One-sided ops are emulated over the stream transport (see qp.c).  Report
+     * outstanding-read/atomic depth so ib_read_bw and RCCL negotiate a
+     * non-zero max_rd_atomic instead of refusing RDMA READ. */
+    attr->max_qp_rd_atom      = 16;
+    attr->max_qp_init_rd_atom = 16;
+    attr->max_res_rd_atom     = ODL_VERBS_MAX_QPS * 16;
+    attr->device_cap_flags    = IBV_DEVICE_RC_RNR_NAK_GEN;
 
     ODL_TRACE_EXIT_VAL(0);
 }

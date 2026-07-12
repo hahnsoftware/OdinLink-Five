@@ -31,8 +31,12 @@ struct ibv_mr *odl_reg_mr(struct ibv_pd *pd, void *addr,
     mr->base.addr    = addr;
     mr->base.length  = length;
     mr->base.handle  = 0;
-    mr->base.lkey    = 0;
-    mr->base.rkey    = 0;
+    /* Give every MR a unique, non-zero key.  RDMA WRITE/READ carry this rkey
+     * on the wire and the responder reverse-maps it (odl_find_mr_by_rkey) to
+     * find where remote_addr lands.  The MR pointer is unique per registration
+     * and stable for its lifetime — same scheme as the dmabuf path. */
+    mr->base.lkey    = (uint32_t)(uintptr_t)mr;
+    mr->base.rkey    = mr->base.lkey;
     mr->base.context = pd->context;
     mr->mr_type      = 0; /* host */
     mr->access_flags = access;
@@ -107,6 +111,25 @@ struct ibv_mr *odl_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
                  (unsigned long long)iova, mr->base.lkey);
     ODL_TRACE_EXIT();
     return &mr->base;
+}
+
+/* Find a local MR by the rkey a remote peer advertised.  Both host and dmabuf
+ * MRs set base.rkey == base.lkey == (uint32_t)(uintptr_t)mr, so this doubles as
+ * the send-side lkey lookup used to pick host vs. zero-copy dmabuf. */
+struct odl_verbs_mr *odl_find_mr_by_rkey(struct odl_verbs_context *ctx,
+                                         uint32_t rkey)
+{
+    if (!rkey) return NULL;
+    pthread_mutex_lock(&ctx->mr_lock);
+    for (int i = 0; i < ctx->nmrs; i++) {
+        struct odl_verbs_mr *mr = ctx->mrs[i];
+        if (mr && (mr->base.rkey == rkey || mr->base.lkey == rkey)) {
+            pthread_mutex_unlock(&ctx->mr_lock);
+            return mr;
+        }
+    }
+    pthread_mutex_unlock(&ctx->mr_lock);
+    return NULL;
 }
 
 int odl_dereg_mr(struct ibv_mr *mr)
