@@ -1106,24 +1106,64 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
 	return 0;
 }
 
-int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
-			     int dmabuf_fd, loff_t offset, size_t len)
+/*
+ * Multi-path striped dmabuf transfer (shared TX/RX core).
+ *
+ * A single transfer is chunked into ≤4095-byte frames sequentially and
+ * BLOCK-striped across the active paths: path p owns the contiguous byte range
+ * [p*len/nps, (p+1)*len/nps).  Each path therefore writes one contiguous region
+ * of the destination rather than every other frame — frame-interleaved striping
+ * has two DMA engines writing physically adjacent, cache-line-sharing memory at
+ * once, which corrupts frame-boundary bytes once the link is driven at full
+ * 2-path rate (single-path is clean).  Both peers run this same code with the
+ * same nps (dev->negotiated_paths — the symmetric quantity agreed at login,
+ * min of each side's num_paths) and chunk identically, so a given frame maps to
+ * the same path on both ends; E2E credits pair path p's TX ring with the peer's
+ * path p RX ring, so it lands at the matching dmabuf offset.  Each frame carries
+ * its own absolute buffer_phy, so cross-path arrival ordering is irrelevant;
+ * only same-path FIFO order matters, and per path we post in ascending offset.
+ *
+ * Completion accounting is per ring context (path->{tx,rx}.submitted/completed/
+ * waitq); the dmabuf callbacks already increment the ctx of the ring the frame
+ * came from, so no cross-path bookkeeping is needed — we just publish the
+ * per-path submitted counts and then wait on every path we posted to.
+ *
+ * nps == 1 collapses to the original single-path behaviour (everything on
+ * paths[0]).
+ */
+static int odl_tb5_submit_dmabuf(struct odl_tb5_device *dev,
+				 int dmabuf_fd, loff_t offset, size_t len,
+				 bool is_tx)
 {
+	enum dma_data_direction dir = is_tx ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
 	struct scatterlist *sg;
+	struct device *dma_dev;
 	dma_addr_t sg_addr;
 	size_t sg_remaining, chunk;
 	size_t total_remaining;
 	loff_t skip;
-	int frame_idx = 0;
+	int fidx[ODL_TB5_MAX_PATHS] = { 0 };	/* per-path frame index */
+	int nps, p, k = 0;
 	int nents_i;
 	int ret = 0;
 
 	if (dev->state != ODL_TB5_STATE_CONNECTED &&
 	    dev->state != ODL_TB5_STATE_READY)
 		return -ENOTCONN;
+
+	/* Stripe across the negotiated (hopid-allocated, ring-started) paths.
+	 * This is the symmetric count both peers agree on; clamp defensively.
+	 * odl_dmabuf_paths (default 0) can cap it for A/B diagnostics. */
+	nps = dev->negotiated_paths;
+	if (nps < 1)
+		nps = 1;
+	if (nps > dev->num_paths)
+		nps = dev->num_paths;
+	if (odl_dmabuf_paths && (int)odl_dmabuf_paths < nps)
+		nps = odl_dmabuf_paths;
 
 	dmabuf = dma_buf_get(dmabuf_fd);
 	if (IS_ERR(dmabuf))
@@ -1135,22 +1175,31 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 		goto err_put;
 	}
 
-	/* Attach to the NHI DMA device (what actually programs the ring),
+	/* Attach to the NHI DMA device (what actually programs the rings),
 	 * NOT dev->dev (the character device, which has no DMA ops / IOMMU
 	 * domain — mapping against it yields no usable DMA segments and the
-	 * transfer silently posts zero frames). */
-	attach = dma_buf_attach(dmabuf,
-				tb_ring_dma_device(dev->paths[0].tx.ring));
+	 * transfer silently posts zero frames).  All paths share one NHI, so a
+	 * single attach/map produces DMA addresses usable by every path ring. */
+	dma_dev = tb_ring_dma_device(is_tx ? dev->paths[0].tx.ring
+					   : dev->paths[0].rx.ring);
+	attach = dma_buf_attach(dmabuf, dma_dev);
 	if (IS_ERR(attach)) {
 		ret = PTR_ERR(attach);
 		goto err_put;
 	}
 
-	sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE);
+	sgt = dma_buf_map_attachment(attach, dir);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		goto err_detach;
 	}
+
+	/* RX: no stream-vs-dmabuf pool contention to resolve here — the stream
+	 * RX pool is armed only on the first host stream_recv (odl_tb5_rx_arm),
+	 * which a dmabuf-only QP never calls, so rx_target stays 0 on every path
+	 * and these rings are ours.  (An earlier attempt to tb_ring_stop/start-
+	 * flush the pool frames broke RX reception outright — never disturb a
+	 * live RX ring mid-op.) */
 
 	skip = offset;
 	total_remaining = len;
@@ -1170,35 +1219,57 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 		}
 
 		while (sg_remaining > 0 && total_remaining > 0) {
+			struct odl_tb5_ring_ctx *rc;
 			struct ring_frame *frame;
+			size_t sent = len - total_remaining;
 
-			if (frame_idx >= dev->paths[0].tx.ring_size) {
+			/* Block striping: path p owns the contiguous byte range
+			 * [p*len/nps, (p+1)*len/nps).  A frame goes to whichever
+			 * path owns its starting byte.  This keeps each path's
+			 * writes to one contiguous region instead of interleaving
+			 * adjacent frames across paths — two DMA engines hammering
+			 * physically adjacent (cache-line-sharing) memory at once
+			 * corrupts frame-boundary bytes under 2-path load.  Both
+			 * peers chunk identically, so `sent` (and thus p) matches
+			 * frame-for-frame across the link. */
+			p = (int)((u64)sent * nps / len);
+			if (p >= nps)
+				p = nps - 1;
+			rc = is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
+
+			if (fidx[p] >= rc->ring_size) {
 				ret = -ENOSPC;
 				goto err_unmap;
 			}
 
-			frame = &dev->paths[0].tx.frames[frame_idx];
+			frame = &rc->frames[fidx[p]];
 
 			/* 12-bit size field: 4096 wraps to 0, cap at 4095.
-			 * RX side must chunk identically (no headers). */
+			 * Both ends chunk identically (no headers). */
 			chunk = min3((size_t)ODL_TB5_FRAME_LEN_MAX,
 				     sg_remaining, total_remaining);
 
 			frame->buffer_phy = sg_addr;
 			frame->size = chunk;
-			frame->callback = odl_tb5_tx_dmabuf_callback;
+			frame->callback = is_tx ? odl_tb5_tx_dmabuf_callback
+						: odl_tb5_rx_dmabuf_callback;
 			frame->sof = ODL_TB5_PDF_SOF_DATA;
 			frame->eof = ODL_TB5_PDF_EOF_DATA;
 
-			ret = tb_ring_tx(dev->paths[0].tx.ring, frame);
+			ret = is_tx ? tb_ring_tx(rc->ring, frame)
+				    : tb_ring_rx(rc->ring, frame);
 			if (ret < 0)
 				goto err_unmap;
-			odl_tb5_tx_submitted(dev);
+			if (is_tx)
+				odl_tb5_tx_submitted(dev);
+			atomic64_inc(is_tx ? &dev->stats.path_tx_frames[p]
+					   : &dev->stats.path_rx_frames[p]);
 
 			sg_addr += chunk;
 			sg_remaining -= chunk;
 			total_remaining -= chunk;
-			frame_idx++;
+			fidx[p]++;
+			k++;
 		}
 
 		if (total_remaining == 0)
@@ -1209,24 +1280,50 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 	 * (e.g. mapped against the wrong device).  Fail loudly rather than
 	 * satisfying the completion wait trivially and returning a silent
 	 * no-op — that masked a broken transport for the whole dmabuf path. */
-	if (frame_idx == 0) {
+	if (k == 0) {
 		ret = -EIO;
 		goto err_unmap;
 	}
 
-	atomic_add(frame_idx, &dev->paths[0].tx.submitted);
+	/* Publish per-path submitted counts (deferred until here so an early
+	 * tb_ring failure leaves them untouched, as the single-path code did). */
+	for (p = 0; p < nps; p++) {
+		struct odl_tb5_ring_ctx *rc =
+			is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
 
-	wait_event_interruptible(dev->paths[0].tx.waitq,
-		atomic_read(&dev->paths[0].tx.completed) >=
-		atomic_read(&dev->paths[0].tx.submitted));
+		if (fidx[p] > 0)
+			atomic_add(fidx[p], &rc->submitted);
+	}
 
-	dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+	/* RX: arm the fallback poll to chase these completions.  Unlike TX
+	 * (odl_tb5_tx_submitted raises tx_inflight, which keeps the poll timer
+	 * self-restarting), a pure recv wait has tx_inflight == 0 and submits
+	 * nothing, so without this the completions rely on the ISR alone and a
+	 * write-back miss stalls the wait for a full grace window — or forever.
+	 * The dmabuf RX callback re-bumps rx_frames_seen so the grace resets
+	 * while frames keep arriving. */
+	if (!is_tx)
+		odl_tb5_poll_kick(dev);
+
+	/* Wait for completion on every path we posted to. */
+	for (p = 0; p < nps; p++) {
+		struct odl_tb5_ring_ctx *rc =
+			is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
+
+		if (fidx[p] == 0)
+			continue;
+		wait_event_interruptible(rc->waitq,
+			atomic_read(&rc->completed) >=
+			atomic_read(&rc->submitted));
+	}
+
+	dma_buf_unmap_attachment(attach, sgt, dir);
 	dma_buf_detach(dmabuf, attach);
 	dma_buf_put(dmabuf);
 	return 0;
 
 err_unmap:
-	dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
+	dma_buf_unmap_attachment(attach, sgt, dir);
 err_detach:
 	dma_buf_detach(dmabuf, attach);
 err_put:
@@ -1234,140 +1331,16 @@ err_put:
 	return ret;
 }
 
+int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
+			     int dmabuf_fd, loff_t offset, size_t len)
+{
+	return odl_tb5_submit_dmabuf(dev, dmabuf_fd, offset, len, true);
+}
+
 int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 			     int dmabuf_fd, loff_t offset, size_t len)
 {
-	struct dma_buf *dmabuf;
-	struct dma_buf_attachment *attach;
-	struct sg_table *sgt;
-	struct scatterlist *sg;
-	dma_addr_t sg_addr;
-	size_t sg_remaining, chunk;
-	size_t total_remaining;
-	loff_t skip;
-	int frame_idx = 0;
-	int nents_i;
-	int ret = 0;
-
-	if (dev->state != ODL_TB5_STATE_CONNECTED &&
-	    dev->state != ODL_TB5_STATE_READY)
-		return -ENOTCONN;
-
-	dmabuf = dma_buf_get(dmabuf_fd);
-	if (IS_ERR(dmabuf))
-		return PTR_ERR(dmabuf);
-
-	if (offset < 0 || len == 0 ||
-	    (size_t)offset + len > dmabuf->size) {
-		ret = -EINVAL;
-		goto err_put;
-	}
-
-	/* Attach to the NHI DMA device, not dev->dev — see submit_tx_dmabuf. */
-	attach = dma_buf_attach(dmabuf,
-				tb_ring_dma_device(dev->paths[0].rx.ring));
-	if (IS_ERR(attach)) {
-		ret = PTR_ERR(attach);
-		goto err_put;
-	}
-
-	sgt = dma_buf_map_attachment(attach, DMA_FROM_DEVICE);
-	if (IS_ERR(sgt)) {
-		ret = PTR_ERR(sgt);
-		goto err_detach;
-	}
-
-	/* No stream-vs-dmabuf RX contention to resolve here: the stream RX pool
-	 * is armed only on the first host stream_recv (odl_tb5_rx_arm), which a
-	 * dmabuf-only QP never calls, so rx_target stays 0 and this ring is ours.
-	 * (An earlier attempt to tb_ring_stop/start-flush the pool frames here
-	 * broke RX reception outright — never disturb a live RX ring mid-op.) */
-
-	skip = offset;
-	total_remaining = len;
-
-	for_each_sgtable_dma_sg(sgt, sg, nents_i) {
-		sg_addr = sg_dma_address(sg);
-		sg_remaining = sg_dma_len(sg);
-
-		if (skip > 0) {
-			if ((size_t)skip >= sg_remaining) {
-				skip -= sg_remaining;
-				continue;
-			}
-			sg_addr += skip;
-			sg_remaining -= skip;
-			skip = 0;
-		}
-
-		while (sg_remaining > 0 && total_remaining > 0) {
-			struct ring_frame *frame;
-
-			if (frame_idx >= dev->paths[0].rx.ring_size) {
-				ret = -ENOSPC;
-				goto err_unmap;
-			}
-
-			frame = &dev->paths[0].rx.frames[frame_idx];
-
-			/* Must match the TX-side 4095-byte chunking */
-			chunk = min3((size_t)ODL_TB5_FRAME_LEN_MAX,
-				     sg_remaining, total_remaining);
-
-			frame->buffer_phy = sg_addr;
-			frame->size = chunk;
-			frame->callback = odl_tb5_rx_dmabuf_callback;
-			frame->sof = ODL_TB5_PDF_SOF_DATA;
-			frame->eof = ODL_TB5_PDF_EOF_DATA;
-
-			ret = tb_ring_rx(dev->paths[0].rx.ring, frame);
-			if (ret < 0)
-				goto err_unmap;
-
-			sg_addr += chunk;
-			sg_remaining -= chunk;
-			total_remaining -= chunk;
-			frame_idx++;
-		}
-
-		if (total_remaining == 0)
-			break;
-	}
-
-	/* See submit_tx_dmabuf: a zero-frame post is a broken mapping, not a
-	 * completed receive.  Fail instead of returning a silent no-op. */
-	if (frame_idx == 0) {
-		ret = -EIO;
-		goto err_unmap;
-	}
-
-	atomic_add(frame_idx, &dev->paths[0].rx.submitted);
-
-	/* Arm the fallback poll to chase these RX completions.  Unlike TX
-	 * (submit_tx_dmabuf raises tx_inflight, which keeps the poll timer
-	 * self-restarting), a pure recv wait has tx_inflight == 0 and submits
-	 * nothing, so without this the completions rely on the ISR alone and a
-	 * write-back miss stalls the wait for a full grace window — or forever.
-	 * The dmabuf RX callback re-bumps rx_frames_seen so the grace resets
-	 * while frames keep arriving. */
-	odl_tb5_poll_kick(dev);
-
-	wait_event_interruptible(dev->paths[0].rx.waitq,
-		atomic_read(&dev->paths[0].rx.completed) >=
-		atomic_read(&dev->paths[0].rx.submitted));
-
-	dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
-	dma_buf_detach(dmabuf, attach);
-	dma_buf_put(dmabuf);
-	return 0;
-
-err_unmap:
-	dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
-err_detach:
-	dma_buf_detach(dmabuf, attach);
-err_put:
-	dma_buf_put(dmabuf);
-	return ret;
+	return odl_tb5_submit_dmabuf(dev, dmabuf_fd, offset, len, false);
 }
 
 /* ══════════════════════════════════════════════════════════════════════

@@ -54,6 +54,16 @@ MODULE_PARM_DESC(num_paths,
 	__stringify(ODL_TB5_MAX_PATHS) ", default 2). The router flow-control "
 	"cap is per-path, so multiple paths scale throughput.");
 
+/* Diagnostic/override knob for the zero-copy dmabuf stripe width.  0 (default)
+ * means "use negotiated_paths"; a positive value caps the number of paths a
+ * single dmabuf transfer is striped over.  Writable so a two-box A/B run can
+ * flip 1<->2 without reload (BOTH ends must match, or the stripe desyncs). */
+unsigned int odl_dmabuf_paths;
+module_param_named(dmabuf_paths, odl_dmabuf_paths, uint, 0644);
+MODULE_PARM_DESC(dmabuf_paths,
+	"Cap dmabuf (zero-copy verbs/RCCL) stripe width; 0 = use negotiated "
+	"paths. Set identically on both peers.");
+
 /* Apple protocol uses its own property key and registers as an alternate
  * service so macOS ThunderboltRDMA can discover us via XDomain matching. */
 static struct tb_property_dir *odl_tb5_apple_property_dir;
