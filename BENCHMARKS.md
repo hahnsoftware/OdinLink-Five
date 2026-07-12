@@ -216,8 +216,47 @@ LD_PRELOAD=build/verbs/libodl_tb5_verbs.so \
 |---|---|---|---|---|---|
 | 64 | **4.85 µs** | 10.69 µs | 11.22 µs | 16.91 µs | 25.95 µs |
 
-> `ib_write_bw`/`ib_read_bw`/`rping` do **not** run yet — the provider
-> implements the SEND/RECV subset (no RDMA WRITE/READ, no RDMA CM).
+### One-sided RDMA — `ib_write_bw` / `ib_read_bw` / `ib_write_lat` / `ib_read_lat`
+
+The provider emulates **RDMA WRITE, WRITE_WITH_IMM and READ** on top of the
+two-sided stream transport by prefixing each message with a small operation
+header (see `verbs/VERBS_PROVIDER.md`). The unmodified perftest one-sided tools
+run end-to-end — same host-memory, single-path (`paths[0]`) transport as
+`ib_send_bw`. Same `LD_PRELOAD` setup; swap the tool name:
+
+```bash
+# Server (S1) / Client (S2) — identical flags, client adds <server-ip>
+ib_write_bw -d odl_tb5_0 -s 65536 -n 2000 -t 32 [<server-ip>]
+ib_read_bw  -d odl_tb5_0 -s 65536 -n 2000 -t 32 [<server-ip>]
+```
+
+RDMA WRITE bandwidth (`ib_write_bw -a -t 32`, BW average, MiB/s):
+
+| bytes | 1 KiB | 4 KiB | 16 KiB | 64 KiB | 256 KiB | 1 MiB | 8 MiB |
+|---|---|---|---|---|---|---|---|
+| WRITE | 463 | 732 | 842 | **948** | 1014 | 1026 | 1054 |
+| READ  | 286 | 561 | 688 | 789 | 904 | 963 | **1046** |
+
+WRITE peaks at ~1460 MiB/s (peak) / ~948 MiB/s (avg) at 64 KiB and settles at
+~1054 MiB/s (~8.6 Gb/s) for large transfers — the same single-path host-memory
+ceiling as `ib_send_bw`. READ trails WRITE (it is a request→response round-trip
+over the same stream) but reaches ~1046 MiB/s at 8 MiB.
+
+One-sided latency (4 KiB, `-n 1000`) — both tools poll the destination buffer
+for the transferred bytes, so a passing run also confirms **data lands at the
+correct remote address**:
+
+| tool | t_min | t_typical | t_avg |
+|---|---|---|---|
+| `ib_write_lat` | **12.6 µs** | 20.97 µs | 19.30 µs |
+| `ib_read_lat`  | **18.3 µs** | 28.91 µs | 27.29 µs |
+
+> These are single-path host-memory numbers. The one-sided ops also work over
+> zero-copy `ibv_reg_dmabuf_mr` regions (the RCCL path), which the responder
+> places directly into the target dmabuf at the rkey-relative offset.
+> **RDMA CM (`rping`, `-R` connection setup) is not implemented yet** — RCCL's
+> IB transport and default perftest use their own TCP bootstrap, so CM is not on
+> the RCCL critical path (see `verbs/VERBS_PROVIDER.md`).
 
 ---
 

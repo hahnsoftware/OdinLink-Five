@@ -72,10 +72,16 @@ LD_LIBRARY_PATH=build/verbs:build/lib \
 | `ibv_reg_dmabuf_mr` | DMA-buf fd passthrough | ✅ (GPU zero-copy) |
 | `ibv_create_cq` | completion ring + eventfd | N/A |
 | `ibv_create_qp` | `odl_tb5_stream_open` | N/A |
-| `ibv_post_send` | enqueue → worker → `stream_send` | ✅ (async) |
-| `ibv_post_recv` | `stream_recv` (blocking) | ❌ |
+| `ibv_post_send` (SEND) | enqueue → worker → `stream_send` | ✅ (async) |
+| `ibv_post_send` (RDMA WRITE / WRITE_WITH_IMM) | header + payload frame → peer places at `remote_addr` | ✅ (async) |
+| `ibv_post_send` (RDMA READ) | READ_REQ header → peer replies READ_RESP + payload | ✅ (async) |
+| `ibv_post_recv` | RQ ring, drained by recv worker | ❌ |
 | `ibv_poll_cq` | dequeue from eventfd ring | N/A |
-| `ibv_modify_qp` | stream state tracking | N/A |
+| `ibv_modify_qp` | stream state tracking + peer stream id | N/A |
+
+Supported `ibv_post_send` opcodes: `IBV_WR_SEND`, `IBV_WR_RDMA_WRITE`,
+`IBV_WR_RDMA_WRITE_WITH_IMM`, `IBV_WR_RDMA_READ`. `IBV_SEND_SIGNALED` is
+honoured; `max_send_sge`/`max_recv_sge` are 1 and inline data is unsupported.
 
 ## Async Completion Model
 
@@ -97,6 +103,60 @@ post struct ibv_wc → CQ ring
     ├── eventfd_write()     ← wakes ibv_get_cq_event()
     └── ibv_poll_cq()       ← drains from CQ ring
 ```
+
+## One-Sided RDMA over a Two-Sided Transport
+
+The NHI stream transport is **two-sided** (SEND/RECV) and has no concept of a
+remote address. RDMA WRITE/READ — which `ib_write_bw`/`ib_read_bw` and RCCL's
+IB net transport require — are emulated by prefixing every stream message with a
+small operation header (`struct odl_rdma_hdr`). Because the transport preserves
+message boundaries (1 `stream_send` == 1 `stream_recv`), the responder reads the
+header first and dispatches on the opcode. Each verb is one header message,
+optionally followed by one payload message:
+
+```
+initiator                         responder (recv worker = dispatcher)
+─────────                         ────────────────────────────────────
+RDMA WRITE   [hdr WRITE|rkey|va] → look up local MR by rkey, recv payload
+             [payload]           →   straight into remote_addr  (no completion)
+
+WRITE_IMM    [hdr WRITE_IMM|imm] → place payload, then consume an RQ WR and
+             [payload]           →   post IBV_WC_RECV_RDMA_WITH_IMM(imm)
+
+RDMA READ    [hdr READ_REQ|rkey] → read local MR, enqueue READ_RESP on the
+                                 ←   send worker: [hdr READ_RESP][payload]
+             place payload in local buffer, complete IBV_WC_RDMA_READ
+
+SEND         [hdr SEND]          → consume an RQ WR, recv payload,
+             [payload]           →   post IBV_WC_RECV
+```
+
+Key points:
+
+- **rkey → MR reverse map.** Every MR (host and dmabuf) gets a unique non-zero
+  `lkey`/`rkey`. `odl_find_mr_by_rkey()` maps the wire rkey back to the local MR
+  so the responder knows where `remote_addr` lands. For host MRs `remote_addr`
+  is directly a valid pointer into the responder's own registered buffer; for
+  dmabuf MRs it is the rkey-relative offset into the target dmabuf (zero-copy).
+- **All TX on one thread.** The send worker is the only thread that transmits,
+  so the `[hdr][payload]` pair is never interleaved with another op. The recv
+  worker answers a READ by *enqueuing* a READ_RESP descriptor onto the send
+  worker rather than transmitting itself.
+- **Passive target.** One-sided WRITE/READ need no posted receive on the target
+  — the recv worker always reads incoming headers, so it services them whether
+  or not the application posted anything.
+- **Both ends run this provider**, so the framing is private and self-consistent
+  (header fields are native little-endian; both test boxes are x86-64).
+
+### Not yet implemented: RDMA CM
+
+`rdma_cm`/`librdmacm` connection management (`rping`, perftest `-R`) is **not**
+implemented. It is deliberately lowest priority: RCCL/NCCL's IB transport and
+default perftest exchange QP information (qpn, psn, rkey, VA) over their **own
+TCP bootstrap** and connect with `ibv_modify_qp` — they never call into
+`librdmacm`. A future CM shim would interpose the `rdma_*` entry points and run a
+small TCP-based rendezvous that drives the same `ibv_modify_qp` RESET→INIT→RTR→
+RTS sequence the ibverbs path already uses.
 
 ## Device Discovery
 
