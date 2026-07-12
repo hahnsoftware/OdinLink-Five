@@ -29,7 +29,7 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 | 🟢 | Async I/O | `poll()` + `O_NONBLOCK` ioctls end-to-end |
 | 🟢 | No-cable testing | `loopback=1` module param + mock library |
 | 🟢 | NCCL verbs transport | NCCL's built-in `NCCL_NET_PLUGIN=IB` transport auto-discovers ODL via `ibv_get_device_list` |
-| 🟢 | DMA-buf zero-copy engine | `submit_tx/rx_dmabuf` verified end-to-end (64K–8M, integrity OK, no hang); shared by the verbs `ibv_reg_dmabuf_mr` path |
+| 🟢 | DMA-buf zero-copy engine | `submit_tx/rx_dmabuf` verified end-to-end (64K–8M, integrity OK, no hang); **block-striped across DMA paths — 17.6 Gb/s**; shared by the verbs `ibv_reg_dmabuf_mr` path |
 | 🟡 | NCCL custom plugin | Deprecated — prefer the verbs transport, which drives the same zero-copy DMA engine |
 | 🟡 | Async / persistent DMA-buf | Transport is correct but synchronous and maps per transfer; completion callbacks exist — async cleanup + map-once (persistent MR) are TODO |
 
@@ -37,47 +37,23 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 
 Measured point-to-point between two AMD Ryzen AI MAX+ 395 ("Strix Halo")
 boxes over a **USB4 v1** link negotiated at **20 Gb/s × 2 lanes** (kernel
-7.0.14-3-pve). "Goodput" is application-level bytes received, not TX
-submission rate.
+7.0.14-3-pve).
 
-| Configuration | Throughput | Goodput | Notes |
-|---|---|---|---|
-| Single stream, 1 DMA path | **9.3 Gb/s** (1.16 GB/s) | 100% | Per-path ceiling — router flow-control, not CPU or window |
-| 4 streams, **2 DMA paths** (MIMO) | **17.9 Gb/s** (2.24 GB/s) | 100% | Even stripe across paths (~50/50), 1.93× single path, 0 drops |
-| Idle latency (64 B round-trip) | **21.9 µs** median | — | Unchanged by multi-path |
-| Latency under 1 MB bulk load | 958 µs median | — | ⚠️ Head-of-line blocking (small messages queue behind bulk) — being worked on |
-
-**Multi-path striping** (module param `odl_num_paths`, default 2) is the
-throughput lever: the ~9.3 Gb/s cap is *per DMA path* (router credits), so
-aggregate scales with parallel ring/HopID pairs. On Strix Halo the NHI ring
-budget caps usable paths at **2** (a 3rd ring pair fails to allocate); the
-driver negotiates `min(local, remote)` paths and degrades gracefully. A
-single stream stays on one path — striping helps MIMO/collective workloads
-(NCCL/RCCL channels), which is the intended use.
-
-### Zero-copy DMA-buf over verbs (the GPU / RCCL transport)
-
-Symmetric zero-copy `ibv_reg_dmabuf_mr` send **and** receive — the path an
-RCCL/GPU workload actually takes — measured with a two-box verbs ping-pong
-(`verbs/tests/bench_verbs_dmabuf.c`) over real `/dev/dma_heap/system` buffers.
-Bytes are verified across the link every run (integrity OK), and the DMA path
-through the NHI is identical for a GPU (amdgpu/CUDA) dmabuf. This is the
-synchronous single-path (`paths[0]`) engine — no striping or pipelining yet.
-
-| Transfer size | One-way throughput | Integrity |
+| Path | Best throughput | Latency (64 B) |
 |---|---|---|
-| 64 KB  | ~5.8 Gb/s (0.73 GB/s) | OK |
-| 256 KB | 8.07 Gb/s (1.01 GB/s) | OK |
-| 1 MB   | 9.27 Gb/s (1.16 GB/s) | OK |
-| 4 MB   | 9.74 Gb/s (1.22 GB/s) | OK |
-| 8 MB   | **9.79 Gb/s** (1.22 GB/s) | OK |
+| Stream, 4 streams / 2 DMA paths (MIMO) | **17.9 Gb/s** (2.24 GB/s) | 21.9 µs round-trip |
+| Zero-copy DMA-buf over verbs, 2 DMA paths | **17.6 Gb/s** (2.20 GB/s) | 4.85 µs (`ib_send_lat`, host path) |
 
-Large transfers reach the same ~9.8 Gb/s single-path ceiling as the stream
-path. Small-message latency is dominated by the synchronous round trip; the
-host-memory path (stock perftest over the provider) measures `ib_send_lat`
-**t_min 5.25 µs** / typical 10.8 µs and `ib_send_bw` (64 KB) **967 MiB/s**.
-Multi-path striping for this DMA-buf path is the next throughput lever (the
-2-path stream result above shows the headroom).
+**Multi-path striping** is the throughput lever: the ~9.3 Gb/s cap is *per DMA
+path* (router credits), so aggregate scales with parallel ring/HopID pairs. On
+Strix Halo the NHI ring budget caps usable paths at **2**; the driver
+negotiates `min(local, remote)` paths and degrades gracefully. Both the stream
+path (`odl_num_paths`) and the zero-copy DMA-buf path (block-striped across
+negotiated paths) reach ~17.5–17.9 Gb/s — the DMA-buf path is the one an
+RCCL/GPU workload actually takes.
+
+📊 **Full results, per-benchmark reproduction commands, and single-vs-multi-path
+comparisons → [`BENCHMARKS.md`](BENCHMARKS.md)**
 
 ## Quick Start
 
@@ -300,6 +276,7 @@ working implementation. See [`COMPAT.md`](COMPAT.md).
 
 | Resource | Link |
 |----------|------|
+| Benchmarks + reproduction commands | [`BENCHMARKS.md`](BENCHMARKS.md) |
 | Install guide | [`docs/INSTALL.md`](docs/INSTALL.md) |
 | GPU / NCCL / RCCL | [`docs/GPU.md`](docs/GPU.md) |
 | Troubleshooting | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
