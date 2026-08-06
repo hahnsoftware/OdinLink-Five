@@ -508,6 +508,10 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 			       struct ring_frame *frame, bool canceled);
 void odl_tb5_rx_callback(struct tb_ring *ring,
 			 struct ring_frame *frame, bool canceled);
+void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled);
+void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled);
 
 struct odl_tb5_device *odl_tb5_rx_ring_to_dev(struct tb_ring *ring);
 

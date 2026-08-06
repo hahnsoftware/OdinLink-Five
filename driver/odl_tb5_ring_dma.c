@@ -502,6 +502,63 @@ rx_frame_done:
 	wake_up_interruptible(&ctx->waitq);
 }
 
+/*
+ * Completions for the synchronous dmabuf path (submit_tx_dmabuf /
+ * submit_rx_dmabuf).  These frames live in ctx->frames[] and carry raw dmabuf
+ * payload — no proto double-buffer, no stream/ctrl header.
+ *
+ * The shared odl_tb5_rx_callback's legacy branch peeks at
+ * ctx->bufs[ctx->posted_buf].virt (the proto double-buffer) and treats a stale
+ * ODL_TB5_DMA_MAGIC found there as a ctrl PING/PONG, returning WITHOUT bumping
+ * ctx->completed.  For dmabuf frames that buffer is unrelated to where the data
+ * actually DMAed, so a coincidental magic match silently drops one completion
+ * per transfer — the send/recv_dmabuf wait then never satisfies (and, under
+ * E2E, the dropped RX also starves a credit and stalls one peer TX frame).
+ * A dedicated callback that only counts the completion avoids the whole
+ * misinterpretation.
+ */
+void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled)
+{
+	struct odl_tb5_ring_ctx *ctx;
+	struct odl_tb5_device *dev;
+
+	ctx = odl_tb5_ring_to_ctx(ring);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	dev = container_of(ctx, struct odl_tb5_device, tx);
+	if (atomic_read(&dev->removing))
+		return;
+
+	if (canceled)
+		return;
+
+	atomic_inc(&ctx->completed);
+	wake_up_interruptible(&ctx->waitq);
+}
+
+void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
+				struct ring_frame *frame, bool canceled)
+{
+	struct odl_tb5_ring_ctx *ctx;
+	struct odl_tb5_device *dev;
+
+	ctx = odl_tb5_ring_to_ctx(ring);
+	if (WARN_ON_ONCE(!ctx))
+		return;
+
+	dev = container_of(ctx, struct odl_tb5_device, rx);
+	if (atomic_read(&dev->removing))
+		return;
+
+	if (canceled)
+		return;
+
+	atomic_inc(&ctx->completed);
+	wake_up_interruptible(&ctx->waitq);
+}
+
 int odl_tb5_rings_alloc(struct odl_tb5_device *dev)
 {
 	struct tb_xdomain *xd = dev->xd;
@@ -971,7 +1028,7 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 
 			frame->buffer_phy = sg_addr;
 			frame->size = chunk;
-			frame->callback = odl_tb5_tx_callback;
+			frame->callback = odl_tb5_tx_dmabuf_callback;
 			frame->sof = ODL_TB5_PDF_SOF_DATA;
 			frame->eof = ODL_TB5_PDF_EOF_DATA;
 
@@ -1092,7 +1149,7 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 
 			frame->buffer_phy = sg_addr;
 			frame->size = chunk;
-			frame->callback = odl_tb5_rx_callback;
+			frame->callback = odl_tb5_rx_dmabuf_callback;
 			frame->sof = ODL_TB5_PDF_SOF_DATA;
 			frame->eof = ODL_TB5_PDF_EOF_DATA;
 
