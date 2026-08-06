@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -270,7 +271,54 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 		"usage: %s <server|client> [--dev N] [--iters N] "
-		"[--warmup N] [--sizes a,b,c]\n", p);
+		"[--warmup N] [--sizes a,b,c]\n"
+		"  --sizes accepts K/M/G suffixes (1024-based), e.g. "
+		"64K,1M,8M — or plain byte counts.\n", p);
+}
+
+/*
+ * Parse one --sizes token: a byte count with an optional K/M/G suffix
+ * (1024-based, case-insensitive; a trailing 'B' is allowed).
+ *
+ * strtoull() alone stops at the first non-digit, so "1M" silently became 1
+ * BYTE and the sweep reported 0K rows with ~20 us round trips that look like
+ * plausible results. Reject trailing garbage instead of guessing.
+ */
+static int parse_size(const char *tok, size_t *out)
+{
+	char *end = NULL;
+	unsigned long long v;
+
+	errno = 0;
+	v = strtoull(tok, &end, 0);
+	if (errno == ERANGE || end == tok)
+		return -1;
+
+	if (*end) {
+		unsigned long long mult;
+
+		switch (*end) {
+		case 'k': case 'K': mult = 1024ULL; break;
+		case 'm': case 'M': mult = 1024ULL * 1024; break;
+		case 'g': case 'G': mult = 1024ULL * 1024 * 1024; break;
+		default:            return -1;
+		}
+		end++;
+		/* Tolerate the "KB"/"MB" spelling, but nothing beyond it. */
+		if (*end == 'b' || *end == 'B')
+			end++;
+		if (*end)
+			return -1;
+		if (v > ULLONG_MAX / mult)
+			return -1;
+		v *= mult;
+	}
+
+	if (v == 0 || v > SIZE_MAX)
+		return -1;
+
+	*out = (size_t)v;
+	return 0;
 }
 
 int main(int argc, char **argv)
@@ -299,10 +347,28 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--sizes") && i + 1 < argc) {
 			g_num_sizes = 0;
 			char *tok = strtok(argv[++i], ",");
-			while (tok && g_num_sizes < 16) {
-				g_sizes[g_num_sizes++] =
-					strtoull(tok, NULL, 0);
+			while (tok) {
+				size_t sz;
+
+				if (g_num_sizes == 16) {
+					fprintf(stderr,
+						"--sizes: at most 16 sizes\n");
+					return 2;
+				}
+				if (parse_size(tok, &sz) < 0) {
+					fprintf(stderr,
+						"--sizes: bad size '%s' "
+						"(expected a byte count, "
+						"optionally with K/M/G)\n",
+						tok);
+					return 2;
+				}
+				g_sizes[g_num_sizes++] = sz;
 				tok = strtok(NULL, ",");
+			}
+			if (g_num_sizes == 0) {
+				fprintf(stderr, "--sizes: no sizes given\n");
+				return 2;
 			}
 		} else {
 			usage(argv[0]);
