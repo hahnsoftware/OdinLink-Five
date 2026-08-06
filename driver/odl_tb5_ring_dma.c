@@ -26,6 +26,12 @@
 #include <linux/math.h>
 #include <linux/vmalloc.h>
 
+/* Maximum size of a single in-flight reassembled message.  Matches the
+ * sender-side cap in odl_tb5_stream_send(); a peer that streams continuation
+ * frames with no MSG_END can otherwise grow the assembly buffer unbounded and
+ * exhaust kernel memory. */
+#define ODL_TB5_RX_ASM_CAP_MAX ((size_t)ODL_TB5_STREAM_PAYLOAD_MAX * 4096)
+
 /* Forward declarations for functions defined later in this file */
 static void odl_tb5_stream_free(struct kref *ref);
 
@@ -354,27 +360,43 @@ void odl_tb5_rx_callback(struct tb_ring *ring,
 						}
 						stream->rx_asm_next_frag = fidx + 1;
 
-						/* Append payload to assembly buffer */
+						/* Append payload to assembly buffer.
+						 * Cap the total size of one in-flight
+						 * message to ODL_TB5_RX_ASM_CAP_MAX so a
+						 * peer streaming continuation frames with
+						 * no MSG_END cannot grow this unbounded. */
 						if (stream->rx_asm_len + payload_len >
 						    stream->rx_asm_cap) {
-							size_t new_cap = max_t(size_t,
-								8192,
-								max(stream->rx_asm_cap * 2,
-								    stream->rx_asm_len +
-								    payload_len));
-							void *nb = kmalloc(new_cap,
-									   GFP_ATOMIC);
-							if (!nb)
-								pr_warn_ratelimited("odl_tb5: rx_asm kmalloc(%zu, GFP_ATOMIC) FAILED - payload will be dropped\n",
-										    new_cap);
-							if (nb) {
-								if (stream->rx_asm_buf)
-									memcpy(nb,
-									       stream->rx_asm_buf,
-									       stream->rx_asm_len);
+							size_t need = stream->rx_asm_len +
+								      payload_len;
+
+							if (need > ODL_TB5_RX_ASM_CAP_MAX) {
+								pr_warn_ratelimited("odl_tb5: rx_asm cap exceeded (need=%zu max=%zu) - dropping message\n",
+										    need,
+										    ODL_TB5_RX_ASM_CAP_MAX);
 								kfree(stream->rx_asm_buf);
-								stream->rx_asm_buf = nb;
-								stream->rx_asm_cap = new_cap;
+								stream->rx_asm_buf = NULL;
+								stream->rx_asm_len = 0;
+								stream->rx_asm_cap = 0;
+							} else {
+								size_t new_cap = max_t(size_t,
+									8192,
+									max(stream->rx_asm_cap * 2,
+									    need));
+								void *nb = kmalloc(new_cap,
+										   GFP_ATOMIC);
+								if (!nb)
+									pr_warn_ratelimited("odl_tb5: rx_asm kmalloc(%zu, GFP_ATOMIC) FAILED - payload will be dropped\n",
+											    new_cap);
+								if (nb) {
+									if (stream->rx_asm_buf)
+										memcpy(nb,
+										       stream->rx_asm_buf,
+										       stream->rx_asm_len);
+									kfree(stream->rx_asm_buf);
+									stream->rx_asm_buf = nb;
+									stream->rx_asm_cap = new_cap;
+								}
 							}
 						}
 						if (stream->rx_asm_buf &&
@@ -850,7 +872,7 @@ int odl_tb5_submit_tx(struct odl_tb5_device *dev,
 
 	buf = &dev->tx.bufs[dev->tx.front];
 
-	if (offset + len > buf->size)
+	if (offset > buf->size || len > buf->size - offset)
 		return -EINVAL;
 
 	nframes = DIV_ROUND_UP(len, ODL_TB5_FRAME_SIZE);
@@ -913,7 +935,7 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
 
 	buf = &dev->rx.bufs[dev->rx.front];
 
-	if (offset + len > buf->size)
+	if (offset > buf->size || len > buf->size - offset)
 		return -EINVAL;
 
 	nframes = DIV_ROUND_UP(len, ODL_TB5_FRAME_SIZE);
@@ -975,7 +997,8 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 		return PTR_ERR(dmabuf);
 
 	if (offset < 0 || len == 0 ||
-	    (size_t)offset + len > dmabuf->size) {
+	    (size_t)offset > dmabuf->size ||
+	    len > dmabuf->size - (size_t)offset) {
 		ret = -EINVAL;
 		goto err_put;
 	}
@@ -1057,9 +1080,24 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 
 	atomic_add(frame_idx, &dev->tx.submitted);
 
-	wait_event_interruptible(dev->tx.waitq,
+	if (wait_event_interruptible(dev->tx.waitq,
 		atomic_read(&dev->tx.completed) >=
-		atomic_read(&dev->tx.submitted));
+		atomic_read(&dev->tx.submitted)) == -ERESTARTSYS) {
+		/* A signal arrived mid-DMA. The unmap below must not race the
+		 * still in-flight transfer, so wait uninterruptibly for it to
+		 * drain — but bound the wait. An unbounded wait_event() here
+		 * pins this task in D state forever (holding a module
+		 * reference) if a completion never arrives, e.g. when the DMA
+		 * engine is wedged. Grace the common case (a completion lands
+		 * in microseconds) while guaranteeing the task can exit. */
+		if (!wait_event_timeout(dev->tx.waitq,
+			atomic_read(&dev->tx.completed) >=
+			atomic_read(&dev->tx.submitted),
+			msecs_to_jiffies(5000)))
+			pr_warn("odl_tb5: dmabuf TX drain timeout (completed=%d submitted=%d); proceeding with unmap\n",
+				atomic_read(&dev->tx.completed),
+				atomic_read(&dev->tx.submitted));
+	}
 
 	dma_buf_unmap_attachment(attach, sgt, DMA_TO_DEVICE);
 	dma_buf_detach(dmabuf, attach);
@@ -1099,7 +1137,8 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 		return PTR_ERR(dmabuf);
 
 	if (offset < 0 || len == 0 ||
-	    (size_t)offset + len > dmabuf->size) {
+	    (size_t)offset > dmabuf->size ||
+	    len > dmabuf->size - (size_t)offset) {
 		ret = -EINVAL;
 		goto err_put;
 	}
@@ -1176,9 +1215,20 @@ int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 
 	atomic_add(frame_idx, &dev->rx.submitted);
 
-	wait_event_interruptible(dev->rx.waitq,
+	if (wait_event_interruptible(dev->rx.waitq,
 		atomic_read(&dev->rx.completed) >=
-		atomic_read(&dev->rx.submitted));
+		atomic_read(&dev->rx.submitted)) == -ERESTARTSYS) {
+		/* See submit_tx_dmabuf: bounded uninterruptible drain so the
+		 * unmap cannot race an in-flight transfer, without the risk of
+		 * a permanently unkillable task. */
+		if (!wait_event_timeout(dev->rx.waitq,
+			atomic_read(&dev->rx.completed) >=
+			atomic_read(&dev->rx.submitted),
+			msecs_to_jiffies(5000)))
+			pr_warn("odl_tb5: dmabuf RX drain timeout (completed=%d submitted=%d); proceeding with unmap\n",
+				atomic_read(&dev->rx.completed),
+				atomic_read(&dev->rx.submitted));
+	}
 
 	dma_buf_unmap_attachment(attach, sgt, DMA_FROM_DEVICE);
 	dma_buf_detach(dmabuf, attach);
