@@ -22,6 +22,16 @@ target_include_directories(odl_tb5_test_rccl_dmabuf PRIVATE
 )
 target_link_libraries(odl_tb5_test_rccl_dmabuf odl_tb5 pthread)
 
+add_executable(odl_tb5_pair_dmabuf
+    odl_tb5_pair_dmabuf.c
+)
+
+target_include_directories(odl_tb5_pair_dmabuf PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/include
+    ${CMAKE_SOURCE_DIR}/driver/uapi
+)
+target_link_libraries(odl_tb5_pair_dmabuf odl_tb5 pthread)
+
 add_executable(odl_tb5_bench_dmabuf
     odl_tb5_bench_dmabuf.c
 )
@@ -31,3 +41,13 @@ target_include_directories(odl_tb5_bench_dmabuf PRIVATE
     ${CMAKE_SOURCE_DIR}/driver/uapi
 )
 target_link_libraries(odl_tb5_bench_dmabuf odl_tb5 pthread)
+
+add_executable(odl_stream_verify
+    odl_stream_verify.c
+)
+
+target_include_directories(odl_stream_verify PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/include
+    ${CMAKE_SOURCE_DIR}/driver/uapi
+)
+target_link_libraries(odl_stream_verify odl_tb5 pthread)

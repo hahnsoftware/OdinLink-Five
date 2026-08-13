@@ -50,7 +50,9 @@
  * the --sizes parser's cap; sizing it to the initializer (5) let >5 sizes
  * overflow into the globals below (corrupting g_iters/g_num_sizes). */
 static size_t g_sizes[16] = { 65536, 262144, 1048576, 4194304, 16777216 };
+static size_t g_reject[8];
 static int    g_num_sizes = 5;
+static int    g_reject_n  = 0;
 static int    g_iters     = 200;
 static int    g_warmup    = 20;
 static int    g_dev       = 0;
@@ -106,6 +108,16 @@ static int run_server(odl_tb5_t h)
 	printf("[server] dmabuf echo — waiting for client drive\n");
 	for (int s = 0; s < g_num_sizes; s++) {
 		size_t size = g_sizes[s];
+		int skip = 0;
+		for (int r = 0; r < g_reject_n; r++)
+			if (g_reject[r] == size)
+				skip = 1;
+		if (skip) {
+			printf("[server] size=%zu is an expect-reject probe — "
+			       "skipping (client never transmits it)\n", size);
+			continue;
+		}
+
 		int fd = alloc_dmabuf(size);
 		if (fd < 0)
 			return 1;
@@ -179,6 +191,24 @@ static int run_client(odl_tb5_t h)
 	       "--------------------------------\n");
 
 	int any_fail = 0;
+
+	/* F2 trigger probe: attempt each --expect-reject size ONCE before the
+	 * real transfers.  On a ring already under pressure the driver's
+	 * up-front capacity pre-check answers -ENOSPC here; on an empty ring
+	 * the submit may go through.  Either outcome is acceptable — the gate
+	 * only cares that the FOLLOWING transfers still complete (the pre-F2
+	 * hang fired exactly on that next-op-after-reject sequence), so this
+	 * probe is informational and never aborts the run. */
+	for (int r = 0; r < g_reject_n; r++) {
+		size_t sz = g_reject[r];
+		int fd = alloc_dmabuf(sz);
+		if (fd < 0)
+			return 1;
+		int ret = odl_tb5_send_dmabuf(h, fd, 0, sz);
+		printf("[client] pre-reject probe size=%zu: %s\n", sz,
+		       ret < 0 ? strerror(-ret) : "submitted (ring had room)");
+		close(fd);
+	}
 
 	for (int s = 0; s < g_num_sizes; s++) {
 		size_t size = g_sizes[s];
@@ -271,9 +301,12 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 		"usage: %s <server|client> [--dev N] [--iters N] "
-		"[--warmup N] [--sizes a,b,c]\n"
+		"[--warmup N] [--sizes a,b,c] [--expect-reject a,b,c]\n"
 		"  --sizes accepts K/M/G suffixes (1024-based), e.g. "
-		"64K,1M,8M — or plain byte counts.\n", p);
+		"64K,1M,8M — or plain byte counts.\n"
+		"  --expect-reject: sizes to probe ONCE (client) before the "
+		"sizes loop, to arm a ring-full capacity reject before the "
+		"real transfers (F2 trigger shape).\n", p);
 }
 
 /*
@@ -369,6 +402,22 @@ int main(int argc, char **argv)
 			if (g_num_sizes == 0) {
 				fprintf(stderr, "--sizes: no sizes given\n");
 				return 2;
+			}
+		} else if (!strcmp(argv[i], "--expect-reject") && i + 1 < argc) {
+			g_reject_n = 0;
+			char *tok = strtok(argv[++i], ",");
+			while (tok) {
+				size_t sz;
+
+				if (g_reject_n == 8 ||
+				    parse_size(tok, &sz) < 0) {
+					fprintf(stderr,
+						"--expect-reject: bad size "
+						"'%s'\n", tok);
+					return 2;
+				}
+				g_reject[g_reject_n++] = sz;
+				tok = strtok(NULL, ",");
 			}
 		} else {
 			usage(argv[0]);

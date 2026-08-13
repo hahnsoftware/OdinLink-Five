@@ -47,9 +47,11 @@ int odl_tb5_test_plugin(void)
 	TEST("All function pointers non-NULL");
 	if (plugin->init && plugin->devices && plugin->getProperties &&
 	    plugin->listen && plugin->connect && plugin->accept &&
+	    plugin->regMr && plugin->regMrDmaBuf && plugin->deregMr &&
 	    plugin->closeListen && plugin->isend && plugin->irecv &&
 	    plugin->iflush && plugin->test && plugin->closeSend &&
-	    plugin->closeRecv) {
+	    plugin->closeRecv && plugin->getDeviceMr &&
+	    plugin->irecvConsumed) {
 		PASS();
 	} else {
 		FAIL("Some function pointers are NULL");
@@ -63,6 +65,20 @@ int odl_tb5_test_plugin(void)
 			PASS();
 		} else {
 			FAIL("init returned error");
+		}
+	}
+
+	/* Host-staged transport must not claim that it registered a DMA-BUF. */
+	TEST("regMrDmaBuf refuses unsupported registration");
+	{
+		void *mhandle = (void *)1;
+		rcclResult_t res = plugin->regMrDmaBuf(NULL, NULL, 4096,
+						      NCCL_PTR_DMABUF, 128, -1,
+						      &mhandle);
+		if (res == rcclInvalidUsage && mhandle == NULL) {
+			PASS();
+		} else {
+			FAIL("Expected rcclInvalidUsage and a NULL memory handle");
 		}
 	}
 
@@ -88,12 +104,13 @@ int odl_tb5_test_plugin(void)
 		if (ndev > 0) {
 			rcclNetProperties_v7_t props;
 			rcclResult_t res = plugin->getProperties(0, &props);
-			if (res == rcclSuccess) {
+			if (res == rcclSuccess && props.speed > 0 &&
+			    props.ptrSupport == NCCL_PTR_HOST) {
 				printf("PASS (name=%s, speed=%d, ptr=%d)\n",
 				       props.name, props.speed, props.ptrSupport);
 				pass_count++;
 			} else {
-				FAIL("getProperties returned error");
+				FAIL("getProperties returned invalid host properties");
 			}
 		} else {
 			printf("SKIP (no devices)\n");

@@ -51,12 +51,15 @@ int odl_tb5_test_device(void)
 	{
 		struct odl_tb5_buf_info info;
 		ret = ioctl(fd, ODL_TB5_IOCTL_GET_BUF_INFO, &info);
-		if (ret == 0) {
+		if (ret == 0 && info.tx_buf_size > 0 && info.rx_buf_size > 0 &&
+		    info.tx_buf_count == 2 && info.rx_buf_count == 2) {
 			printf("PASS (tx=%lu, rx=%lu, count=%u)\n",
 			       (unsigned long)info.tx_buf_size,
 			       (unsigned long)info.rx_buf_size,
 			       info.tx_buf_count);
 			pass_count++;
+		} else if (ret == 0) {
+			FAIL("driver reported unusable buffer geometry");
 		} else {
 			FAIL(strerror(errno));
 		}
