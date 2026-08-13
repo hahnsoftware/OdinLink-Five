@@ -71,6 +71,14 @@ struct odl_tb5_login_msg {
 	u32 extra_tx_hopids[ODL_TB5_MAX_PATHS - 1];
 	/* v3 extension (presence detected via packet size) */
 	u32 flags;
+	/* v4 extension (presence detected via packet size): the SENDER's
+	 * XDomain UUID (dev->xd->local_uuid).  tb_route() is ambiguous
+	 * across cables — two controllers can both report route 2 — so
+	 * inbound control packets are matched to a device by UUID instead:
+	 * the receiver compares sender_uuid against its devices' remote_uuid,
+	 * which is unique per wire.  Legacy peers omit these 16 bytes and
+	 * fall back to route lookup. */
+	u8 sender_uuid[16];
 };
 
 struct odl_tb5_login_response {
@@ -91,6 +99,9 @@ struct odl_tb5_login_response {
 /* Size of the v2 (multi-path) login message — everything before the v3
  * flags dword.  v2 peers send exactly this many bytes. */
 #define ODL_TB5_LOGIN_V2_SIZE	offsetof(struct odl_tb5_login_msg, flags)
+/* Size of the v3 (raw-payload flags) login message — everything before
+ * the v4 sender UUID.  v3 peers send exactly this many bytes. */
+#define ODL_TB5_LOGIN_V3_SIZE	offsetof(struct odl_tb5_login_msg, sender_uuid)
 
 /* Raw-payload zero-copy: both sides must set this flag in their login
  * messages for the bounce-free dmabuf path to activate on the link. */
@@ -103,6 +114,9 @@ struct odl_tb5_login_response {
 
 struct odl_tb5_logout_msg {
 	struct odl_tb5_xd_header xd_hdr;
+	/* v4: sender XDomain UUID — see the login message.  Legacy peers
+	 * send just the header (40 bytes). */
+	u8 sender_uuid[16];
 };
 
 static void odl_tb5_login_work_fn(struct work_struct *work);
@@ -143,6 +157,26 @@ static struct odl_tb5_device *odl_tb5_find_device_by_route(u64 route)
 	return NULL;
 }
 
+/* Match an inbound control packet to the device whose peer sent it.
+ * Each wire ends at a device whose xd->remote_uuid is the SENDER's
+ * xd->local_uuid on the other host; the sender stamps that UUID into
+ * the v4 login/logout payloads.  Unique per wire, even when several
+ * cables share the same tb_route() value. */
+static struct odl_tb5_device *
+odl_tb5_find_device_by_remote_uuid(const uuid_t *u)
+{
+	struct odl_tb5_device *dev;
+
+	if (!u)
+		return NULL;
+	list_for_each_entry(dev, &odl_tb5_devices_list, list) {
+		if (dev->xd->remote_uuid &&
+		    uuid_equal(dev->xd->remote_uuid, u))
+			return dev;
+	}
+	return NULL;
+}
+
 static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 				       void *data)
 {
@@ -157,12 +191,40 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 	route = (((u64)hdr->route_hi << 32) | hdr->route_lo) & ~BIT_ULL(63);
 
 	mutex_lock(&odl_tb5_devices_lock);
-	dev = odl_tb5_find_device_by_route(route);
+	/* Multi-cable identity routing: v4+ senders stamp their XDomain UUID,
+	 * which uniquely identifies the wire (tb_route() can collide across
+	 * controllers).  Route lookup remains the legacy/Apple fallback. */
+	dev = NULL;
+	if (!odl_protocol_mode) {
+		if (hdr->type == ODL_TB5_MSG_LOGIN &&
+		    size >= sizeof(struct odl_tb5_login_msg)) {
+			const struct odl_tb5_login_msg *pkg = buf;
+
+			dev = odl_tb5_find_device_by_remote_uuid(
+				(const uuid_t *)pkg->sender_uuid);
+			if (!dev)
+				pr_warn("OdinLink: login sender UUID %pU — "
+					"no matching device, route fallback\n",
+					pkg->sender_uuid);
+		} else if (hdr->type == ODL_TB5_MSG_LOGOUT &&
+			   size >= sizeof(struct odl_tb5_logout_msg)) {
+			const struct odl_tb5_logout_msg *pkg = buf;
+
+			dev = odl_tb5_find_device_by_remote_uuid(
+				(const uuid_t *)pkg->sender_uuid);
+			if (!dev)
+				pr_warn("OdinLink: logout sender UUID %pU — "
+					"no matching device, route fallback\n",
+					pkg->sender_uuid);
+		}
+	}
+	if (!dev)
+		dev = odl_tb5_find_device_by_route(route);
 
 	if (!dev) {
-		mutex_unlock(&odl_tb5_devices_lock);
 		pr_warn("OdinLink: incoming packet route %llx — no matching device\n",
 			route);
+		mutex_unlock(&odl_tb5_devices_lock);
 		return 0;
 	}
 
@@ -197,6 +259,16 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		}
 
 		if (size >= sizeof(*pkg)) {
+			/* Login v4: raw-payload flags + sender UUID present
+			 * (by SIZE, proto_version stays 1 — no flag day). */
+			remote_tx_hopid = pkg->transmit_path;
+			proto_ver = pkg->proto_version;
+			remote_paths = clamp_t(int, (int)pkg->path_count,
+					       1, ODL_TB5_MAX_PATHS);
+			for (p = 1; p < remote_paths; p++)
+				remote_hopids[p] = pkg->extra_tx_hopids[p - 1];
+			remote_flags = pkg->flags;
+		} else if (size >= ODL_TB5_LOGIN_V3_SIZE) {
 			/* Login v3: raw-payload flags present (by SIZE,
 			 * proto_version stays 1 — no flag day). */
 			remote_tx_hopid = pkg->transmit_path;
@@ -376,6 +448,10 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	for (p = 1; p < dev->num_paths; p++)
 		msg.extra_tx_hopids[p - 1] = dev->paths[p].local_tx_hopid;
 	msg.flags = odl_raw_payload ? ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD : 0;
+	/* v4: stamp our controller identity so the peer can route this
+	 * packet to the right device on multi-cable hosts. */
+	if (dev->xd->local_uuid)
+		memcpy(msg.sender_uuid, dev->xd->local_uuid, 16);
 
 	ret = tb_xdomain_request(dev->xd, &msg, sizeof(msg),
 				 TB_CFG_PKG_XDOMAIN_REQ,
@@ -1459,6 +1535,9 @@ int odl_tb5_proto_send_logout(struct odl_tb5_device *dev)
 
 	odl_tb5_xd_header_init(&msg.xd_hdr, dev->xd, ODL_TB5_MSG_LOGOUT,
 			       sizeof(msg));
+	/* v4: stamp our identity (see login v4). */
+	if (dev->xd->local_uuid)
+		memcpy(msg.sender_uuid, dev->xd->local_uuid, 16);
 
 	tb_xdomain_request(dev->xd, &msg, sizeof(msg),
 			   TB_CFG_PKG_XDOMAIN_REQ,

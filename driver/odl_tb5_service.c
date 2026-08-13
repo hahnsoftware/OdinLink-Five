@@ -199,12 +199,31 @@ static int odl_tb5_probe(struct tb_service *svc,
 	dev->svc = svc;
 	dev->xd  = tb_service_parent(svc);
 
-	ret = ida_alloc_max(&odl_tb5_ida, ODL_TB5_MAX_DEVICES - 1, GFP_KERNEL);
-	if (ret < 0) {
-		kfree(dev);
-		return ret;
+	/* Stable, per-controller numbering: /dev/odl_tb5_N == TB domain N
+	 * (each controller = one NHI = one cable).  Probe order is racy
+	 * across controllers, which made probe-order indexes flaky for
+	 * cross-host pairing; the domain index is deterministic per NIC.
+	 * Falls back to a free slot if the controller index is taken. */
+	dev->index = dev->xd->tb->index;
+	if (dev->index >= 0 && dev->index < ODL_TB5_MAX_DEVICES) {
+		ret = ida_alloc_range(&odl_tb5_ida, dev->index, dev->index,
+				      GFP_KERNEL);
+		if (ret < 0)
+			dev->index = -1;
+		else
+			dev->index = ret;
+	} else {
+		dev->index = -1;
 	}
-	dev->index = ret;
+	if (dev->index < 0) {
+		ret = ida_alloc_max(&odl_tb5_ida, ODL_TB5_MAX_DEVICES - 1,
+				    GFP_KERNEL);
+		if (ret < 0) {
+			kfree(dev);
+			return ret;
+		}
+		dev->index = ret;
+	}
 
 	/* Multi-path: initialise ALL slots up front (cheap, avoids special
 	 * casing elsewhere).  num_paths is the configured stripe count;
