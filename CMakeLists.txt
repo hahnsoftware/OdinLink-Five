@@ -62,9 +62,11 @@ if(PKG_CONFIG_EXE)
         if(NOT _CHK_FUSE3_FOUND)
             message(STATUS "Optional: libfuse3-dev not found (distributed file access disabled)")
         endif()
-        pkg_check_modules(_CHK_OPENSSL QUIET libcrypto)
-        if(NOT _CHK_OPENSSL_FOUND)
-            message(STATUS "Optional: libssl-dev not found (SHA-256 sync disabled)")
+        if(BUILD_DAEMON)
+            pkg_check_modules(_CHK_OPENSSL QUIET libcrypto)
+            if(NOT _CHK_OPENSSL_FOUND)
+                list(APPEND ODL_MISSING_DEPS "libssl-dev")
+            endif()
         endif()
     endif()
 else()
@@ -84,7 +86,7 @@ if(ODL_MISSING_DEPS)
         "\n"
         "  Then re-run cmake.\n"
         "============================================================\n")
-    # Fail only if a required dep is missing (not optional fuse3/openssl)
+    # Fail only if a dependency required by every requested component is missing.
     if(BUILD_KERNEL_MODULE)
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
            (NOT KERNEL_GCC OR NOT PKG_CONFIG_EXE OR NOT GDBUS_CODEGEN_EXE
@@ -136,6 +138,11 @@ add_subdirectory(tests)
 # Auto-disable if dependencies not found
 if(BUILD_DAEMON AND NOT _CHK_GLIB2_FOUND)
     message(WARNING "glib-2.0 / gio-2.0 not found -- disabling daemon build.")
+    set(BUILD_DAEMON OFF)
+endif()
+
+if(BUILD_DAEMON AND NOT _CHK_OPENSSL_FOUND)
+    message(WARNING "libcrypto not found -- disabling daemon build. Install libssl-dev to enable it.")
     set(BUILD_DAEMON OFF)
 endif()
 

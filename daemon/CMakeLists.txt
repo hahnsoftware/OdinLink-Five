@@ -12,14 +12,8 @@ else()
                    "Install libfuse3-dev to enable.")
 endif()
 
-# Optional: OpenSSL for SHA-256 (used by sync protocol)
-pkg_check_modules(OPENSSL QUIET libcrypto)
-if(OPENSSL_FOUND)
-    message(STATUS "OpenSSL found -- SHA-256 enabled for file sync")
-else()
-    message(STATUS "OpenSSL not found -- file sync SHA-256 disabled. "
-                   "Install libssl-dev to enable.")
-endif()
+# The sync protocol always uses OpenSSL for HMAC and SHA-256.
+pkg_check_modules(OPENSSL REQUIRED libcrypto)
 
 # Generate D-Bus C bindings from introspection XML
 set(DBUS_XML ${CMAKE_CURRENT_SOURCE_DIR}/dbus/com.odinlink.Tb5Daemon.xml)
@@ -91,20 +85,15 @@ else()
     list(APPEND DAEMON_SOURCES src/odl_tb5_daemon_fuse_stubs.c)
 endif()
 
-# Add OpenSSL if available
-if(OPENSSL_FOUND)
-    list(APPEND DAEMON_INCLUDES ${OPENSSL_INCLUDE_DIRS})
-    list(APPEND DAEMON_LIBS ${OPENSSL_LIBRARIES})
-endif()
+list(APPEND DAEMON_INCLUDES ${OPENSSL_INCLUDE_DIRS})
+list(APPEND DAEMON_LIBS ${OPENSSL_LIBRARIES})
 
 add_executable(odl_tb5_daemon ${DAEMON_SOURCES})
 
 if(FUSE3_FOUND)
     target_compile_definitions(odl_tb5_daemon PRIVATE ODL_HAVE_FUSE3=1)
 endif()
-if(OPENSSL_FOUND)
-    target_compile_definitions(odl_tb5_daemon PRIVATE ODL_HAVE_OPENSSL=1)
-endif()
+target_compile_definitions(odl_tb5_daemon PRIVATE ODL_HAVE_OPENSSL=1)
 
 target_include_directories(odl_tb5_daemon PRIVATE ${DAEMON_INCLUDES})
 target_link_libraries(odl_tb5_daemon ${DAEMON_LIBS})
