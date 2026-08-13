@@ -17,11 +17,101 @@
 
 #include <linux/poll.h>
 #include <linux/uaccess.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/vmalloc.h>
 
 #include "odl_tb5_core.h"
 
 static dev_t odl_tb5_devt;
 static struct class *odl_tb5_class;
+
+/* ── debugfs: per-device observability counters ─────────────────────── */
+
+static int odl_tb5_stats_show(struct seq_file *m, void *v)
+{
+	struct odl_tb5_device *dev = m->private;
+	struct odl_tb5_stats *s = &dev->stats;
+
+#define ODL_TB5_STATS_PRINT(name)					\
+	seq_printf(m, "%s %lld\n", #name,				\
+		   (long long)atomic64_read(&s->name));
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_PRINT)
+#undef ODL_TB5_STATS_PRINT
+
+	/* Per-path frame counters (multi-path striping) */
+	{
+		int p;
+
+		for (p = 0; p < dev->num_paths; p++) {
+			seq_printf(m, "p%d_tx_frames %lld\n", p,
+				   (long long)atomic64_read(
+					   &s->path_tx_frames[p]));
+			seq_printf(m, "p%d_rx_frames %lld\n", p,
+				   (long long)atomic64_read(
+					   &s->path_rx_frames[p]));
+		}
+	}
+
+	/* Current state values (not counters) */
+	seq_printf(m, "cur_rx_posted %d\n", atomic_read(&dev->paths[0].rx_posted));
+	seq_printf(m, "cur_rx_target %d\n", dev->paths[0].rx_target);
+	seq_printf(m, "cur_frame_pool_free %d\n", dev->frame_pool.free_count);
+	seq_printf(m, "cur_batch_pool_free %d\n", dev->batch_pool.free_count);
+	seq_printf(m, "cur_tx_inflight %d\n", atomic_read(&dev->tx_inflight));
+	seq_printf(m, "cur_poll_active %d\n", atomic_read(&dev->poll_active));
+	seq_printf(m, "cur_tx_mode %d\n", dev->tx_adaptive.mode);
+	seq_printf(m, "cur_state %d\n", dev->state);
+	seq_printf(m, "cur_tx_active_paths %d\n", dev->tx_active_paths);
+	seq_printf(m, "cur_negotiated_paths %d\n", dev->negotiated_paths);
+	seq_printf(m, "cur_raw_payload_ok %d\n", dev->raw_payload_ok);
+
+	/* RX health counters that live on the device rather than in the
+	 * stats X-macro (they are levels/low-water marks, not monotonic
+	 * event counts, and rx_posted_min must not be zeroed to 0). */
+	seq_printf(m, "rx_frames_ok %d\n", atomic_read(&dev->rx_frames_ok));
+	seq_printf(m, "rx_unclassified %d\n",
+		   atomic_read(&dev->rx_unclassified));
+	seq_printf(m, "rx_repost_starved %d\n",
+		   atomic_read(&dev->rx_repost_starved));
+	seq_printf(m, "rx_repost_short %d\n",
+		   atomic_read(&dev->rx_repost_short));
+	seq_printf(m, "rx_posted_min %d\n", atomic_read(&dev->rx_posted_min));
+	seq_printf(m, "restart_count %d\n", atomic_read(&dev->restart_count));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(odl_tb5_stats);
+
+static ssize_t odl_tb5_stats_reset_write(struct file *file,
+					 const char __user *ubuf,
+					 size_t count, loff_t *ppos)
+{
+	struct odl_tb5_device *dev = file->private_data;
+	struct odl_tb5_stats *s = &dev->stats;
+
+#define ODL_TB5_STATS_ZERO(name)	atomic64_set(&s->name, 0);
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_ZERO)
+#undef ODL_TB5_STATS_ZERO
+
+	{
+		int p;
+
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++) {
+			atomic64_set(&s->path_tx_frames[p], 0);
+			atomic64_set(&s->path_rx_frames[p], 0);
+		}
+	}
+
+	return count;
+}
+
+static const struct file_operations odl_tb5_stats_reset_fops = {
+	.owner		= THIS_MODULE,
+	.open		= simple_open,
+	.write		= odl_tb5_stats_reset_write,
+	.llseek		= default_llseek,
+};
 
 static int odl_tb5_open(struct inode *inode, struct file *filp)
 {
@@ -62,6 +152,33 @@ static int odl_tb5_release(struct inode *inode, struct file *filp)
 	kfree(ctx);
 	atomic_dec(&dev->open_count);
 
+	return 0;
+}
+
+static int odl_tb5_loopback_legacy_xfer(struct odl_tb5_device *dev,
+					__u64 offset, __u64 len, bool is_tx)
+{
+	struct odl_tb5_ring_ctx *tx = &dev->paths[0].tx;
+	struct odl_tb5_ring_ctx *rx = &dev->paths[0].rx;
+	struct odl_tb5_dma_buf *tx_buf = &tx->bufs[tx->front];
+	struct odl_tb5_dma_buf *rx_buf = &rx->bufs[rx->front];
+
+	if (offset > tx_buf->size || len > tx_buf->size - offset ||
+	    offset > rx_buf->size || len > rx_buf->size - offset)
+		return -EINVAL;
+
+	if (is_tx) {
+		memcpy((char *)rx_buf->virt + offset,
+		       (char *)tx_buf->virt + offset, len);
+		atomic_inc(&tx->submitted);
+		atomic_inc(&tx->completed);
+		wake_up_interruptible(&tx->waitq);
+		return 0;
+	}
+
+	atomic_inc(&rx->submitted);
+	atomic_inc(&rx->completed);
+	wake_up_interruptible(&rx->waitq);
 	return 0;
 }
 
@@ -127,6 +244,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		stream = odl_tb5_stream_lookup(dev, req.stream_id);
 		if (!stream)
@@ -152,10 +271,17 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		stream = odl_tb5_stream_lookup(dev, req.stream_id);
 		if (!stream)
 			return -ENOENT;
+
+		/* Arm the RX pool on the first recv attempt — BEFORE the
+		 * O_NONBLOCK short-circuit, else a non-blocking verbs recv
+		 * worker returns EAGAIN here forever and the pool never arms. */
+		odl_tb5_rx_arm(dev);
 
 		/* Non-blocking recv: fail if no data available */
 		if (nonblock && !odl_tb5_stream_can_recv(stream)) {
@@ -187,6 +313,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		if (nonblock)
 			return -EAGAIN; /* Use poll() for non-blocking wait */
@@ -208,9 +336,22 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
-		if (nonblock)
-			return -EAGAIN; /* Use poll() for non-blocking wait */
+		/* Arm the RX pool before the O_NONBLOCK short-circuit, same
+		 * reason as STREAM_RECV. */
+		odl_tb5_rx_arm(dev);
+
+		/* Non-blocking fd with timeout_ms == 0: pure poll mode, return
+		 * immediately.  A non-blocking fd with timeout_ms > 0 BLOCKS on
+		 * stream->rx_waitq up to the timeout (Task C) — this lets the
+		 * userspace verbs recv worker block instead of busy-polling,
+		 * while timeout_ms == 0 keeps the old -EAGAIN poll-only
+		 * behaviour.  The in-kernel wait in odl_tb5_stream_wait_rx is
+		 * unaffected by O_NONBLOCK. */
+		if (nonblock && req.timeout_ms == 0)
+			return -EAGAIN;
 
 		stream = odl_tb5_stream_lookup(dev, req.stream_id);
 		if (!stream)
@@ -228,6 +369,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		stream = odl_tb5_stream_lookup(dev, req.stream_id);
 		if (!stream)
@@ -246,6 +389,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 
 		if (copy_from_user(&req, uarg, sizeof(req)))
 			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		stream = odl_tb5_stream_lookup(dev, req.stream_id);
 		if (!stream)
@@ -267,6 +412,9 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (dev->state != ODL_TB5_STATE_CONNECTED &&
 		    dev->state != ODL_TB5_STATE_READY)
 			return -ENOTCONN;
+		if (dev->loopback_data)
+			return odl_tb5_loopback_legacy_xfer(dev, req.offset,
+						    req.len, true);
 
 		return odl_tb5_submit_tx(dev, req.offset, req.len,
 					 !!(req.flags & ODL_TB5_XFER_FLAG_CTRL));
@@ -280,6 +428,9 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (dev->state != ODL_TB5_STATE_CONNECTED &&
 		    dev->state != ODL_TB5_STATE_READY)
 			return -ENOTCONN;
+		if (dev->loopback_data)
+			return odl_tb5_loopback_legacy_xfer(dev, req.offset,
+						    req.len, false);
 
 		return odl_tb5_submit_rx(dev, req.offset, req.len);
 	}
@@ -292,6 +443,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (dev->state != ODL_TB5_STATE_CONNECTED &&
 		    dev->state != ODL_TB5_STATE_READY)
 			return -ENOTCONN;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		return odl_tb5_submit_tx_dmabuf(dev, req.dmabuf_fd,
 						req.offset, req.len);
@@ -305,6 +458,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (dev->state != ODL_TB5_STATE_CONNECTED &&
 		    dev->state != ODL_TB5_STATE_READY)
 			return -ENOTCONN;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
 
 		return odl_tb5_submit_rx_dmabuf(dev, req.dmabuf_fd,
 						req.offset, req.len);
@@ -313,10 +468,10 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	case ODL_TB5_IOCTL_POLL_COMPLETION: {
 		struct odl_tb5_completion comp;
 
-		comp.tx_completed = atomic_read(&dev->tx.completed);
-		comp.rx_completed = atomic_read(&dev->rx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.tx_completed = atomic_read(&dev->paths[0].tx.completed);
+		comp.rx_completed = atomic_read(&dev->paths[0].rx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -328,18 +483,18 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		struct odl_tb5_completion comp;
 		long ret;
 
-		ret = wait_event_interruptible_timeout(dev->tx.waitq,
-			atomic_read(&dev->tx.completed) > 0,
+		ret = wait_event_interruptible_timeout(dev->paths[0].tx.waitq,
+			atomic_read(&dev->paths[0].tx.completed) > 0,
 			msecs_to_jiffies(30000));
 		if (ret == 0)
 			return -ETIMEDOUT;
 		if (ret < 0)
 			return ret;
 
-		comp.tx_completed = atomic_xchg(&dev->tx.completed, 0);
-		comp.rx_completed = atomic_read(&dev->rx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.tx_completed = atomic_xchg(&dev->paths[0].tx.completed, 0);
+		comp.rx_completed = atomic_read(&dev->paths[0].rx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -351,18 +506,18 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		struct odl_tb5_completion comp;
 		long ret;
 
-		ret = wait_event_interruptible_timeout(dev->rx.waitq,
-			atomic_read(&dev->rx.completed) > 0,
+		ret = wait_event_interruptible_timeout(dev->paths[0].rx.waitq,
+			atomic_read(&dev->paths[0].rx.completed) > 0,
 			msecs_to_jiffies(30000));
 		if (ret == 0)
 			return -ETIMEDOUT;
 		if (ret < 0)
 			return ret;
 
-		comp.rx_completed = atomic_xchg(&dev->rx.completed, 0);
-		comp.tx_completed = atomic_read(&dev->tx.completed);
-		comp.tx_submitted = atomic_read(&dev->tx.submitted);
-		comp.rx_submitted = atomic_read(&dev->rx.submitted);
+		comp.rx_completed = atomic_xchg(&dev->paths[0].rx.completed, 0);
+		comp.tx_completed = atomic_read(&dev->paths[0].tx.completed);
+		comp.tx_submitted = atomic_read(&dev->paths[0].tx.submitted);
+		comp.rx_submitted = atomic_read(&dev->paths[0].rx.submitted);
 
 		if (copy_to_user(uarg, &comp, sizeof(comp)))
 			return -EFAULT;
@@ -411,8 +566,8 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	case ODL_TB5_IOCTL_GET_BUF_INFO: {
 		struct odl_tb5_buf_info info;
 
-		info.tx_buf_size  = dev->tx.bufs[0].size;
-		info.rx_buf_size  = dev->rx.bufs[0].size;
+		info.tx_buf_size  = dev->paths[0].tx.bufs[0].size;
+		info.rx_buf_size  = dev->paths[0].rx.bufs[0].size;
 		info.tx_buf_count = ODL_TB5_NUM_BUFFERS;
 		info.rx_buf_count = ODL_TB5_NUM_BUFFERS;
 
@@ -423,17 +578,17 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 	}
 
 	case ODL_TB5_IOCTL_SWAP_TX_BUF:
-		spin_lock(&dev->tx.lock);
-		swap(dev->tx.front, dev->tx.back);
-		dev->tx.swapped_since_post = true;
-		spin_unlock(&dev->tx.lock);
+		spin_lock(&dev->paths[0].tx.lock);
+		swap(dev->paths[0].tx.front, dev->paths[0].tx.back);
+		dev->paths[0].tx.swapped_since_post = true;
+		spin_unlock(&dev->paths[0].tx.lock);
 		return 0;
 
 	case ODL_TB5_IOCTL_SWAP_RX_BUF:
-		spin_lock(&dev->rx.lock);
-		swap(dev->rx.front, dev->rx.back);
-		dev->rx.swapped_since_post = true;
-		spin_unlock(&dev->rx.lock);
+		spin_lock(&dev->paths[0].rx.lock);
+		swap(dev->paths[0].rx.front, dev->paths[0].rx.back);
+		dev->paths[0].rx.swapped_since_post = true;
+		spin_unlock(&dev->paths[0].rx.lock);
 		return 0;
 
 	case ODL_TB5_IOCTL_WAIT_READY: {
@@ -475,16 +630,16 @@ static int odl_tb5_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	switch (mmap_offset) {
 	case ODL_TB5_MMAP_TX_BUF0:
-		buf = &dev->tx.bufs[0];
+		buf = &dev->paths[0].tx.bufs[0];
 		break;
 	case ODL_TB5_MMAP_TX_BUF1:
-		buf = &dev->tx.bufs[1];
+		buf = &dev->paths[0].tx.bufs[1];
 		break;
 	case ODL_TB5_MMAP_RX_BUF0:
-		buf = &dev->rx.bufs[0];
+		buf = &dev->paths[0].rx.bufs[0];
 		break;
 	case ODL_TB5_MMAP_RX_BUF1:
-		buf = &dev->rx.bufs[1];
+		buf = &dev->paths[0].rx.bufs[1];
 		break;
 	default:
 		return -EINVAL;
@@ -495,8 +650,10 @@ static int odl_tb5_mmap(struct file *filp, struct vm_area_struct *vma)
 		return -EINVAL;
 
 	vma->vm_pgoff = 0;
+	if (dev->loopback_data)
+		return remap_vmalloc_range(vma, buf->virt, 0);
 
-	dma_dev = tb_ring_dma_device(dev->tx.ring);
+	dma_dev = tb_ring_dma_device(dev->paths[0].tx.ring);
 
 	return dma_mmap_coherent(dma_dev, vma, buf->virt, buf->phys,
 				 buf->size);
@@ -509,11 +666,11 @@ static __poll_t odl_tb5_poll(struct file *filp, poll_table *wait)
 	__poll_t mask = 0;
 
 	/* Wait for TX/RX completion events */
-	poll_wait(filp, &dev->tx.waitq, wait);
-	poll_wait(filp, &dev->rx.waitq, wait);
+	poll_wait(filp, &dev->paths[0].tx.waitq, wait);
+	poll_wait(filp, &dev->paths[0].rx.waitq, wait);
 
 	/* Readable if RX completions are available */
-	if (atomic_read(&dev->rx.completed) > 0)
+	if (atomic_read(&dev->paths[0].rx.completed) > 0)
 		mask |= EPOLLIN | EPOLLRDNORM;
 
 	/*
@@ -580,6 +737,20 @@ int odl_tb5_chardev_create(struct odl_tb5_device *dev)
 		goto err_cdev_del;
 	}
 
+	/* Per-device debugfs directory (e.g. odl_tb5/odl_tb5_0).
+	 * debugfs failures are non-fatal — the driver works without it. */
+	{
+		char name[32];
+
+		snprintf(name, sizeof(name), "%s_%d",
+			 ODL_TB5_DEVICE_NAME, dev->index);
+		dev->dbg_dir = debugfs_create_dir(name, odl_tb5_debugfs_root);
+		debugfs_create_file("stats", 0444, dev->dbg_dir, dev,
+				    &odl_tb5_stats_fops);
+		debugfs_create_file("stats_reset", 0200, dev->dbg_dir, dev,
+				    &odl_tb5_stats_reset_fops);
+	}
+
 	return 0;
 
 err_cdev_del:
@@ -589,6 +760,8 @@ err_cdev_del:
 
 void odl_tb5_chardev_destroy(struct odl_tb5_device *dev)
 {
+	debugfs_remove_recursive(dev->dbg_dir);
+	dev->dbg_dir = NULL;
 	device_destroy(odl_tb5_class, dev->devt);
 	cdev_del(&dev->cdev);
 }

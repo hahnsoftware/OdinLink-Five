@@ -14,17 +14,24 @@
  * Also handles module parameters: ring_size, loopback, protocol, e2e.
  */
 
+#include <linux/debugfs.h>
+#include <linux/log2.h>
+
 #include "odl_tb5_core.h"
 
 LIST_HEAD(odl_tb5_devices_list);
 DEFINE_MUTEX(odl_tb5_devices_lock);
+
+/* Module-global debugfs root — parent of the per-device stat dirs. */
+struct dentry *odl_tb5_debugfs_root;
 
 static DEFINE_IDA(odl_tb5_ida);
 
 unsigned int odl_ring_size = ODL_TB5_RING_SIZE_DEFAULT;
 module_param(odl_ring_size, uint, 0444);
 MODULE_PARM_DESC(odl_ring_size,
-	"NHI ring entries per direction (power-of-2, default 4096 = 16 MB/batch)");
+	"NHI ring entries per direction (power-of-2, default 4096 = 16 MB/batch; "
+	"use 1024 on iommu=pt hosts where 16 MB contiguous DMA fails)");
 
 int odl_loopback_count = 0;
 module_param_named(loopback, odl_loopback_count, int, 0444);
@@ -38,6 +45,13 @@ MODULE_PARM_DESC(protocol,
 
 bool odl_e2e = true;
 module_param_named(e2e, odl_e2e, bool, 0444);
+
+bool odl_raw_payload = true;
+module_param_named(raw_payload, odl_raw_payload, bool, 0444);
+MODULE_PARM_DESC(raw_payload,
+	"Allow bounce-free raw-payload dmabuf TX/RX when both peers "
+	"advertise support (default=1). The login exchange negotiates "
+	"per link; old peers fall back to the legacy framed path.");
 
 /* upstream PR #21: bounded RX busy-poll before sleeping. The RX softirq
  * increments rx_complete on another CPU, so a spinning reader sees it within
@@ -60,6 +74,23 @@ MODULE_PARM_DESC(e2e,
 	"Enable end-to-end flow control (default=1). Set 0 for TB3 controllers "
 	"that do not support RING_FLAG_E2E.");
 
+unsigned int odl_num_paths = 2;
+module_param_named(num_paths, odl_num_paths, uint, 0444);
+MODULE_PARM_DESC(num_paths,
+	"Number of parallel DMA striping paths per device (1.."
+	__stringify(ODL_TB5_MAX_PATHS) ", default 2). The router flow-control "
+	"cap is per-path, so multiple paths scale throughput.");
+
+/* Diagnostic/override knob for the zero-copy dmabuf stripe width.  0 (default)
+ * means "use negotiated_paths"; a positive value caps the number of paths a
+ * single dmabuf transfer is striped over.  Writable so a two-box A/B run can
+ * flip 1<->2 without reload (BOTH ends must match, or the stripe desyncs). */
+unsigned int odl_dmabuf_paths;
+module_param_named(dmabuf_paths, odl_dmabuf_paths, uint, 0644);
+MODULE_PARM_DESC(dmabuf_paths,
+	"Cap dmabuf (zero-copy verbs/RCCL) stripe width; 0 = use negotiated "
+	"paths. Set identically on both peers.");
+
 /* Apple protocol uses its own property key and registers as an alternate
  * service so macOS ThunderboltRDMA can discover us via XDomain matching. */
 static struct tb_property_dir *odl_tb5_apple_property_dir;
@@ -76,6 +107,77 @@ static const struct tb_service_id odl_tb5_ids[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(tbsvc, odl_tb5_ids);
+
+/* Allocate the NHI ring pairs plus their DMA buffers.  A ring-stage failure
+ * gets one probe at the minimum size: if even that fails, halving cannot tell
+ * memory pressure from controller resources owned by another driver.  Only a
+ * later DMA-buffer failure uses the full halving ladder.  With iommu=pt the
+ * NHI sits in an identity IOMMU domain, so large dma_alloc_coherent requests
+ * may need that ladder to find physically contiguous memory. */
+static int odl_tb5_probe_alloc_rings_bufs(struct odl_tb5_device *dev)
+{
+	unsigned int rs = odl_ring_size;
+	int ret;
+
+	if (rs < ODL_TB5_RING_SIZE_MIN)
+		rs = ODL_TB5_RING_SIZE_MIN;
+	if (rs > ODL_TB5_RING_SIZE_MAX)
+		rs = ODL_TB5_RING_SIZE_MAX;
+	rs = roundup_pow_of_two(rs);
+
+	for (;;) {
+		ret = odl_tb5_rings_alloc(dev, rs);
+		if (ret) {
+			odl_tb5_rings_free(dev);
+
+			if (ret == -EBUSY)
+				goto controller_busy;
+			if (ret != -ENOMEM)
+				return ret;
+
+			if (rs > ODL_TB5_RING_SIZE_MIN) {
+				pr_warn("odl_tb5: NHI ring setup failed at size %u; "
+					"probing minimum size %u once\n", rs,
+					ODL_TB5_RING_SIZE_MIN);
+				rs = ODL_TB5_RING_SIZE_MIN;
+				ret = odl_tb5_rings_alloc(dev, rs);
+				if (!ret)
+					goto alloc_dma_bufs;
+				odl_tb5_rings_free(dev);
+				if (ret == -EBUSY)
+					goto controller_busy;
+			}
+
+			pr_err("odl_tb5: NHI ring allocation unavailable even at "
+				"minimum size; a competing owner such as "
+				"thunderbolt_ibverbs is one possible cause\n");
+			return ret;
+		}
+
+alloc_dma_bufs:
+		ret = odl_tb5_dma_bufs_alloc(dev);
+		if (!ret)
+			return 0;
+
+		odl_tb5_dma_bufs_free(dev);
+		odl_tb5_rings_free(dev);
+
+		if (rs <= ODL_TB5_RING_SIZE_MIN)
+			return ret;
+
+		rs /= 2;
+		pr_warn("odl_tb5: DMA buffer allocation failed (%d), retrying "
+			"with odl_ring_size=%u\n", ret, rs);
+	}
+
+controller_busy:
+	/* The ring allocator already unwound its partial path.  A smaller DMA
+	 * batch cannot make an output HopID free. */
+	pr_err("odl_tb5: controller resources unavailable; not retrying "
+		"the DMA buffer size (unload a competing owner such as "
+		"thunderbolt_ibverbs)\n");
+	return ret;
+}
 
 static int odl_tb5_probe(struct tb_service *svc,
 			 const struct tb_service_id *id)
@@ -103,43 +205,77 @@ static int odl_tb5_probe(struct tb_service *svc,
 		return ret;
 	}
 	dev->index = ret;
-	dev->local_tx_hopid = -1;
+
+	/* Multi-path: initialise ALL slots up front (cheap, avoids special
+	 * casing elsewhere).  num_paths is the configured stripe count;
+	 * rings_alloc may reduce it if a higher path can't get NHI rings.
+	 * negotiated/tx_active/remote start at 1 so the single-path fallback
+	 * (and any code reading them before handshake) is well-defined. */
+	dev->num_paths = odl_num_paths;
+	dev->remote_path_count = 1;
+	dev->negotiated_paths = 1;
+	dev->tx_active_paths = 1;
+	{
+		int p;
+
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++) {
+			struct odl_tb5_path *path = &dev->paths[p];
+
+			path->tx.dev = dev;
+			path->rx.dev = dev;
+			path->local_tx_hopid = -1;
+			path->remote_tx_hopid = 0;
+			path->stale_remote_tx_hopid = 0;
+			path->in_hopid_valid = false;
+			spin_lock_init(&path->tx.lock);
+			spin_lock_init(&path->rx.lock);
+			init_waitqueue_head(&path->tx.waitq);
+			init_waitqueue_head(&path->rx.waitq);
+			init_waitqueue_head(&path->rx_repost_waitq);
+			atomic_set(&path->tx.completed, 0);
+			atomic_set(&path->tx.submitted, 0);
+			atomic_set(&path->rx.completed, 0);
+			atomic_set(&path->rx.submitted, 0);
+			atomic_set(&path->rx_posted, 0);
+			atomic_set(&path->legacy_rx_posted, 0);
+			atomic_set(&path->rx_reposting, 0);
+			path->rx_repost_pending = false;
+			path->rx_target = 0;
+		}
+	}
 
 	dev->state = ODL_TB5_STATE_DISCONNECTED;
 
 	mutex_init(&dev->state_lock);
 	init_waitqueue_head(&dev->state_waitq);
-	spin_lock_init(&dev->tx.lock);
-	spin_lock_init(&dev->rx.lock);
-	init_waitqueue_head(&dev->tx.waitq);
-	init_waitqueue_head(&dev->rx.waitq);
-	atomic_set(&dev->tx.completed, 0);
-	atomic_set(&dev->tx.submitted, 0);
-	atomic_set(&dev->rx.completed, 0);
-	atomic_set(&dev->rx.submitted, 0);
 	atomic_set(&dev->open_count, 0);
+	atomic_set(&dev->pong_mask, 0);
+	atomic_set(&dev->ack_mask, 0);
+	atomic_set(&dev->verify_ping_mask, 0);
+	atomic_set(&dev->verify_pong_mask, 0);
 
 	/* Stream management init */
 	hash_init(dev->streams);
 	ida_init(&dev->stream_ida);
 	mutex_init(&dev->stream_lock);
+	mutex_init(&dev->dmabuf_tx_lock);
+	mutex_init(&dev->dmabuf_rx_lock);
 	INIT_WORK(&dev->tx_drain_work, odl_tb5_tx_drain_work_fn);
-	atomic_set(&dev->rx_posted, 0);
 	/* rx_posted_min is a low-water mark: start high so the first real
-	 * value wins. The rest are plain counters and kzalloc zeroed them. */
+	 * value wins. The rest are plain counters and kzalloc zeroed them.
+	 * (rx_posted / rx_target themselves live per-path.) */
 	atomic_set(&dev->rx_posted_min, INT_MAX);
-	dev->rx_target = 0;
 
 	atomic_set(&dev->removing, 0);
 
-	/* Adaptive TX mode defaults */
+	/* Adaptive TX mode defaults.
+	 *
+	 * Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
+	 * slots), NOT the NHI ring depth.  With a large odl_ring_size the raw
+	 * ring*3/4 exceeds the pool, so the adaptive logic can never trip and
+	 * TX flow control is miscalibrated.  Clamp to the usable pool. */
 	dev->tx_adaptive.mode = ODL_TB5_TX_LATENCY;
 	dev->tx_adaptive.consecutive_low = 0;
-	/* Watermarks gate the shared frame pool (ODL_TB5_FRAME_POOL_SIZE
-	 * slots), NOT the NHI ring depth.  With large odl_ring_size the raw
-	 * ring*3/4 exceeds the pool, so the adaptive logic can never trip and
-	 * TX flow control is miscalibrated.  Clamp to the usable pool.
-	 * (upstream PR #20) */
 	dev->tx_adaptive.high_watermark =
 		min_t(unsigned int, odl_ring_size * 3 / 4,
 		      ODL_TB5_FRAME_POOL_SIZE - ODL_TB5_TX_POOL_RESERVE);
@@ -154,18 +290,11 @@ static int odl_tb5_probe(struct tb_service *svc,
 		goto err_free_dev;
 	}
 
-	ret = odl_tb5_rings_alloc(dev);
+	ret = odl_tb5_probe_alloc_rings_bufs(dev);
 	if (ret) {
-		pr_err("odl_tb5: ring alloc failed for index %d: %d\n",
+		pr_err("odl_tb5: ring/DMA buf alloc failed for index %d: %d\n",
 		       dev->index, ret);
 		goto err_chardev;
-	}
-
-	ret = odl_tb5_dma_bufs_alloc(dev);
-	if (ret) {
-		pr_err("odl_tb5: DMA buf alloc failed for index %d: %d\n",
-		       dev->index, ret);
-		goto err_rings;
 	}
 
 	ret = odl_tb5_proto_init(dev);
@@ -188,7 +317,6 @@ static int odl_tb5_probe(struct tb_service *svc,
 
 err_dma:
 	odl_tb5_dma_bufs_free(dev);
-err_rings:
 	odl_tb5_rings_free(dev);
 err_chardev:
 	odl_tb5_chardev_destroy(dev);
@@ -226,7 +354,22 @@ static void odl_tb5_remove(struct tb_service *svc)
 		return;
 	}
 
+	/* Set `removing` while holding devices_lock: the protocol
+	 * handler checks the flag and schedules restart/connect work
+	 * strictly under this lock, so once we've cycled the lock no
+	 * incoming packet can arm work on this device anymore.  Without
+	 * this fence a peer reload (login/logout packet) could schedule
+	 * restart_work AFTER the cancels below, and the work would then
+	 * run on a torn-down/freed device — kworker crash, rmmod stuck
+	 * in D-state, refcount -1, power cycle required. */
+	mutex_lock(&odl_tb5_devices_lock);
 	atomic_set(&dev->removing, 1);
+	mutex_unlock(&odl_tb5_devices_lock);
+	spin_lock_irq(&dev->verify_reply_lock);
+	dev->verify_reply_open = false;
+	dev->drain_reply_open = false;
+	spin_unlock_irq(&dev->verify_reply_lock);
+	wake_up_all(&dev->verify_waitq);
 
 	mutex_lock(&dev->state_lock);
 	saved_state = dev->state;
@@ -238,7 +381,21 @@ static void odl_tb5_remove(struct tb_service *svc)
 	    saved_state == ODL_TB5_STATE_READY)
 		odl_tb5_proto_send_logout(dev);
 
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
+
+	/* Two cancel passes: the works arm each other (restart→login,
+	 * login→connect, connect→login/verify).  A work that was already
+	 * running before `removing` was set may re-arm a work we canceled
+	 * earlier in the same pass; because every work fn gates its
+	 * scheduling on !removing, anything re-armed during pass 1 runs
+	 * as a no-op — pass 2 only makes sure nothing is left PENDING
+	 * when the device is freed. */
+	cancel_work_sync(&dev->verify_work);
+	cancel_work_sync(&dev->ctrl_reply_work);
+	cancel_work_sync(&dev->restart_work);
+	cancel_work_sync(&dev->connect_work);
+	cancel_delayed_work_sync(&dev->login_work);
+	cancel_work_sync(&dev->tx_drain_work);
 
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
@@ -248,6 +405,41 @@ static void odl_tb5_remove(struct tb_service *svc)
 	cancel_work_sync(&dev->tx_drain_work);
 
 	odl_tb5_rings_stop(dev);
+
+	/* Disable the DMA paths while rings and hopids are still valid —
+	 * rings_free() below NULLs the rings and releases local_tx_hopid,
+	 * which would make this call a no-op and leave stale paths in the
+	 * routers (breaks the next module load until a controller reset).
+	 * in_hopid_valid marks a fully-enabled path; iterate every one.
+	 *
+	 * Release regardless of connection state (upstream BUG1): gating this
+	 * on CONNECTED/READY meant removal during HANDSHAKE (login retrying,
+	 * peer gone, admin unbind) leaked the hop-ID until enable_paths
+	 * returned -ENOMEM on every later load.  in_hopid_valid is already the
+	 * authoritative record of what was actually allocated, so the state
+	 * check adds nothing but the leak. */
+	{
+		int p;
+
+		for (p = 0; p < dev->num_paths; p++) {
+			struct odl_tb5_path *path = &dev->paths[p];
+
+			if (!path->in_hopid_valid)
+				continue;
+
+			tb_xdomain_disable_paths(dev->xd,
+						 path->local_tx_hopid,
+						 path->tx.ring ? path->tx.ring->hop : -1,
+						 path->remote_tx_hopid,
+						 path->rx.ring ? path->rx.ring->hop : -1);
+			/* restart_work may have released the in-hopid already
+			 * (a restart can race us) — releasing twice trips
+			 * ida_free's WARN. */
+			tb_xdomain_release_in_hopid(dev->xd,
+						    path->remote_tx_hopid);
+			path->in_hopid_valid = false;
+		}
+	}
 
 	synchronize_rcu();
 
@@ -262,21 +454,6 @@ static void odl_tb5_remove(struct tb_service *svc)
 	odl_tb5_batch_pool_free(dev);
 	odl_tb5_dma_bufs_free(dev);
 	odl_tb5_rings_free(dev);
-
-	/* BUG1 fix: release regardless of connection state.  The original code
-	 * released only from CONNECTED/READY, so removal during HANDSHAKE
-	 * (login retrying, peer gone, admin unbind) leaked the hop-ID until
-	 * enable_paths returned -ENOMEM on every later load.  Ordering is kept
-	 * exactly as upstream: this runs AFTER rings_stop()/bufs_free() above. */
-	if (dev->in_hopid_valid) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring ? dev->tx.ring->hop : -1,
-					 dev->in_hopid,
-					 dev->rx.ring ? dev->rx.ring->hop : -1);
-		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-		dev->in_hopid_valid = false;
-	}
 
 	odl_tb5_chardev_destroy(dev);
 
@@ -324,9 +501,21 @@ static int __init odl_tb5_init(void)
 		return -EINVAL;
 	}
 
+	if (odl_num_paths < 1 || odl_num_paths > ODL_TB5_MAX_PATHS) {
+		unsigned int clamped = clamp_t(unsigned int, odl_num_paths,
+					       1, ODL_TB5_MAX_PATHS);
+		pr_warn("odl_tb5: num_paths=%u out of range (1..%u), clamping to %u\n",
+			odl_num_paths, ODL_TB5_MAX_PATHS, clamped);
+		odl_num_paths = clamped;
+	}
+
 	ret = odl_tb5_chardev_init();
 	if (ret)
 		return ret;
+
+	/* Create the debugfs root before any device probe so per-device
+	 * subdirs have a parent. Non-fatal if debugfs is unavailable. */
+	odl_tb5_debugfs_root = debugfs_create_dir("odl_tb5", NULL);
 
 	/* If loopback=1 or more, create software-only devices.
 	 * Loopback devices work without Thunderbolt hardware and
@@ -408,7 +597,7 @@ static int __init odl_tb5_init(void)
 	if (ret)
 		goto err_proto;
 
-	pr_info("odl_tb5: OdinLink TB5 driver loaded (ring_size=%u)\n",
+	pr_info("odl_tb5: service registered (ring_size=%u); awaiting peer probe\n",
 		odl_ring_size);
 
 	return 0;
@@ -422,6 +611,8 @@ err_dir:
 	}
 	tb_property_free_dir(odl_tb5_property_dir);
 err_chardev:
+	debugfs_remove_recursive(odl_tb5_debugfs_root);
+	odl_tb5_debugfs_root = NULL;
 	odl_tb5_chardev_exit();
 	return ret;
 }
@@ -444,7 +635,19 @@ static void __exit odl_tb5_exit(void)
 		pr_warn("odl_tb5: cleaning up orphaned device at exit\n");
 		list_del_rcu(&dev->list);
 		atomic_set(&dev->removing, 1);
-		hrtimer_cancel(&dev->rx_poll_timer);
+		spin_lock_irq(&dev->verify_reply_lock);
+		dev->verify_reply_open = false;
+		dev->drain_reply_open = false;
+		spin_unlock_irq(&dev->verify_reply_lock);
+		wake_up_all(&dev->verify_waitq);
+		odl_tb5_poll_disarm(dev);
+		/* Double cancel pass — see odl_tb5_remove() for why. */
+		cancel_work_sync(&dev->verify_work);
+		cancel_work_sync(&dev->ctrl_reply_work);
+		cancel_work_sync(&dev->restart_work);
+		cancel_work_sync(&dev->connect_work);
+		cancel_delayed_work_sync(&dev->login_work);
+		cancel_work_sync(&dev->tx_drain_work);
 		cancel_work_sync(&dev->verify_work);
 		cancel_work_sync(&dev->ctrl_reply_work);
 		cancel_work_sync(&dev->restart_work);
@@ -490,6 +693,8 @@ out:
 	 */
 	rcu_barrier();
 
+	debugfs_remove_recursive(odl_tb5_debugfs_root);
+	odl_tb5_debugfs_root = NULL;
 	odl_tb5_chardev_exit();
 	ida_destroy(&odl_tb5_ida);
 	pr_info("odl_tb5: OdinLink TB5 driver unloaded\n");

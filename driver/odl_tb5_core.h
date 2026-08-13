@@ -22,6 +22,7 @@
 #include <linux/thunderbolt.h>
 #include <linux/cdev.h>
 #include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/mutex.h>
@@ -41,7 +42,7 @@
 #define class_create_compat(name) class_create((name))
 #endif
 
-/* hrtimer_setup was added in kernel 6.11; provide fallback for older kernels */
+/* hrtimer_setup was added in kernel 6.11; provide fallback for older */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static inline void hrtimer_setup(struct hrtimer *timer,
 				 enum hrtimer_restart (*fn)(struct hrtimer *),
@@ -59,11 +60,17 @@ static inline void hrtimer_setup(struct hrtimer *timer,
 #define ODL_TB5_DMA_MAGIC	0x4F444C35
 #define ODL_TB5_DMA_PING	1
 #define ODL_TB5_DMA_PONG	2
+#define ODL_TB5_DMA_ACK		3
+#define ODL_TB5_DMA_DRAIN_PREP	4
+#define ODL_TB5_DMA_DRAIN_READY	5
+#define ODL_TB5_DMA_DRAIN_PAD	6
+#define ODL_TB5_DMA_DRAIN_ACK	7
+#define ODL_TB5_DMA_DRAIN_VERSION 1
 
 struct odl_tb5_dma_hdr {
 	__le32	magic;
 	__le32	type;
-	__le32	reserved[2];
+	__le32	reserved[3];
 };
 
 /* ── Stream header (on-wire, 5 bytes at start of every DMA frame) ──── */
@@ -80,42 +87,44 @@ struct odl_tb5_stream_hdr {
 /* ── DMA frame pool (replaces old double-buffer scheme) ─────────────── */
 
 /*
- * The frame pool is SHARED between TX and RX repost, so it must comfortably
- * back the peer's pre-posted receive ring or bidirectional traffic starves RX
- * and the NHI drops inbound frames in bursts.
+ * Pool sizing vs. throughput: the link is window-limited (in-flight
+ * bytes / completion round trip), not CPU-limited.  RX posts pool/2
+ * frames as the receive window; the batch pool bounds the TX window.
+ * Keep each window at or below half the NHI ring depth (odl_ring_size,
+ * default 4096 descriptors) so tb_ring_tx/rx never hit a full ring.
  *
- * Sizing, for the ggml-rpc transport (the most demanding consumer here):
- *   256 KiB message / 4024 B payload  = 66 frames per message
- *   24 pre-posted receives            = 1587 frames of RX ring
- * The old 1024-frame pool was smaller than the RX ring alone, and the 64-frame
- * "reserve for RX" was less than a SINGLE message - so a busy sender routinely
- * left nothing for repost. Observed as 32-fragment burst losses under
- * bidirectional load.
- *
- * 4096 frames = 16 MiB per device; the reserve now guarantees the full RX ring
- * can always be reposted no matter how hard TX is pushing. Pure memory: no
- * extra work per frame, so the latency path is unaffected (and it removes
- * stalls waiting for free frames).
+ * The pool is also SHARED between TX and RX repost, so it must comfortably
+ * back the peer's pre-posted receive ring or bidirectional traffic starves
+ * RX and the NHI drops inbound frames in bursts.  For the ggml-rpc transport
+ * (the most demanding consumer here) a 256 KiB message is 66 frames and 24
+ * pre-posted receives are 1587 frames of RX ring, so a 1024-frame pool was
+ * smaller than the RX ring alone.
  */
-#define ODL_TB5_FRAME_POOL_SIZE		4096
+#define ODL_TB5_FRAME_POOL_SIZE		4096	/* rx window = 2048 frames */
 /*
  * The reserve is a floor TX may not dig below, NOT the size of the RX ring.
  * rx_target already claims pool/2 (2048) for posted receives, so setting the
  * reserve to 2048 as well left free_count == reserve exactly and
  * odl_tb5_stream_can_send() (free > reserve) was false forever - TX deadlocked
- * with a healthy link. Keep it a small guard so RX repost can always obtain a
- * few frames, while leaving TX ~1700 frames (~26 x 256 KiB messages) of room.
+ * with a healthy link. Keep it a small guard so RX repost can always obtain
+ * frames, while leaving TX ~1700 frames (~26 x 256 KiB messages) of room.
  */
 #define ODL_TB5_TX_POOL_RESERVE		256  /* floor kept free for RX repost */
+/* Latency floor: lowered from 10 us to 2 us.  The old 10 us poll interval was
+ * the dominant latency floor (measured t_min ~9.92 us).  2 us keeps the same
+ * on-demand semantics (ISR still kicks ring_work on real completions) at a
+ * fraction of the fixed overhead. (K4 / Task C) */
+#define ODL_TB5_POLL_INTERVAL_NS	(2 * 1000)  /* 2 us */
 /*
- * Fallback poll interval for ring completions. NHI MSI-X fires, but the
- * ring_work it schedules can run before the descriptor write-back lands, so
- * this timer bounds how long a completion can sit unprocessed. It is the
- * dominant term in end-to-end latency: the median-minus-min spread of the
- * 22.4 us RTT is essentially this wait. 3 us keeps the tail close to the
- * 13.6 us best case at a modest timer cost.
+ * On-demand poll timer: after the last observed activity the fallback poll
+ * keeps running for this many ticks (grace window) to cover NHI descriptor
+ * write-back lag, then disarms so a truly idle device costs no CPU.  With the
+ * 2 us interval, 40 ticks ≈ 80 us, comfortably above the ~21 us idle round
+ * trip.  The NHI ISR still kicks ring_work on real completions, so this only
+ * bounds the write-back re-check, never correctness.  (K4 / Task C)
  */
-#define ODL_TB5_POLL_INTERVAL_NS	(3 * 1000)   /* 3 us */
+#define ODL_TB5_POLL_GRACE_TICKS	40
+#define ODL_TB5_MAX_PATHS		4	/* max striped paths per device */
 
 /* ── SG batch buffer pool (throughput mode) ──────────────────────────── */
 
@@ -135,7 +144,7 @@ struct odl_tb5_stream_hdr {
  * ("throughput TX stalled waiting for batch buf (free=0 ...)"). Match the
  * window to that consumer's depth. 32 x 256 KiB = 8 MiB per device.
  */
-#define ODL_TB5_BATCH_BUF_COUNT		32
+#define ODL_TB5_BATCH_BUF_COUNT		32	/* tx window = 8 MB (2048 frames) */
 #define ODL_TB5_THROUGHPUT_THRESH	65536	/* bytes: msg > 64KB → throughput */
 #define ODL_TB5_MODE_HYSTERESIS		4	/* consecutive low polls to downshift */
 
@@ -208,6 +217,7 @@ struct odl_tb5_rx_msg {
 
 struct odl_tb5_stream {
 	u8			id;
+	int			path_idx;	/* pinned TX path (stripe target) */
 	struct odl_tb5_device	*dev;
 	struct odl_tb5_file_ctx	*owner;
 	struct list_head	owner_list;
@@ -270,6 +280,11 @@ struct odl_tb5_dma_buf {
 /* ── NHI ring context (shared TX or RX ring) ─────────────────────────── */
 
 struct odl_tb5_ring_ctx {
+	/* Backpointer to the owning device.  The ring ctx now lives inside
+	 * struct odl_tb5_path[] so container_of() from a ctx no longer
+	 * recovers the device; callbacks use this instead. Set wherever a
+	 * ring ctx is initialised (probe / rings_alloc / loopback). */
+	struct odl_tb5_device	*dev;
 	struct tb_ring		*ring;
 	struct ring_frame	*frames;
 	int			ring_size;
@@ -280,6 +295,12 @@ struct odl_tb5_ring_ctx {
 	atomic_t		submitted;
 	wait_queue_head_t	waitq;
 
+	/* Raw-payload RX: cumulative bytes the NHI reported on zero-copy
+	 * frames (empty-descriptor cells completed via
+	 * odl_tb5_rx_dmabuf_raw_callback).  Per-transfer deltas against a
+	 * captured base give the exact received count for length validation. */
+	atomic_t		rx_raw_bytes;
+
 	/* Legacy double-buffer fields (kept for proto layer compat) */
 	struct odl_tb5_dma_buf	bufs[ODL_TB5_NUM_BUFFERS];
 	int			front;
@@ -289,16 +310,107 @@ struct odl_tb5_ring_ctx {
 	bool			swapped_since_post;
 };
 
+/* ── Per-path state (single-path today: everything lives in paths[0]) ─── */
+
+struct odl_tb5_path {
+	struct odl_tb5_ring_ctx	tx;
+	struct odl_tb5_ring_ctx	rx;
+	int			local_tx_hopid;
+	int			remote_tx_hopid;
+	int			stale_remote_tx_hopid;
+	bool			in_hopid_valid;
+	atomic_t		rx_posted;
+	atomic_t		legacy_rx_posted;
+	int			rx_target;
+	/* Serializes the single-path dmabuf ownership handoff with pool
+	 * refill without holding a spinlock across a full ring refill. */
+	atomic_t		rx_reposting;
+	bool			rx_repost_pending;
+	wait_queue_head_t	rx_repost_waitq;
+};
+
+/* ── Observability counters (debugfs-exported) ───────────────────────── */
+
+/*
+ * Single source of truth for the per-device statistics counters.  The
+ * X-macro is expanded three times: once to declare the atomic64_t struct
+ * members, once to print them in the debugfs seq_file, and once to zero
+ * them on reset.  This guarantees the three lists never drift apart.
+ */
+#define ODL_TB5_STATS_FIELDS(X)			\
+	/* TX path */				\
+	X(tx_send_calls)			\
+	X(tx_bytes_submitted)			\
+	X(tx_frames_submitted)			\
+	X(tx_frames_completed)			\
+	X(tx_frames_canceled)			\
+	/* RX path */				\
+	X(rx_frames_legacy)			\
+	X(rx_frames_seen)			\
+	X(rx_frames_canceled)			\
+	X(rx_frames_ctrl)			\
+	X(rx_frames_stream)			\
+	X(rx_frames_no_stream)			\
+	X(rx_frames_runt)			\
+	X(rx_asm_start)				\
+	X(rx_asm_reset_incomplete)		\
+	X(rx_asm_grow_fail)			\
+	X(rx_asm_append_skipped)		\
+	X(rx_asm_cap_exceeded)			\
+	X(rx_msgs_enqueued)			\
+	X(rx_bytes_enqueued)			\
+	X(rx_msgs_drop_overflow)		\
+	X(rx_msgs_drop_alloc)			\
+	X(rx_repost_pool_empty)			\
+	X(rx_repost_ring_fail)			\
+	/* Raw-payload zero-copy (bounce-free dmabuf) */	\
+	X(raw_tx_frames)			\
+	X(raw_rx_len_mismatch)			\
+	X(raw_eligible_reject)			\
+	X(raw_unaligned_fallback)
+
+struct odl_tb5_stats {
+#define ODL_TB5_STATS_DECL(name)	atomic64_t name;
+	ODL_TB5_STATS_FIELDS(ODL_TB5_STATS_DECL)
+#undef ODL_TB5_STATS_DECL
+	/* Per-path frame counters — kept outside the X-macro (indexed by
+	 * path, printed as pN_tx_frames / pN_rx_frames in debugfs). */
+	atomic64_t path_tx_frames[ODL_TB5_MAX_PATHS];
+	atomic64_t path_rx_frames[ODL_TB5_MAX_PATHS];
+};
+
+/* Hot-path counter helpers — plain atomic64 ops, no locking. */
+#define ODL_STAT_INC(dev, field)	\
+	atomic64_inc(&(dev)->stats.field)
+#define ODL_STAT_ADD(dev, field, n)	\
+	atomic64_add((n), &(dev)->stats.field)
+
 /* ── Main device structure ───────────────────────────────────────────── */
 
 struct odl_tb5_device {
 	struct tb_service	*svc;
 	struct tb_xdomain	*xd;
-	int			local_tx_hopid;
-	int			remote_tx_hopid;
 
-	struct odl_tb5_ring_ctx	tx;
-	struct odl_tb5_ring_ctx	rx;
+	/* Per-path state.  Single-path today: probe/loopback set
+	 * num_paths = 1 and everything lives in paths[0].  The per-path
+	 * hopid ownership fields (local/remote/stale tx hopid,
+	 * in_hopid_valid) and the RX repost bookkeeping (rx_posted,
+	 * rx_target) moved here from the device.  in_hopid_valid guards
+	 * tb_xdomain_release_in_hopid() against double release (restart_work
+	 * and remove() can both reach it). */
+	struct odl_tb5_path	paths[ODL_TB5_MAX_PATHS];
+	int			num_paths;
+	/* Multi-path negotiation.  remote_path_count is what the peer
+	 * advertises in its login (>=1; 1 for a legacy peer).
+	 * negotiated_paths = min(num_paths, remote_path_count) — the paths
+	 * that are hopid-allocated and enabled.  tx_active_paths (<=
+	 * negotiated_paths, >=1) is the number of paths that passed ping/pong
+	 * verification and are therefore used as TX stripe targets; RX stays
+	 * enabled on all negotiated paths so asymmetric degradation still
+	 * lets the peer reach us. */
+	int			remote_path_count;
+	int			negotiated_paths;
+	int			tx_active_paths;
 
 	/* Login/logout handshake */
 	struct delayed_work	login_work;
@@ -307,26 +419,61 @@ struct odl_tb5_device {
 	int			login_retries;
 	bool			login_sent;
 	bool			login_received;
-	int			stale_remote_tx_hopid;
-	/* BUG1 fix: authoritative record of the hop-ID actually allocated by
-	 * tb_xdomain_alloc_in_hopid(), so every teardown path can release it
-	 * regardless of connection state. */
-	bool			in_hopid_valid;
-	int			in_hopid;
+	/* Bounce-free raw-payload dmabuf negotiated for this link.  Set by
+	 * the login exchange: true only when the module param raw_payload is
+	 * on, the mode is OdinLink (not Apple), and BOTH peers advertised
+	 * ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD.  Written under state_lock in the
+	 * handshake paths; S2 adds submit-path readers (pair those with
+	 * WRITE_ONCE/READ_ONCE then). */
+	bool			raw_payload_ok;
 
 	/* DMA verification (ping/pong) */
 	struct work_struct	verify_work;
 	struct work_struct	ctrl_reply_work;
 	struct hrtimer		rx_poll_timer;
+	/* On-demand poll-timer state.  poll_active is the armed flag (0/1),
+	 * set via xchg by odl_tb5_poll_kick() and cleared by the timer fn when
+	 * it goes idle — this is the arm/disarm handshake.  tx_inflight counts
+	 * TX frames submitted-but-not-completed (bracketed at every tb_ring_tx
+	 * / TX callback): while > 0 the timer must keep polling so completions
+	 * are picked up.  rx_dmabuf_pending counts synchronous RX dmabuf calls
+	 * from the point their frames are posted until their mapping is safe to
+	 * release; it keeps the same completion pump alive for the whole wait.
+	 * poll_last_rxseen / poll_idle_ticks are owned solely by the timer fn
+	 * (it never runs concurrently with itself) and drive the RX grace window. */
+	atomic_t		poll_active;
+	atomic_t		tx_inflight;
+	atomic_t		rx_dmabuf_pending;
+	u64			poll_last_rxseen;
+	unsigned int		poll_idle_ticks;
 	wait_queue_head_t	verify_waitq;
-	bool			pong_received;
-	/* Set when we answer a peer PING. Unlike pong_received this is NOT
-	 * cleared by verify_work, because the peer's ping can arrive BEFORE
-	 * our own verify starts -- clearing it there loses the proof and the
-	 * verify then times out with the link perfectly healthy. Reset only
-	 * when a new connection begins. */
-	bool			peer_ping_answered;
-	int			verify_rx_type;
+	/* Per-path verify bitmaps (indexed by path).  pong_mask bit i is set
+	 * when a PONG arrives on path i; verify_ping_mask bit i is set when a
+	 * PING arrives on path i and ctrl_reply_work must answer on that same
+	 * path.  Bitmaps (not single slots) so pings/pongs on two paths racing
+	 * in parallel don't clobber each other. */
+	atomic_t		pong_mask;
+	atomic_t		ack_mask;
+	atomic_t		verify_ping_mask;
+	atomic_t		verify_pong_mask;
+	/* The drain transition reuses the verification work item, but has a
+	 * separate admission gate: ordinary PING/PONG/ACK traffic is closed
+	 * before DRAIN_PREP is allowed onto the rings. */
+	atomic_t		drain_prep_mask;
+	atomic_t		drain_frozen_mask;
+	atomic_t		drain_ready_mask;
+	atomic_t		drain_ack_mask;
+	atomic_t		drain_ready_reply_mask;
+	atomic_t		drain_ack_reply_mask;
+	atomic_t		drain_generation;
+	atomic_t		drain_peer_generation[ODL_TB5_MAX_PATHS];
+	atomic_t		drain_peer_rx[ODL_TB5_MAX_PATHS];
+	atomic_t		drain_pad_expected[ODL_TB5_MAX_PATHS];
+	atomic_t		drain_pad_received[ODL_TB5_MAX_PATHS];
+	/* Serializes control-reply admission against verification teardown. */
+	spinlock_t		verify_reply_lock;
+	bool			verify_reply_open;
+	bool			drain_reply_open;
 
 	/* Connection state */
 	enum odl_tb5_conn_state	state;
@@ -370,9 +517,6 @@ struct odl_tb5_device {
 	/* TX drain worker */
 	struct work_struct	tx_drain_work;
 
-	/* RX repost tracking */
-	atomic_t		rx_posted;
-
 	/*
 	 * RX diagnostics. The receive callback used to validate only
 	 * frame->size, so a frame the NHI had already flagged as bad was
@@ -403,19 +547,64 @@ struct odl_tb5_device {
 	atomic_t		rx_repost_starved; /* repost gave up: pool empty   */
 	atomic_t		rx_repost_short;   /* worst shortfall vs rx_target */
 	atomic_t		rx_posted_min;     /* low-water mark of rx_posted  */
-	int			rx_target;
+
+	/* Frames that completed with a valid size but no DMA magic and no
+	 * stream header we recognized: the callback could not classify them.
+	 * A sustained nonzero count means the peer's control frames are
+	 * arriving with unexpected content/layout, not that they are lost. */
+	atomic_t		rx_unclassified;
+
+	/* Reconnect-loop tally: increment per verify-failure restart. */
+	atomic_t		restart_count;
 
 	struct list_head	list;
+
+	/* Observability counters + per-device debugfs directory */
+	struct odl_tb5_stats	stats;
+	struct dentry		*dbg_dir;
 
     /* Cleanup synchronization — set to true when remove begins.
      * Used by callbacks for early exit during module unload,
      * preventing use-after-free after the device memory is released. */
 	atomic_t			removing;
+
+	/* dmabuf ring separation: >0 while a dmabuf RX transfer owns the
+	 * shared control path.  Only non-zero in the single-path fallback
+	 * (no dmabuf-reserved ring), where it suppresses pool auto-repost so
+	 * the transfer's private staging frames are the only receives queued.
+	 * Always 0
+	 * in multi-path mode (dmabuf lives on separate rings 1..nps-1), so the
+	 * control-path pool is never starved. */
+	atomic_t			dmabuf_rx_active;
+	/* One synchronous call per direction owns that direction's dmabuf frame
+	 * arrays/rings.  Separate locks preserve full-duplex operation. */
+	struct mutex			dmabuf_tx_lock;
+	struct mutex			dmabuf_rx_lock;
 };
+
+/* TX stripe target for a stream.  Streams are pinned at creation; if the
+ * connection later degrades (or renegotiates) to fewer TX-verified paths,
+ * fold the pin back into the active range instead of submitting to a
+ * dead ring. */
+static inline int odl_tb5_stream_tx_path(const struct odl_tb5_stream *stream)
+{
+	/* dmabuf ring separation: stream headers and host-memory payloads
+	 * always travel on the control/pool path (0).  dmabuf zero-copy
+	 * payloads are striped onto separate paths (1..nps-1) and must never
+	 * share a ring FIFO with pool/header frames, so all stream traffic is
+	 * pinned to path 0 regardless of tx_active_paths.  (stream is unused
+	 * but kept for call-site compatibility.) */
+	(void)stream;
+	return 0;
+}
 
 extern struct list_head odl_tb5_devices_list;
 extern struct mutex     odl_tb5_devices_lock;
 extern unsigned int     odl_ring_size;
+
+/* Module-global debugfs root (created in module init, may be NULL/ERR
+ * if debugfs is unavailable — debugfs_* calls tolerate that). */
+extern struct dentry   *odl_tb5_debugfs_root;
 
 /* ── Service lifecycle ───────────────────────────────────────────────── */
 
@@ -424,15 +613,16 @@ void odl_tb5_service_exit(void);
 
 /* ── Ring allocation (NHI level) ─────────────────────────────────────── */
 
-int  odl_tb5_rings_alloc(struct odl_tb5_device *dev);
+int  odl_tb5_rings_alloc(struct odl_tb5_device *dev, unsigned int rs);
 void odl_tb5_rings_free(struct odl_tb5_device *dev);
-int  odl_tb5_rings_start(struct odl_tb5_device *dev);
+int  odl_tb5_rings_start(struct odl_tb5_device *dev, int idx);
+void odl_tb5_rings_stop_path(struct odl_tb5_device *dev, int idx);
 void odl_tb5_rings_stop(struct odl_tb5_device *dev);
 void odl_tb5_rings_reset(struct odl_tb5_device *dev);
 
 /* ── DMA frame pool ──────────────────────────────────────────────────── */
 
-int  odl_tb5_frame_pool_alloc(struct odl_tb5_device *dev);
+int  odl_tb5_frame_pool_alloc(struct odl_tb5_device *dev, int size);
 void odl_tb5_frame_pool_free(struct odl_tb5_device *dev);
 struct odl_tb5_frame_slot *odl_tb5_frame_pool_get(struct odl_tb5_frame_pool *pool);
 void odl_tb5_frame_pool_put(struct odl_tb5_frame_pool *pool,
@@ -500,6 +690,14 @@ void odl_tb5_tx_drain_work_fn(struct work_struct *work);
 
 enum hrtimer_restart odl_tb5_rx_poll_timer_fn(struct hrtimer *timer);
 
+/* On-demand poll-timer arming.  odl_tb5_poll_kick() (re)arms the fallback
+ * poll if it is not already running; odl_tb5_poll_disarm() cancels it and
+ * clears the armed flag.  odl_tb5_tx_submitted() brackets a successful
+ * tb_ring_tx: it bumps tx_inflight and arms on the idle→busy edge. */
+void odl_tb5_poll_kick(struct odl_tb5_device *dev);
+void odl_tb5_poll_disarm(struct odl_tb5_device *dev);
+void odl_tb5_tx_submitted(struct odl_tb5_device *dev);
+
 /* ── Ring callbacks ──────────────────────────────────────────────────── */
 
 void odl_tb5_tx_callback(struct tb_ring *ring,
@@ -508,16 +706,29 @@ void odl_tb5_tx_batch_callback(struct tb_ring *ring,
 			       struct ring_frame *frame, bool canceled);
 void odl_tb5_rx_callback(struct tb_ring *ring,
 			 struct ring_frame *frame, bool canceled);
+
+/* Dedicated completions for the synchronous dmabuf path.  Those private
+ * staging frames must not enter the shared callback's stream/control parser. */
 void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
 				struct ring_frame *frame, bool canceled);
 void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
 				struct ring_frame *frame, bool canceled);
+/* Raw-payload RX completions additionally charge the received byte count
+ * into dev->paths[p].rx.rx_raw_bytes for the transfer length check. */
+void odl_tb5_rx_dmabuf_raw_callback(struct tb_ring *ring,
+				    struct ring_frame *frame, bool canceled);
 
 struct odl_tb5_device *odl_tb5_rx_ring_to_dev(struct tb_ring *ring);
 
 /* ── RX repost ───────────────────────────────────────────────────────── */
 
-void odl_tb5_rx_repost(struct odl_tb5_device *dev);
+void odl_tb5_rx_repost(struct odl_tb5_device *dev, int idx);
+
+/* Arm the stream RX pool on the first host stream recv attempt (idempotent,
+ * lock-free).  Called from the STREAM_RECV/STREAM_WAIT_RX ioctl handlers,
+ * before their O_NONBLOCK short-circuit.  NOT called for dmabuf recv, which
+ * must keep the RX ring empty for its own frames. */
+void odl_tb5_rx_arm(struct odl_tb5_device *dev);
 
 /* ── Character device ────────────────────────────────────────────────── */
 
@@ -543,7 +754,10 @@ int  odl_tb5_proto_send_logout(struct odl_tb5_device *dev);
 extern int odl_loopback_count;
 extern int odl_protocol_mode;
 extern bool odl_e2e;
+extern unsigned int odl_dmabuf_paths;
+extern unsigned int odl_num_paths;
 extern unsigned int odl_busy_poll_us;
+extern bool odl_raw_payload;
 int  odl_loopback_init(void);
 void odl_loopback_exit(void);
 

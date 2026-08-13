@@ -27,6 +27,13 @@
 #define ODL_TB5_MSG_LOGOUT     3
 
 #define ODL_TB5_LOGIN_TIMEOUT  500
+#define ODL_TB5_TX_DRAIN_TIMEOUT_MS 100
+#define ODL_TB5_DRAIN_TIMEOUT_MS 5000
+
+static unsigned int odl_drain_phase_delay_ms;
+module_param_named(drain_phase_delay_ms, odl_drain_phase_delay_ms, uint, 0644);
+MODULE_PARM_DESC(drain_phase_delay_ms,
+	"Test-only delay before each ring-drain phase (default 0 ms)");
 
 /* Stop retrying the XDomain login after this many failures (0 = forever).
  * See HAZARD note in odl_tb5_login_work_fn(). */
@@ -45,11 +52,25 @@ struct odl_tb5_xd_header {
 	u32	type;
 };
 
+/*
+ * Login v2 (multi-path striping) + v3 (raw-payload flags): the v1 layout
+ * is kept bit-for-bit and every extension is APPENDED.  Detection is
+ * purely by SIZE — the protocol version stays at 1, so old and new
+ * drivers interoperate without a flag day.  Path 0's hopid stays in
+ * transmit_path; paths 1..N-1 go into extra_tx_hopids[].  v3 adds one
+ * `flags` dword (feature advertisement — only ODL_TB5_LOGIN_FLAG_RAW_
+ * PAYLOAD is defined); presence is detected by size like v2.
+ */
 struct odl_tb5_login_msg {
 	struct odl_tb5_xd_header xd_hdr;
 	u32 proto_version;
 	u32 transmit_path;
 	u32 reserved[2];
+	/* v2 extension (presence detected via packet size) */
+	u32 path_count;
+	u32 extra_tx_hopids[ODL_TB5_MAX_PATHS - 1];
+	/* v3 extension (presence detected via packet size) */
+	u32 flags;
 };
 
 struct odl_tb5_login_response {
@@ -57,7 +78,28 @@ struct odl_tb5_login_response {
 	u32 status;
 	u32 transmit_path;
 	u32 reserved[2];
+	/* v2 extension (presence detected via the XD header length field) */
+	u32 path_count;
+	u32 extra_tx_hopids[ODL_TB5_MAX_PATHS - 1];
+	/* v3 extension (presence detected via the XD header length field) */
+	u32 flags;
 };
+
+/* Size of the v1 (single-path) login message — everything before the v2
+ * extension.  Old peers send exactly this many bytes. */
+#define ODL_TB5_LOGIN_V1_SIZE	offsetof(struct odl_tb5_login_msg, path_count)
+/* Size of the v2 (multi-path) login message — everything before the v3
+ * flags dword.  v2 peers send exactly this many bytes. */
+#define ODL_TB5_LOGIN_V2_SIZE	offsetof(struct odl_tb5_login_msg, flags)
+
+/* Raw-payload zero-copy: both sides must set this flag in their login
+ * messages for the bounce-free dmabuf path to activate on the link. */
+#define ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD	BIT(0)
+
+/* Payload-length thresholds (in dwords, relative to the XD header) that
+ * prove a login response carries the v2/v3 extension fields. */
+#define ODL_TB5_LOGIN_RSP_V2_DW	(offsetof(struct odl_tb5_login_response, flags) / 4 - XD_HDR_SIZE_DW)
+#define ODL_TB5_LOGIN_RSP_V3_DW	(sizeof(struct odl_tb5_login_response) / 4 - XD_HDR_SIZE_DW)
 
 struct odl_tb5_logout_msg {
 	struct odl_tb5_xd_header xd_hdr;
@@ -66,10 +108,18 @@ struct odl_tb5_logout_msg {
 static void odl_tb5_login_work_fn(struct work_struct *work);
 static void odl_tb5_connect_work_fn(struct work_struct *work);
 static void odl_tb5_restart_work_fn(struct work_struct *work);
+static void odl_tb5_drain_state_reset(struct odl_tb5_device *dev);
+static int  odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type,
+				 int path_idx);
 static int  odl_tb5_complete_connection(struct odl_tb5_device *dev);
 
 #define XD_HDR_SIZE_DW  3
 #define XD_SN_MASK      0x18000000u
+/* Payload length (in dwords) lives in the low 6 bits of length_sn — used
+ * to detect whether a login response carries the v2 multi-path fields
+ * (the ctl layer copies a fixed-size buffer, so the received byte count
+ * is not otherwise visible to us). */
+#define XD_LEN_MASK     0x3fu
 
 static void odl_tb5_xd_header_init(struct odl_tb5_xd_header *hdr,
 				    struct tb_xdomain *xd, u32 type,
@@ -116,13 +166,26 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		return 0;
 	}
 
+	/* Device is being torn down: don't touch its state and, above
+	 * all, don't schedule any work on it.  remove() sets `removing`
+	 * under devices_lock, so this check (plus scheduling only while
+	 * holding the lock below) guarantees no work is armed after
+	 * remove()'s cancel_work_sync() calls have run. */
+	if (atomic_read(&dev->removing)) {
+		mutex_unlock(&odl_tb5_devices_lock);
+		return 1;
+	}
+
 	switch (hdr->type) {
 	case ODL_TB5_MSG_LOGIN: {
 		const struct odl_tb5_login_msg *pkg = buf;
 		struct odl_tb5_login_response resp = { };
+		u32 remote_hopids[ODL_TB5_MAX_PATHS] = { };
+		int remote_paths = 1;
 		u32 remote_tx_hopid = 0;
+		u32 remote_flags = 0;
 		u32 proto_ver = 0;
-		int ret;
+		int ret, p;
 
 		/* Minimum: XDomain header (40 bytes). The payload fields
 		 * (transmit_path, proto_version) may be absent if the peer
@@ -134,6 +197,25 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		}
 
 		if (size >= sizeof(*pkg)) {
+			/* Login v3: raw-payload flags present (by SIZE,
+			 * proto_version stays 1 — no flag day). */
+			remote_tx_hopid = pkg->transmit_path;
+			proto_ver = pkg->proto_version;
+			remote_paths = clamp_t(int, (int)pkg->path_count,
+					       1, ODL_TB5_MAX_PATHS);
+			for (p = 1; p < remote_paths; p++)
+				remote_hopids[p] = pkg->extra_tx_hopids[p - 1];
+			remote_flags = pkg->flags;
+		} else if (size >= ODL_TB5_LOGIN_V2_SIZE) {
+			/* Login v2: multi-path fields present (by SIZE) */
+			remote_tx_hopid = pkg->transmit_path;
+			proto_ver = pkg->proto_version;
+			remote_paths = clamp_t(int, (int)pkg->path_count,
+					       1, ODL_TB5_MAX_PATHS);
+			for (p = 1; p < remote_paths; p++)
+				remote_hopids[p] = pkg->extra_tx_hopids[p - 1];
+		} else if (size >= ODL_TB5_LOGIN_V1_SIZE) {
+			/* Login v1: single path */
 			remote_tx_hopid = pkg->transmit_path;
 			proto_ver = pkg->proto_version;
 		} else if (size >= sizeof(struct odl_tb5_xd_header) + 8) {
@@ -142,10 +224,14 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			remote_tx_hopid = payload[1];
 			proto_ver = payload[0];
 		}
+		remote_hopids[0] = remote_tx_hopid;
 
 		pr_info("OdinLink: received login from peer "
 			"(version=%u, tx_path=%u, size=%zu)\n",
 			proto_ver, remote_tx_hopid, size);
+		if (remote_paths > 1)
+			pr_info("OdinLink: peer advertises %d paths\n",
+				remote_paths);
 
 		resp.xd_hdr.route_hi  = upper_32_bits(dev->xd->route);
 		resp.xd_hdr.route_lo  = lower_32_bits(dev->xd->route);
@@ -155,7 +241,16 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 		resp.xd_hdr.uuid      = odl_tb5_proto_uuid;
 		resp.xd_hdr.type      = ODL_TB5_MSG_LOGIN_RSP;
 		resp.status            = 0;
-		resp.transmit_path     = dev->local_tx_hopid;
+		resp.transmit_path     = dev->paths[0].local_tx_hopid;
+		/* Always advertise all of our own paths; the peer clamps
+		 * to its own count.  Old peers simply ignore the extra
+		 * bytes (their response buffer is the short v1 struct). */
+		resp.path_count        = dev->num_paths;
+		for (p = 1; p < dev->num_paths; p++)
+			resp.extra_tx_hopids[p - 1] =
+				dev->paths[p].local_tx_hopid;
+		resp.flags             = odl_raw_payload ?
+					ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD : 0;
 
 		ret = tb_xdomain_response(dev->xd, &resp, sizeof(resp),
 					  TB_CFG_PKG_XDOMAIN_RESP);
@@ -163,47 +258,82 @@ static int odl_tb5_proto_handle_packet(const void *buf, size_t size,
 			"sn=%u, tx_hopid=%d)\n",
 			ret, dev->xd->route,
 			(hdr->length_sn & XD_SN_MASK) >> 27,
-			dev->local_tx_hopid);
+			dev->paths[0].local_tx_hopid);
 
 		mutex_lock(&dev->state_lock);
-		if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
+		if (dev->state == ODL_TB5_STATE_READY) {
+			/* We were fully up and the peer is logging in again —
+			 * a genuine peer restart.  Tear down and re-handshake. */
 			pr_info("OdinLink: peer restarted (our state=%d), "
 				"scheduling restart\n", dev->state);
-			dev->stale_remote_tx_hopid = dev->remote_tx_hopid;
-			dev->remote_tx_hopid = remote_tx_hopid;
+			for (p = 0; p < ODL_TB5_MAX_PATHS; p++)
+				dev->paths[p].stale_remote_tx_hopid =
+					dev->paths[p].remote_tx_hopid;
+			for (p = 0; p < remote_paths; p++)
+				dev->paths[p].remote_tx_hopid =
+					remote_hopids[p];
+			dev->remote_path_count = remote_paths;
+			dev->negotiated_paths = min(dev->num_paths,
+						    remote_paths);
 			dev->login_received = true;
+			dev->raw_payload_ok = odl_raw_payload &&
+				odl_protocol_mode == 0 &&
+				(remote_flags &
+				 ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD);
 			mutex_unlock(&dev->state_lock);
-			mutex_unlock(&odl_tb5_devices_lock);
+			/* Schedule while still holding devices_lock so
+			 * remove() can fence us out (see removing check
+			 * above). */
 			schedule_work(&dev->restart_work);
+			mutex_unlock(&odl_tb5_devices_lock);
 			return 1;
 		}
 
-		dev->remote_tx_hopid = remote_tx_hopid;
+		/* state HANDSHAKE or CONNECTED: the peer is (still) handshaking.
+		 * Record its hopids and login, but do NOT restart on a login
+		 * received while CONNECTED — that just means the peer is catching
+		 * up during our verify window.  Restarting here livelocks: each
+		 * side keeps kicking the other out of verify.  We already sent
+		 * our login response above; connect_work is idempotent. */
+		for (p = 0; p < remote_paths; p++)
+			dev->paths[p].remote_tx_hopid = remote_hopids[p];
+		dev->remote_path_count = remote_paths;
+		dev->negotiated_paths = min(dev->num_paths, remote_paths);
 		dev->login_received = true;
-		if (dev->login_sent)
+		dev->raw_payload_ok = odl_raw_payload &&
+			odl_protocol_mode == 0 &&
+			(remote_flags & ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD);
+		if (dev->login_sent && dev->state == ODL_TB5_STATE_HANDSHAKE)
 			need_complete = true;
 		mutex_unlock(&dev->state_lock);
 
-		mutex_unlock(&odl_tb5_devices_lock);
 		if (need_complete)
 			schedule_work(&dev->connect_work);
+		mutex_unlock(&odl_tb5_devices_lock);
 
 		return 1;
 	}
 
-	case ODL_TB5_MSG_LOGOUT:
+	case ODL_TB5_MSG_LOGOUT: {
+		int p;
+
 		pr_info("OdinLink: received logout from peer\n");
 
 		mutex_lock(&dev->state_lock);
-		dev->stale_remote_tx_hopid = dev->remote_tx_hopid;
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++)
+			dev->paths[p].stale_remote_tx_hopid =
+				dev->paths[p].remote_tx_hopid;
 		dev->login_received = false;
 		dev->login_sent = false;
+		dev->raw_payload_ok = false;
 		mutex_unlock(&dev->state_lock);
 
-		mutex_unlock(&odl_tb5_devices_lock);
+		/* Schedule under devices_lock — see removing check above. */
 		schedule_work(&dev->restart_work);
+		mutex_unlock(&odl_tb5_devices_lock);
 
 		return 1;
+	}
 
 	default:
 		mutex_unlock(&odl_tb5_devices_lock);
@@ -232,12 +362,20 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	struct odl_tb5_login_msg msg = { };
 	struct odl_tb5_login_response resp = { };
 	bool need_complete = false;
-	int ret;
+	bool still_waiting = false;
+	int remote_paths = 1;
+	u32 remote_flags = 0;
+	u32 resp_dw;
+	int ret, p;
 
 	odl_tb5_xd_header_init(&msg.xd_hdr, dev->xd, ODL_TB5_MSG_LOGIN,
 			       sizeof(msg));
 	msg.proto_version = ODL_TB5_PROTOCOL_VER;
-	msg.transmit_path = dev->local_tx_hopid;
+	msg.transmit_path = dev->paths[0].local_tx_hopid;
+	msg.path_count = dev->num_paths;
+	for (p = 1; p < dev->num_paths; p++)
+		msg.extra_tx_hopids[p - 1] = dev->paths[p].local_tx_hopid;
+	msg.flags = odl_raw_payload ? ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD : 0;
 
 	ret = tb_xdomain_request(dev->xd, &msg, sizeof(msg),
 				 TB_CFG_PKG_XDOMAIN_REQ,
@@ -254,8 +392,10 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 	 * Accept any response that follows the XDomain response format. */
 	if (odl_protocol_mode == 1) {
 		/* Apple mode: accept any response that looks reasonable.
-		 * The transmit_path is at a fixed offset in the response. */
-		dev->remote_tx_hopid = resp.transmit_path;
+		 * The transmit_path is at a fixed offset in the response.
+		 * Always single-path. */
+		mutex_lock(&dev->state_lock);
+		dev->paths[0].remote_tx_hopid = resp.transmit_path;
 		goto login_ok;
 	}
 
@@ -276,65 +416,107 @@ int odl_tb5_proto_send_login(struct odl_tb5_device *dev)
 		return -ECONNREFUSED;
 	}
 
-	dev->remote_tx_hopid = resp.transmit_path;
+	/* The unlock at login_ok below pairs with this (and the Apple-mode
+	 * lock above) — historically this function unlocked state_lock
+	 * without ever taking it. */
+	mutex_lock(&dev->state_lock);
+	dev->paths[0].remote_tx_hopid = resp.transmit_path;
+
+	/* Multi-path (v2) detection is size-tolerant: the responder encodes
+	 * its payload length in the XD header.  Old responders send the
+	 * short v1 layout — the extension bytes in `resp` are then
+	 * unspecified (the ctl layer copies a fixed-size buffer), so never
+	 * read them unless the advertised length covers them. */
+	resp_dw = resp.xd_hdr.length_sn & XD_LEN_MASK;
+	if (resp_dw >= ODL_TB5_LOGIN_RSP_V3_DW) {
+		remote_paths = clamp_t(int, (int)resp.path_count,
+				       1, ODL_TB5_MAX_PATHS);
+		for (p = 1; p < remote_paths; p++)
+			dev->paths[p].remote_tx_hopid =
+				resp.extra_tx_hopids[p - 1];
+		remote_flags = resp.flags;
+		if (remote_paths > 1)
+			pr_info("OdinLink: peer response advertises %d paths\n",
+				remote_paths);
+	} else if (resp_dw >= ODL_TB5_LOGIN_RSP_V2_DW) {
+		remote_paths = clamp_t(int, (int)resp.path_count,
+				       1, ODL_TB5_MAX_PATHS);
+		for (p = 1; p < remote_paths; p++)
+			dev->paths[p].remote_tx_hopid =
+				resp.extra_tx_hopids[p - 1];
+		if (remote_paths > 1)
+			pr_info("OdinLink: peer response advertises %d paths\n",
+				remote_paths);
+	}
+
 login_ok:
+	dev->remote_path_count = remote_paths;
+	dev->negotiated_paths = min(dev->num_paths, remote_paths);
+	dev->raw_payload_ok = odl_raw_payload && odl_protocol_mode == 0 &&
+			      (remote_flags & ODL_TB5_LOGIN_FLAG_RAW_PAYLOAD);
 	dev->login_sent = true;
 	if (dev->login_received && dev->state == ODL_TB5_STATE_HANDSHAKE)
 		need_complete = true;
+	/* Our login succeeded but the peer's login hasn't arrived yet: keep
+	 * retrying at the normal backoff so a peer that came up first (and
+	 * whose own login_work already stopped) still gets poked.  Bounded,
+	 * and it stops the moment we leave HANDSHAKE — unlike an unconditional
+	 * fast re-login, which livelocks by restarting a mid-verify peer. */
+	still_waiting = !need_complete &&
+			dev->state == ODL_TB5_STATE_HANDSHAKE;
 	mutex_unlock(&dev->state_lock);
 
 	pr_info("OdinLink: login sent OK, remote_tx_hopid=%d\n",
-		dev->remote_tx_hopid);
+		dev->paths[0].remote_tx_hopid);
 
-	if (need_complete)
+	if (need_complete && !atomic_read(&dev->removing))
 		schedule_work(&dev->connect_work);
+
+	if (still_waiting && !atomic_read(&dev->removing))
+		schedule_delayed_work(&dev->login_work,
+				      msecs_to_jiffies(ODL_TB5_LOGIN_TIMEOUT));
 
 	return 0;
 }
 
-/* Finish handshake and bring link up. */
-static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+/* Bring up one DMA path: allocate the input HopID for the peer's TX,
+ * start the ring pair, and enable the router paths (with retries).
+ * Returns 0 on success; on failure the path is fully rolled back. */
+static int odl_tb5_connect_path(struct odl_tb5_device *dev, int idx)
 {
+	struct odl_tb5_path *path = &dev->paths[idx];
 	int ret, i;
 
-	/* BUG1 fix (re-entry): this function is called again on every handshake
-	 * restart.  Without releasing the hop-ID we already hold, each retry
-	 * orphans the previous allocation (dev->in_hopid is simply overwritten)
-	 * until tb_xdomain_enable_paths() fails with -ENOMEM.  Release first. */
-	if (dev->in_hopid_valid) {
-		if (dev->tx.started)
-			tb_xdomain_disable_paths(dev->xd, dev->local_tx_hopid,
-						 dev->tx.ring ? dev->tx.ring->hop : -1,
-						 dev->in_hopid,
-						 dev->rx.ring ? dev->rx.ring->hop : -1);
-		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-		dev->in_hopid_valid = false;
-	}
-
-	ret = tb_xdomain_alloc_in_hopid(dev->xd, dev->remote_tx_hopid);
+	ret = tb_xdomain_alloc_in_hopid(dev->xd, path->remote_tx_hopid);
 	if (ret < 0) {
 		pr_err("OdinLink: failed to allocate input HopID: %d\n", ret);
 		return ret;
 	}
-	dev->in_hopid = dev->remote_tx_hopid;
-	dev->in_hopid_valid = true;
-	ret = odl_tb5_rings_start(dev);
+	path->in_hopid_valid = true;
+	ret = odl_tb5_rings_start(dev, idx);
 	if (ret) {
 		pr_err("OdinLink: failed to start rings: %d\n", ret);
-		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-		dev->in_hopid_valid = false;
+		tb_xdomain_release_in_hopid(dev->xd, path->remote_tx_hopid);
+		path->in_hopid_valid = false;
 		return ret;
 	}
 
-	{
+	if (idx == 0) {
+		/* Legacy 16-frame RX prime for path 0 — unchanged from the
+		 * single-path flow (the legacy double-buffers only exist
+		 * for path 0).  Paths > 0 get their RX window from the
+		 * frame-pool repost in verify_work before any pings fly;
+		 * frames the peer sends earlier are absorbed by its
+		 * ping/pong retry loop. */
 		size_t rx_prime = (size_t)ODL_TB5_FRAME_SIZE * 16;
 
 		ret = odl_tb5_submit_rx(dev, 0, rx_prime);
 		if (ret) {
 			pr_err("OdinLink: failed to prime RX: %d\n", ret);
-			odl_tb5_rings_stop(dev);
-			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-			dev->in_hopid_valid = false;
+			odl_tb5_rings_stop_path(dev, idx);
+			tb_xdomain_release_in_hopid(dev->xd,
+						    path->remote_tx_hopid);
+			path->in_hopid_valid = false;
 			return ret;
 		}
 		pr_info("OdinLink: RX primed with 16 frames before "
@@ -343,10 +525,10 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 
 	for (i = 0; i < ODL_TB5_ENABLE_RETRIES; i++) {
 		ret = tb_xdomain_enable_paths(dev->xd,
-					      dev->local_tx_hopid,
-					      dev->tx.ring->hop,
-					      dev->remote_tx_hopid,
-					      dev->rx.ring->hop);
+					      path->local_tx_hopid,
+					      path->tx.ring->hop,
+					      path->remote_tx_hopid,
+					      path->rx.ring->hop);
 		if (!ret)
 			break;
 
@@ -363,10 +545,44 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 		pr_err("OdinLink: failed to enable XDomain paths "
 		       "after %d attempts: %d\n",
 		       ODL_TB5_ENABLE_RETRIES, ret);
-		odl_tb5_rings_stop(dev);
-		tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-		dev->in_hopid_valid = false;
+		odl_tb5_rings_stop_path(dev, idx);
+		tb_xdomain_release_in_hopid(dev->xd, path->remote_tx_hopid);
+		path->in_hopid_valid = false;
 		return ret;
+	}
+
+	return 0;
+}
+
+/* Finish handshake and bring link up. */
+static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
+{
+	int negotiated = dev->negotiated_paths;
+	int enabled = 0;
+	int ret, p;
+
+	if (negotiated < 1)
+		negotiated = 1;
+
+	dev->tx_active_paths = 1;
+
+	for (p = 0; p < negotiated; p++) {
+		ret = odl_tb5_connect_path(dev, p);
+		if (ret) {
+			if (p == 0)
+				return ret;
+			/* Path i > 0 failed: don't activate this or any
+			 * later path — degrade instead of hard-failing. */
+			pr_warn("OdinLink: path %d bring-up failed (%d), "
+				"continuing with %d path(s)\n", p, ret, p);
+			break;
+		}
+		enabled++;
+	}
+
+	if (enabled < negotiated) {
+		negotiated = enabled;
+		dev->negotiated_paths = enabled;
 	}
 
 	mutex_lock(&dev->state_lock);
@@ -377,17 +593,22 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 	pr_info("OdinLink: connected to peer "
 		"(local_tx_hopid=%d, remote_tx_hopid=%d, "
 		"tx_ring_hop=%d, rx_ring_hop=%d, "
-		"ring_size=%d, E2E enabled)\n",
-		dev->local_tx_hopid, dev->remote_tx_hopid,
-		dev->tx.ring->hop, dev->rx.ring->hop,
-		dev->tx.ring_size);
+		"ring_size=%d, E2E=%s)\n",
+		dev->paths[0].local_tx_hopid, dev->paths[0].remote_tx_hopid,
+		dev->paths[0].tx.ring->hop, dev->paths[0].rx.ring->hop,
+		dev->paths[0].tx.ring_size, odl_e2e ? "enabled" : "disabled");
+	if (negotiated > 1)
+		pr_info("OdinLink: %d DMA paths enabled\n", negotiated);
 
 	/* Allocate frame pool early so verify uses the non-blocking
 	 * pool path for PING/PONG instead of the legacy submit_tx
 	 * which blocks waiting for TX completion (unreliable on
-	 * Barlow Ridge). */
+	 * Barlow Ridge).  With more than 2 paths the shared pool is
+	 * doubled so each path still gets a useful RX window. */
 	if (!dev->frame_pool.slots) {
-		int pool_ret = odl_tb5_frame_pool_alloc(dev);
+		int pool_size = negotiated > 2 ? 2 * ODL_TB5_FRAME_POOL_SIZE
+					       : ODL_TB5_FRAME_POOL_SIZE;
+		int pool_ret = odl_tb5_frame_pool_alloc(dev, pool_size);
 
 		if (pool_ret)
 			pr_warn("OdinLink: frame pool alloc failed (%d), "
@@ -403,10 +624,19 @@ static int odl_tb5_complete_connection(struct odl_tb5_device *dev)
 				"throughput mode disabled\n", bret);
 	}
 
-	hrtimer_start(&dev->rx_poll_timer,
-		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-		      HRTIMER_MODE_REL);
-	schedule_work(&dev->verify_work);
+	/* Accept verification PINGs before either side queues verify_work. */
+	spin_lock_irq(&dev->verify_reply_lock);
+	atomic_set(&dev->pong_mask, 0);
+	atomic_set(&dev->ack_mask, 0);
+	atomic_set(&dev->verify_ping_mask, 0);
+	atomic_set(&dev->verify_pong_mask, 0);
+	odl_tb5_drain_state_reset(dev);
+	dev->verify_reply_open = true;
+	dev->drain_reply_open = true;
+	spin_unlock_irq(&dev->verify_reply_lock);
+	odl_tb5_poll_kick(dev);
+	if (!atomic_read(&dev->removing))
+		schedule_work(&dev->verify_work);
 
 	return 0;
 }
@@ -418,26 +648,42 @@ static void odl_tb5_connect_work_fn(struct work_struct *work)
 		container_of(work, struct odl_tb5_device, connect_work);
 	int ret;
 
+	if (atomic_read(&dev->removing))
+		return;
+
 	ret = odl_tb5_complete_connection(dev);
 	if (ret) {
 		mutex_lock(&dev->state_lock);
 		dev->login_sent = false;
 		dev->login_received = false;
+		dev->raw_payload_ok = false;
 		mutex_unlock(&dev->state_lock);
 
 		pr_warn("OdinLink: connection completion failed (%d), "
 			"retrying handshake\n", ret);
-		schedule_delayed_work(&dev->login_work,
-				      msecs_to_jiffies(1000));
+		if (!atomic_read(&dev->removing))
+			schedule_delayed_work(&dev->login_work,
+					      msecs_to_jiffies(1000));
 	}
 }
 
-/* Write a kernel DMA control message (ping or pong) via frame pool. */
-static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type)
+/* Write a kernel DMA control message (ping or pong) via frame pool.
+ * @path_idx selects the DMA path whose TX ring carries the message. */
+static int odl_tb5_send_dma_msg_value(struct odl_tb5_device *dev, u32 type,
+				      int path_idx, u32 value)
 {
 	struct odl_tb5_frame_slot *slot;
 	struct odl_tb5_dma_hdr *dhdr;
 	int ret;
+	u32 generation = 0;
+
+	if (type == ODL_TB5_DMA_DRAIN_PREP ||
+	    type == ODL_TB5_DMA_DRAIN_PAD)
+		generation = (u32)atomic_read(&dev->drain_generation);
+	else if (type == ODL_TB5_DMA_DRAIN_READY ||
+		 type == ODL_TB5_DMA_DRAIN_ACK)
+		generation = (u32)atomic_read(
+				&dev->drain_peer_generation[path_idx]);
 
 	/* Use frame pool for non-blocking send (each msg gets its own
 	 * slot, no drain wait).  Write raw DMA header at offset 0
@@ -452,6 +698,9 @@ static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type)
 		memset(dhdr, 0, sizeof(*dhdr));
 		dhdr->magic = cpu_to_le32(ODL_TB5_DMA_MAGIC);
 		dhdr->type  = cpu_to_le32(type);
+		dhdr->reserved[0] = cpu_to_le32(ODL_TB5_DMA_DRAIN_VERSION);
+		dhdr->reserved[1] = cpu_to_le32(value);
+		dhdr->reserved[2] = cpu_to_le32(generation);
 
 		slot->frame.size = sizeof(*dhdr);
 		slot->frame.sof = ODL_TB5_PDF_SOF_CTRL;
@@ -459,60 +708,372 @@ static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type)
 		slot->frame.callback = odl_tb5_tx_callback;
 		slot->tx_msg = NULL;
 
-		ret = tb_ring_tx(dev->tx.ring, &slot->frame);
+		ret = tb_ring_tx(dev->paths[path_idx].tx.ring, &slot->frame);
 		if (ret < 0) {
 			odl_tb5_frame_pool_put(&dev->frame_pool, slot);
 			return ret;
 		}
+		odl_tb5_tx_submitted(dev);
 
+		atomic64_inc(&dev->stats.path_tx_frames[path_idx]);
 		return 0;
 	}
 
-	/* Legacy fallback (before frame pool is allocated) */
+	/* Legacy fallback (before frame pool is allocated) — path 0 only,
+	 * the legacy double-buffers don't exist for other paths. */
 	{
 		struct odl_tb5_dma_hdr *hdr;
 
-		hdr = dev->tx.bufs[dev->tx.front].virt;
+		if (path_idx != 0)
+			return -ENXIO;
+
+		hdr = dev->paths[0].tx.bufs[dev->paths[0].tx.front].virt;
 		memset(hdr, 0, sizeof(*hdr));
 		hdr->magic = cpu_to_le32(ODL_TB5_DMA_MAGIC);
 		hdr->type  = cpu_to_le32(type);
+		hdr->reserved[0] = cpu_to_le32(ODL_TB5_DMA_DRAIN_VERSION);
+		hdr->reserved[1] = cpu_to_le32(value);
+		hdr->reserved[2] = cpu_to_le32(generation);
 
 		return odl_tb5_submit_tx(dev, 0, sizeof(*hdr), true);
 	}
 }
 
-/* Respond to incoming DMA PING messages with a PONG. */
+/* Respond to incoming DMA PING messages with a PONG — on the same path
+ * the PING arrived on.  rx_callback records the arrival path in the
+ * verify_ping_mask bitmap; pings on different paths therefore can't
+ * clobber each other even when they race. */
 static void odl_tb5_ctrl_reply_work_fn(struct work_struct *work)
 {
 	struct odl_tb5_device *dev =
 		container_of(work, struct odl_tb5_device, ctrl_reply_work);
-	int type = dev->verify_rx_type;
+	unsigned long ping_mask, pong_mask, ready_mask, ack_mask;
+	int p;
 
-	if (type == ODL_TB5_DMA_PING) {
+	if (atomic_read(&dev->removing))
+		return;
+
+	ping_mask = (unsigned long)atomic_xchg(&dev->verify_ping_mask, 0);
+	pong_mask = (unsigned long)atomic_xchg(&dev->verify_pong_mask, 0);
+	ready_mask = (unsigned long)atomic_xchg(&dev->drain_ready_reply_mask, 0);
+	ack_mask = (unsigned long)atomic_xchg(&dev->drain_ack_reply_mask, 0);
+
+	for_each_set_bit(p, &ping_mask, ODL_TB5_MAX_PATHS) {
 		int ret;
 
-		pr_info("OdinLink: DMA ping received, sending pong\n");
-		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG);
+		if (p == 0)
+			pr_info("OdinLink: DMA ping received, sending pong\n");
+		else
+			pr_info("OdinLink: DMA ping received on path %d, "
+				"sending pong\n", p);
+		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PONG, p);
 
-		/* BUG 10 fix: answering a PING is itself proof the DMA path
-		 * works in both directions -- we received a frame (RX good)
-		 * and submitted one (TX good).  Without this the handshake is
-		 * an unwinnable race: the peer that verifies first calls
-		 * odl_tb5_rings_reset() and sets rx_target/rx_posted to 0
-		 * (no RX frames are posted until a STREAM_OPEN ioctl), so our
-		 * PINGs land nowhere and our own PONG never arrives.  The
-		 * second node then always fails "DMA verify failed after 300
-		 * attempts" even though the link is perfectly healthy. */
-		if (!ret) {
-			dev->peer_ping_answered = true;
-			if (!dev->pong_received)
-				dev->pong_received = true;
-			wake_up_all(&dev->verify_waitq);
-		}
-	} else {
-		pr_warn("OdinLink: unexpected DMA ctrl message type %d\n",
-			type);
+		if (ret)
+			pr_warn("OdinLink: DMA pong send failed on path %d (%d)\n",
+				p, ret);
 	}
+
+	for_each_set_bit(p, &pong_mask, ODL_TB5_MAX_PATHS) {
+		int ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_ACK, p);
+
+		if (ret)
+			pr_warn("OdinLink: DMA ACK send failed on path %d (%d)\n",
+				p, ret);
+	}
+
+	if ((ready_mask || ack_mask) && odl_drain_phase_delay_ms)
+		msleep(odl_drain_phase_delay_ms);
+
+	for_each_set_bit(p, &ready_mask, ODL_TB5_MAX_PATHS) {
+		u32 posted = (u32)(atomic_read(&dev->paths[p].rx_posted) +
+				   atomic_read(&dev->paths[p].legacy_rx_posted));
+		int ret;
+
+		/* READY publishes the exact window after PREP consumed the last
+		 * older frame on this FIFO.  The peer's READY consumes one more
+		 * local slot, padding consumes all but one of the remainder, and
+		 * that final slot is reserved for DRAIN_ACK. */
+		atomic_set(&dev->drain_pad_expected[p],
+			   posted > 1 ? (int)posted - 2 : 0);
+		ret = odl_tb5_send_dma_msg_value(dev, ODL_TB5_DMA_DRAIN_READY,
+						 p, posted);
+		if (ret)
+			pr_warn("OdinLink: DMA drain READY failed on path %d (%d)\n",
+				 p, ret);
+	}
+
+	for_each_set_bit(p, &ack_mask, ODL_TB5_MAX_PATHS) {
+		int ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_DRAIN_ACK, p);
+
+		if (ret)
+			pr_warn("OdinLink: DMA drain ACK failed on path %d (%d)\n",
+				 p, ret);
+	}
+}
+
+static int odl_tb5_send_dma_msg(struct odl_tb5_device *dev, u32 type,
+				int path_idx)
+{
+	return odl_tb5_send_dma_msg_value(dev, type, path_idx, 0);
+}
+
+static int odl_tb5_send_dma_msg_wait(struct odl_tb5_device *dev, u32 type,
+				     int path_idx)
+{
+	unsigned long deadline = jiffies +
+		msecs_to_jiffies(ODL_TB5_DRAIN_TIMEOUT_MS);
+	int ret;
+
+	do {
+		ret = odl_tb5_send_dma_msg(dev, type, path_idx);
+		if (ret != -ENOMEM && ret != -ENOSPC && ret != -EBUSY)
+			return ret;
+		if (atomic_read(&dev->removing) ||
+		    dev->state != ODL_TB5_STATE_CONNECTED)
+			return -ESHUTDOWN;
+		odl_tb5_poll_kick(dev);
+		usleep_range(50, 100);
+	} while (time_before(jiffies, deadline));
+
+	return -ETIMEDOUT;
+}
+
+static int odl_tb5_verify_quiesce_replies(struct odl_tb5_device *dev)
+{
+	unsigned long flags;
+	long ret;
+
+	spin_lock_irqsave(&dev->verify_reply_lock, flags);
+	dev->verify_reply_open = false;
+	spin_unlock_irqrestore(&dev->verify_reply_lock, flags);
+
+	flush_work(&dev->ctrl_reply_work);
+	ret = wait_event_interruptible_timeout(
+			dev->verify_waitq,
+			atomic_read(&dev->tx_inflight) == 0 ||
+			atomic_read(&dev->removing),
+			msecs_to_jiffies(ODL_TB5_TX_DRAIN_TIMEOUT_MS));
+	if (atomic_read(&dev->removing))
+		return -ESHUTDOWN;
+	if (ret == 0)
+		return -ETIMEDOUT;
+	return ret < 0 ? (int)ret : 0;
+}
+
+static void odl_tb5_drain_state_reset(struct odl_tb5_device *dev)
+{
+	int p;
+
+	atomic_set(&dev->drain_prep_mask, 0);
+	atomic_set(&dev->drain_frozen_mask, 0);
+	atomic_set(&dev->drain_ready_mask, 0);
+	atomic_set(&dev->drain_ack_mask, 0);
+	atomic_set(&dev->drain_ready_reply_mask, 0);
+	atomic_set(&dev->drain_ack_reply_mask, 0);
+	for (p = 0; p < ODL_TB5_MAX_PATHS; p++) {
+		atomic_set(&dev->drain_peer_generation[p], 0);
+		atomic_set(&dev->drain_peer_rx[p], 0);
+		atomic_set(&dev->drain_pad_expected[p], 0);
+		atomic_set(&dev->drain_pad_received[p], 0);
+	}
+}
+
+static int odl_tb5_freeze_verify_rx(struct odl_tb5_device *dev, int paths,
+				    u32 *snapshots)
+{
+	int p;
+
+	for (p = 0; p < paths; p++) {
+		struct odl_tb5_path *path = &dev->paths[p];
+		unsigned long flags;
+		long ret;
+
+		spin_lock_irqsave(&path->rx.lock, flags);
+		WRITE_ONCE(path->rx_target, 0);
+		path->rx_repost_pending = false;
+		spin_unlock_irqrestore(&path->rx.lock, flags);
+
+		ret = wait_event_interruptible_timeout(
+				path->rx_repost_waitq,
+				atomic_read(&path->rx_reposting) == 0 ||
+				atomic_read(&dev->removing),
+				msecs_to_jiffies(ODL_TB5_DRAIN_TIMEOUT_MS));
+		if (atomic_read(&dev->removing))
+			return -ESHUTDOWN;
+		if (ret <= 0)
+			return ret == 0 ? -ETIMEDOUT : (int)ret;
+
+		snapshots[p] = (u32)(atomic_read(&path->rx_posted) +
+				     atomic_read(&path->legacy_rx_posted));
+		if (snapshots[p] < 3) {
+			pr_warn("OdinLink: DMA drain path %d has only %u RX slots\n",
+				p, snapshots[p]);
+			return -ENOSPC;
+		}
+		pr_info("OdinLink: DMA drain froze path %d (rx_posted=%u)\n",
+			p, snapshots[p]);
+
+		spin_lock_irqsave(&dev->verify_reply_lock, flags);
+		atomic_or(BIT(p), &dev->drain_frozen_mask);
+		if (atomic_read(&dev->drain_prep_mask) & BIT(p)) {
+			atomic_or(BIT(p), &dev->drain_ready_reply_mask);
+			schedule_work(&dev->ctrl_reply_work);
+		}
+		spin_unlock_irqrestore(&dev->verify_reply_lock, flags);
+	}
+
+	return 0;
+}
+
+static bool odl_tb5_drain_rx_empty(struct odl_tb5_device *dev, int paths)
+{
+	int p;
+
+	for (p = 0; p < paths; p++)
+		if (atomic_read(&dev->paths[p].rx_posted) != 0 ||
+		    atomic_read(&dev->paths[p].legacy_rx_posted) != 0)
+			return false;
+	return true;
+}
+
+static int odl_tb5_drain_verify_rings(struct odl_tb5_device *dev, int paths)
+{
+	unsigned long wanted = GENMASK(paths - 1, 0);
+	u32 snapshots[ODL_TB5_MAX_PATHS] = { };
+	unsigned long flags;
+	long ret;
+	int p;
+
+	if (!dev->frame_pool.slots) {
+		pr_err("OdinLink: safe DMA drain requires pool-backed RX; refusing READY\n");
+		return -EOPNOTSUPP;
+	}
+
+	/* Every attempt gets a new identity.  Delayed READY/PAD/ACK frames from
+	 * an abandoned attempt must not satisfy this attempt's barriers. */
+	if (atomic_inc_return(&dev->drain_generation) == 0)
+		atomic_inc(&dev->drain_generation);
+
+	ret = odl_tb5_verify_quiesce_replies(dev);
+	if (ret)
+		return (int)ret;
+
+	spin_lock_irqsave(&dev->verify_reply_lock, flags);
+	dev->drain_reply_open = true;
+	spin_unlock_irqrestore(&dev->verify_reply_lock, flags);
+
+	ret = odl_tb5_freeze_verify_rx(dev, paths, snapshots);
+	if (ret)
+		goto out_close;
+
+if (odl_drain_phase_delay_ms)
+		msleep(odl_drain_phase_delay_ms);
+
+	for (p = 0; p < paths; p++) {
+		ret = odl_tb5_send_dma_msg_value(dev, ODL_TB5_DMA_DRAIN_PREP,
+						 p, snapshots[p]);
+		if (ret)
+			goto out_close;
+	}
+
+	ret = wait_event_interruptible_timeout(
+			dev->verify_waitq,
+			(((unsigned long)atomic_read(&dev->drain_ready_mask) & wanted) ==
+			 wanted) || atomic_read(&dev->removing) ||
+			dev->state != ODL_TB5_STATE_CONNECTED,
+			msecs_to_jiffies(ODL_TB5_DRAIN_TIMEOUT_MS));
+	if (atomic_read(&dev->removing)) {
+		ret = -ESHUTDOWN;
+		goto out_close;
+	}
+	if (ret <= 0 || dev->state != ODL_TB5_STATE_CONNECTED) {
+		pr_warn("OdinLink: DMA drain ready wait: ret=%ld state=%d "
+			"ready=%lx frozen=%lx prep=%lx want=%lx\n", ret,
+			dev->state,
+			(unsigned long)atomic_read(&dev->drain_ready_mask),
+			(unsigned long)atomic_read(&dev->drain_frozen_mask),
+			(unsigned long)atomic_read(&dev->drain_prep_mask),
+			wanted);
+		ret = ret == 0 ? -ETIMEDOUT : (ret < 0 ? ret : -ENOTCONN);
+		goto out_close;
+	}
+
+	for (p = 0; p < paths; p++) {
+		int peer_rx = atomic_read(&dev->drain_peer_rx[p]);
+
+		if (peer_rx < 2) {
+			pr_warn("OdinLink: DMA drain peer path %d reserved only %d RX slots\n",
+				p, peer_rx);
+			ret = -ENOSPC;
+			goto out_close;
+		}
+	}
+
+	if (odl_drain_phase_delay_ms)
+		msleep(odl_drain_phase_delay_ms);
+
+for (p = 0; p < paths; p++) {
+		int pads = atomic_read(&dev->drain_peer_rx[p]) - 2;
+		int i;
+
+		for (i = 0; i < pads; i++) {
+			ret = odl_tb5_send_dma_msg_wait(dev,
+						    ODL_TB5_DMA_DRAIN_PAD, p);
+			if (ret)
+				goto out_close;
+		}
+	}
+
+	ret = wait_event_interruptible_timeout(
+			dev->verify_waitq,
+			((((unsigned long)atomic_read(&dev->drain_ack_mask) & wanted) ==
+			  wanted) && odl_tb5_drain_rx_empty(dev, paths)) ||
+			 atomic_read(&dev->removing) ||
+			 dev->state != ODL_TB5_STATE_CONNECTED,
+			msecs_to_jiffies(ODL_TB5_DRAIN_TIMEOUT_MS));
+	if (atomic_read(&dev->removing)) {
+		ret = -ESHUTDOWN;
+		goto out_close;
+	}
+	if (ret <= 0 || dev->state != ODL_TB5_STATE_CONNECTED) {
+		pr_warn("OdinLink: DMA drain ack wait: ret=%ld state=%d "
+			"ack=%lx pad=%d/%d,%d/%d peer_rx=%d,%d "
+			"rx_posted=%u,%u want=%lx\n", ret, dev->state,
+			(unsigned long)atomic_read(&dev->drain_ack_mask),
+			atomic_read(&dev->drain_pad_received[0]),
+			atomic_read(&dev->drain_pad_expected[0]),
+			atomic_read(&dev->drain_pad_received[1]),
+			atomic_read(&dev->drain_pad_expected[1]),
+			atomic_read(&dev->drain_peer_rx[0]),
+			atomic_read(&dev->drain_peer_rx[1]),
+			atomic_read(&dev->paths[0].rx_posted),
+			atomic_read(&dev->paths[1].rx_posted), wanted);
+		ret = ret == 0 ? -ETIMEDOUT : (ret < 0 ? ret : -ENOTCONN);
+		goto out_close;
+	}
+
+	flush_work(&dev->ctrl_reply_work);
+	ret = wait_event_interruptible_timeout(
+			dev->verify_waitq,
+			atomic_read(&dev->tx_inflight) == 0 ||
+			atomic_read(&dev->removing),
+			msecs_to_jiffies(ODL_TB5_DRAIN_TIMEOUT_MS));
+	if (atomic_read(&dev->removing))
+		ret = -ESHUTDOWN;
+	else if (ret == 0) {
+		pr_warn("OdinLink: DMA drain TX-inflight timeout "
+			"(tx_inflight=%d)\n", atomic_read(&dev->tx_inflight));
+		ret = -ETIMEDOUT;
+	}
+	else if (ret > 0)
+		ret = 0;
+
+out_close:
+	spin_lock_irqsave(&dev->verify_reply_lock, flags);
+	dev->drain_reply_open = false;
+	spin_unlock_irqrestore(&dev->verify_reply_lock, flags);
+	flush_work(&dev->ctrl_reply_work);
+	return (int)ret;
 }
 
 
@@ -527,20 +1088,34 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 {
 	struct odl_tb5_device *dev =
 		container_of(work, struct odl_tb5_device, verify_work);
+	int negotiated = dev->negotiated_paths;
+	int verified = 0;
 	long ret;
-	int attempt;
+	int attempt, p;
 
-	dev->pong_received = false;   /* peer_ping_answered deliberately kept */
+	if (atomic_read(&dev->removing))
+		return;
+
+	if (negotiated < 1)
+		negotiated = 1;
+
+	/* Each side must receive a PONG and an ACK proving its own PONG arrived.
+	 * The masks are cleared when a new connection opens reply admission. */
 
 	/* Use frame pool for RX during verify — each pool slot is
 	 * independent and auto-reposts after consumption, so we never
 	 * run out of RX frames.  The legacy submit_rx only posts 16
-	 * frames and can't repost without a ring reset. */
+	 * frames and can't repost without a ring reset.  The RX window
+	 * (pool/2) is split evenly across the negotiated paths. */
 	if (dev->frame_pool.slots) {
-		dev->rx_target = dev->frame_pool.size / 2;
-		odl_tb5_rx_repost(dev);
+		int per_path = (dev->frame_pool.size / 2) / negotiated;
+
+		for (p = 0; p < negotiated; p++) {
+			dev->paths[p].rx_target = per_path;
+			odl_tb5_rx_repost(dev, p);
+		}
 		pr_info("OdinLink: verify using pool RX (target=%d)\n",
-			dev->rx_target);
+			dev->paths[0].rx_target);
 	} else {
 		size_t buf_size = (size_t)ODL_TB5_FRAME_SIZE * 16;
 
@@ -552,83 +1127,202 @@ static void odl_tb5_verify_work_fn(struct work_struct *work)
 		}
 	}
 
-	for (attempt = 0; attempt < 300; attempt++) {
-		if (dev->state != ODL_TB5_STATE_CONNECTED)
-			goto out_reset;
+	/* Verify every negotiated path sequentially, path 0 first.  Path 0
+	 * dead => hard fail (as before).  Path i > 0 dead => degrade the
+	 * TX side to the verified prefix; the path stays started/enabled
+	 * on the RX side so an asymmetric peer can still reach us. */
+	for (p = 0; p < negotiated; p++) {
+		int max_attempts = (p == 0) ? 300 : 50;
+		bool pong = false;
 
-		/* Answering the peer's PING already proved both directions. */
-		if (dev->peer_ping_answered)
-			break;
+		for (attempt = 0; attempt < max_attempts; attempt++) {
+			if (dev->state != ODL_TB5_STATE_CONNECTED)
+				goto out_reset;
 
-		flush_work(&dev->ctrl_reply_work);
+			flush_work(&dev->ctrl_reply_work);
 
-		ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PING);
-		if (ret) {
-			pr_warn("OdinLink: DMA verify: send ping failed "
-				"(%ld)\n", ret);
-			goto out_reset;
+			ret = odl_tb5_send_dma_msg(dev, ODL_TB5_DMA_PING, p);
+			if (ret) {
+				pr_warn("OdinLink: DMA verify: send ping failed "
+					"(%ld)\n", ret);
+				if (p == 0)
+					goto out_reset;
+				break;
+			}
+
+			if (attempt == 0) {
+				if (p == 0)
+					pr_info("OdinLink: DMA ping sent, "
+						"waiting for pong\n");
+				else
+					pr_info("OdinLink: DMA ping sent on "
+						"path %d, waiting for pong\n",
+						p);
+			}
+
+			ret = wait_event_interruptible_timeout(
+					dev->verify_waitq,
+					(atomic_read(&dev->pong_mask) & BIT(p)) &&
+					(atomic_read(&dev->ack_mask) & BIT(p)),
+					msecs_to_jiffies(100));
+			if (ret > 0) {
+				pong = true;
+				break;
+			}
+
+			if (ret < 0)
+				goto out_reset;
+
+			if ((attempt + 1) % 50 == 0)
+				pr_info("OdinLink: DMA ping attempt %d, "
+					"still waiting for pong (rx_seen=%lld "
+					"ctrl=%lld path%drx=%lld txinf=%d "
+					"pool_free=%d rx_posted=%d)\n",
+					attempt + 1,
+					(long long)atomic64_read(
+						&dev->stats.rx_frames_seen),
+					(long long)atomic64_read(
+						&dev->stats.rx_frames_ctrl),
+					p,
+					(long long)atomic64_read(
+						&dev->stats.path_rx_frames[p]),
+					atomic_read(&dev->tx_inflight),
+					dev->frame_pool.free_count,
+					atomic_read(&dev->paths[p].rx_posted));
+
+			/* Do NOT reset the RX ring here — that kills in-flight
+			 * frames and creates dead windows where PONGs are lost. */
 		}
 
-		if (attempt == 0)
-			pr_info("OdinLink: DMA ping sent, "
-				"waiting for pong\n");
-
-		ret = wait_event_interruptible_timeout(
-				dev->verify_waitq,
-				dev->pong_received || dev->peer_ping_answered,
-				msecs_to_jiffies(100));
-		if (ret > 0)
+		if (!pong) {
+			if (p == 0) {
+				pr_err("OdinLink: DMA verify failed after %d attempts\n",
+				       attempt);
+				goto out_reset;
+			}
+			pr_warn("OdinLink: DMA verify failed on path %d, "
+				"degrading TX to %d path(s)\n", p, p);
 			break;
+		}
 
-		if (ret < 0)
-			goto out_reset;
-
-		if ((attempt + 1) % 50 == 0)
-			pr_info("OdinLink: DMA ping attempt %d, "
-				"still waiting for pong\n", attempt + 1);
-
-		/* Do NOT reset the RX ring here — that kills in-flight
-		 * frames and creates dead windows where PONGs are lost. */
+		verified++;
 	}
 
-	if (!dev->pong_received && !dev->peer_ping_answered) {
-		pr_err("OdinLink: DMA verify failed after %d attempts\n",
-		       attempt);
+	dev->tx_active_paths = verified;
+
+	pr_info("OdinLink: DMA paths verified, draining verification RX\n");
+	if (verified > 1)
+		pr_info("OdinLink: %d TX paths active\n", verified);
+
+	/* A path that cannot carry the bilateral drain cannot safely retain its
+	 * posted verification descriptors.  Refuse a one-sided degraded READY;
+	 * the restart path will negotiate a clean set of rings instead. */
+	if (verified != negotiated) {
+		pr_warn("OdinLink: DMA drain requires all %d negotiated paths; only %d verified\n",
+			negotiated, verified);
 		goto out_reset;
 	}
 
-	pr_info("OdinLink: DMA path verified, resetting rings for userspace\n");
+	ret = odl_tb5_drain_verify_rings(dev, negotiated);
+	if (ret) {
+		pr_warn("OdinLink: DMA ring drain failed (%ld); restarting handshake\n",
+			ret);
+		goto out_reset_quiesced;
+	}
 
-	flush_work(&dev->ctrl_reply_work);
-	hrtimer_cancel(&dev->rx_poll_timer);
-	odl_tb5_rings_reset(dev);
+	for (p = 0; p < negotiated; p++) {
+		struct odl_tb5_path *path = &dev->paths[p];
+
+		pr_info("OdinLink: DMA drain path %d complete (pool_rx=%d legacy_rx=%d)\n",
+			p, atomic_read(&path->rx_posted),
+			atomic_read(&path->legacy_rx_posted));
+
+		/* The counted drain (odl.sh) already proved via
+		 * odl_tb5_drain_rx_empty + the global TX-inflight gate that no
+		 * descriptor or callback remains on these rings.  Do NOT stop/start
+		 * them here: tb_ring_stop/start resets the driver-side descriptor
+		 * head to 0 but leaves the NHI controller's internal cursor
+		 * untouched, which desynchronises the E2E credit pairing and makes
+		 * RX staging posted after the restart never be consumed (ring tail
+		 * stays 0) -- the dmabuf RX hang (Bug 1).  Just reset the software
+		 * accounting and leave the live ring running. */
+		atomic_set(&path->tx.submitted, 0);
+		atomic_set(&path->tx.completed, 0);
+		path->tx.frames_posted = false;
+		path->tx.swapped_since_post = false;
+		atomic_set(&path->rx.submitted, 0);
+		atomic_set(&path->rx.completed, 0);
+		path->rx.frames_posted = false;
+		path->rx.swapped_since_post = false;
+	}
+
+	/* Keep the control RX ring (path 0) primed after READY.  The drain froze
+	 * RX repost (rx_target=0) and left the ring empty; an empty RX ring drops
+	 * a peer's late PING/PONG, forcing a handshake restart and the reload-time
+	 * churn (Bug 3).  Re-arm so a peer still handshaking can reach us.
+	 * Multi-path data rings get their RX staging posted by the dmabuf submit
+	 * path itself. */
+	odl_tb5_rx_arm(dev);
+	pr_info("OdinLink: DMA drain TX complete (tx_inflight=%d)\n",
+		atomic_read(&dev->tx_inflight));
 
 	mutex_lock(&dev->state_lock);
 	dev->state = ODL_TB5_STATE_READY;
 	wake_up_all(&dev->state_waitq);
 	mutex_unlock(&dev->state_lock);
 
-	/*
-	 * Don't post pool frames yet — legacy consumers (daemon, CLI)
-	 * don't use stream headers.  Pool RX repost starts when the
-	 * first stream is opened via STREAM_OPEN ioctl.
-	 */
-	dev->rx_target = 0;
-	atomic_set(&dev->rx_posted, 0);
+	/* The counted drain consumed every verification descriptor.  Pool RX
+	 * remains disarmed until a stream consumer explicitly arms it. */
 
-	/* Restart the hrtimer poll for stream data — NHI MSI-X
-	 * interrupts fire but descriptor write-back can lag, so we poll
-	 * at 50 us to keep latency low. */
-	hrtimer_start(&dev->rx_poll_timer,
-		      ns_to_ktime(ODL_TB5_POLL_INTERVAL_NS),
-		      HRTIMER_MODE_REL);
+	/* Arm the on-demand poll for stream data — NHI MSI-X interrupts
+	 * fire but descriptor write-back can lag, so we poll at 10 us to
+	 * keep latency low.  It self-disarms once the device goes idle. */
+	odl_tb5_poll_kick(dev);
 
 	pr_info("OdinLink: entering READY state\n");
 	return;
 
 out_reset:
-	hrtimer_cancel(&dev->rx_poll_timer);
-	odl_tb5_rings_reset(dev);
+	ret = odl_tb5_verify_quiesce_replies(dev);
+	if (ret && ret != -ESHUTDOWN)
+		pr_warn("OdinLink: DMA verify reply drain failed (%ld)\n", ret);
+out_reset_quiesced:
+	odl_tb5_poll_disarm(dev);
+
+	/* Liveness: a failed path-0 verify used to leave the device in
+	 * CONNECTED limbo forever (peer half-connected after staggered
+	 * reloads).  Restart the handshake instead; login retries have
+	 * their own backoff if the peer is really gone. */
+	if (dev->state == ODL_TB5_STATE_CONNECTED &&
+	    !atomic_read(&dev->removing)) {
+		int p;
+
+		pr_warn("OdinLink: verify failed — restarting handshake\n");
+		mutex_lock(&dev->state_lock);
+		dev->login_sent = false;
+		dev->login_received = false;
+		dev->raw_payload_ok = false;
+		/* restart_work disables/releases each path using
+		 * stale_remote_tx_hopid.  On a verify-failure restart the
+		 * paths are still enabled with the CURRENT remote hopids
+		 * (no peer change happened), so seed stale from remote —
+		 * otherwise the teardown runs with hopid 0, leaves the real
+		 * router paths enabled and leaks the in-hopids, corrupting
+		 * the DMA plane until a reboot. */
+		for (p = 0; p < ODL_TB5_MAX_PATHS; p++)
+			dev->paths[p].stale_remote_tx_hopid =
+				dev->paths[p].remote_tx_hopid;
+		mutex_unlock(&dev->state_lock);
+
+		/* A local-only restart can leave the peer in its old verification
+		 * attempt: it will answer our new pings, but its own replies are still
+		 * matched against stale ring state.  Notify it before tearing down so
+		 * both ends abandon the failed attempt.  send_logout also moves this
+		 * side out of CONNECTED, which prevents either side from exposing a
+		 * half-restarted link as READY. */
+		odl_tb5_proto_send_logout(dev);
+		schedule_work(&dev->restart_work);
+	}
 }
 
 /* Tear down stale connection and restart the handshake. */
@@ -636,24 +1330,55 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 {
 	struct odl_tb5_device *dev =
 		container_of(work, struct odl_tb5_device, restart_work);
+	int p;
 
-	hrtimer_cancel(&dev->rx_poll_timer);
+	if (atomic_read(&dev->removing))
+		return;
+
+	spin_lock_irq(&dev->verify_reply_lock);
+	dev->verify_reply_open = false;
+	dev->drain_reply_open = false;
+	spin_unlock_irq(&dev->verify_reply_lock);
+	odl_tb5_poll_disarm(dev);
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
 	cancel_work_sync(&dev->connect_work);
 	cancel_delayed_work_sync(&dev->login_work);
-	dev->pong_received = false;
+	atomic_set(&dev->pong_mask, 0);
+	atomic_set(&dev->ack_mask, 0);
+	atomic_set(&dev->verify_ping_mask, 0);
+	atomic_set(&dev->verify_pong_mask, 0);
+	atomic_set(&dev->drain_generation, 0);
+	odl_tb5_drain_state_reset(dev);
+	dev->tx_active_paths = 1;
+	/* Rings are stopped below; any in-flight TX frames are dropped without a
+	 * completion callback, so clear the global count to avoid a leaked
+	 * tx_inflight that would silently disable submit arming (Bug 3). */
+	atomic_set(&dev->tx_inflight, 0);
 
-	if (dev->tx.started) {
-		tb_xdomain_disable_paths(dev->xd,
-					 dev->local_tx_hopid,
-					 dev->tx.ring->hop,
-					 dev->stale_remote_tx_hopid,
-					 dev->rx.ring->hop);
-		odl_tb5_rings_stop(dev);
-		if (dev->in_hopid_valid) {
-			tb_xdomain_release_in_hopid(dev->xd, dev->in_hopid);
-			dev->in_hopid_valid = false;
+	/* M1 ordering, now per path: first disable ALL router paths, then
+	 * stop the rings, then release the input HopIDs (guarded by
+	 * in_hopid_valid against double release). */
+	for (p = 0; p < dev->num_paths; p++) {
+		struct odl_tb5_path *path = &dev->paths[p];
+
+		if (path->tx.started)
+			tb_xdomain_disable_paths(dev->xd,
+						 path->local_tx_hopid,
+						 path->tx.ring->hop,
+						 path->stale_remote_tx_hopid,
+						 path->rx.ring->hop);
+	}
+
+	odl_tb5_rings_stop(dev);
+
+	for (p = 0; p < dev->num_paths; p++) {
+		struct odl_tb5_path *path = &dev->paths[p];
+
+		if (path->in_hopid_valid) {
+			tb_xdomain_release_in_hopid(dev->xd,
+						    path->stale_remote_tx_hopid);
+			path->in_hopid_valid = false;
 		}
 	}
 
@@ -662,10 +1387,13 @@ static void odl_tb5_restart_work_fn(struct work_struct *work)
 	wake_up_all(&dev->state_waitq);
 	dev->login_sent = false;
 	dev->login_retries = 0;
+	dev->raw_payload_ok = false;
 	mutex_unlock(&dev->state_lock);
 
 	pr_info("OdinLink: connection restarted, beginning handshake\n");
-	schedule_delayed_work(&dev->login_work, 0);
+	atomic_inc(&dev->restart_count);
+	if (!atomic_read(&dev->removing))
+		schedule_delayed_work(&dev->login_work, 0);
 }
 
 /* Delayed work handler that retries login with exponential backoff. */
@@ -676,8 +1404,20 @@ static void odl_tb5_login_work_fn(struct work_struct *work)
 	unsigned long delay_ms;
 	int ret;
 
+	if (atomic_read(&dev->removing))
+		return;
+
+	/* The liveness re-login (see send_login) may fire after the
+	 * handshake completed — don't clobber negotiated state then. */
+	mutex_lock(&dev->state_lock);
+	if (dev->state != ODL_TB5_STATE_HANDSHAKE) {
+		mutex_unlock(&dev->state_lock);
+		return;
+	}
+	mutex_unlock(&dev->state_lock);
+
 	ret = odl_tb5_proto_send_login(dev);
-	if (ret) {
+	if (ret && !atomic_read(&dev->removing)) {
 		dev->login_retries++;
 
 		delay_ms = ODL_TB5_LOGIN_TIMEOUT <<
@@ -746,13 +1486,25 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
 	INIT_WORK(&dev->ctrl_reply_work, odl_tb5_ctrl_reply_work_fn);
 	hrtimer_setup(&dev->rx_poll_timer, odl_tb5_rx_poll_timer_fn,
 		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	atomic_set(&dev->poll_active, 0);
+	atomic_set(&dev->tx_inflight, 0);
+	atomic_set(&dev->rx_dmabuf_pending, 0);
+	dev->poll_last_rxseen = 0;
+	dev->poll_idle_ticks = 0;
 	init_waitqueue_head(&dev->verify_waitq);
+	spin_lock_init(&dev->verify_reply_lock);
+	dev->verify_reply_open = false;
+	dev->drain_reply_open = false;
 
 	dev->login_retries  = 0;
 	dev->login_sent     = false;
 	dev->login_received = false;
-	dev->pong_received  = false;
-	dev->peer_ping_answered = false;
+	dev->raw_payload_ok = false;
+	atomic_set(&dev->pong_mask, 0);
+	atomic_set(&dev->ack_mask, 0);
+	atomic_set(&dev->verify_ping_mask, 0);
+	atomic_set(&dev->verify_pong_mask, 0);
+	odl_tb5_drain_state_reset(dev);
 
 	mutex_lock(&dev->state_lock);
 	dev->state = ODL_TB5_STATE_HANDSHAKE;
@@ -767,7 +1519,7 @@ int odl_tb5_proto_init(struct odl_tb5_device *dev)
 /* Tear down the protocol layer for a device. */
 void odl_tb5_proto_exit(struct odl_tb5_device *dev)
 {
-	hrtimer_cancel(&dev->rx_poll_timer);
+	odl_tb5_poll_disarm(dev);
 	cancel_work_sync(&dev->verify_work);
 	cancel_work_sync(&dev->ctrl_reply_work);
 	cancel_work_sync(&dev->restart_work);

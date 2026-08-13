@@ -59,7 +59,7 @@ typedef int64_t  __s64;
 #define ODL_TB5_PDF_SOF_CTRL   0x01
 #define ODL_TB5_PDF_EOF_CTRL   0x02
 
-/* ── Stream header (5 bytes, prepended to every DMA frame) ──────────── */
+/* ── Stream header (8 bytes, prepended to every DMA frame) ──────────── */
 
 /* 8 bytes: src_id, dst_id, flags, reserved, payload_len, frag_idx.
  * frag_idx makes fragment loss DETECTABLE - reassembly used to be blind
@@ -67,14 +67,27 @@ typedef int64_t  __s64;
  * silently produced a short, corrupt message. The pad keeps the payload
  * 8-byte aligned, which also makes the reassembly memcpy cheaper. */
 #define ODL_TB5_STREAM_HDR_SIZE      8
-/* A Thunderbolt ring frame carries framing/CRC overhead beyond the payload
- * the driver writes, so a frame of exactly ODL_TB5_FRAME_SIZE bytes does not
- * fit the equally-sized RX buffer and is silently dropped by the NHI. Only
- * the short tail fragment of a multi-frame message would then arrive, so any
- * message larger than one frame never completed reassembly. Reserve headroom
- * so header + payload stays strictly below the buffer size. */
+
+/*
+ * Two independent reasons a frame must stay strictly below
+ * ODL_TB5_FRAME_SIZE, both of which caused silent bulk data loss:
+ *
+ *  - struct ring_frame.size (and the NHI descriptor length) is a 12-bit
+ *    field, so a frame length of exactly 4096 truncates to 0 and the frame
+ *    is transmitted empty; the receiver discards it as a runt. This alone
+ *    accounted for ~99.6 % loss on bulk transfers.
+ *  - A Thunderbolt ring frame carries framing/CRC overhead beyond the
+ *    payload the driver writes, so a full-size frame does not fit the
+ *    equally-sized RX buffer and the NHI drops it. Only the short tail
+ *    fragment of a multi-frame message would then arrive, so any message
+ *    larger than one frame never completed reassembly.
+ *
+ * ODL_TB5_FRAME_TAIL_RESERVE (64) covers both: it is well under the 4095
+ * ceiling the 12-bit field imposes and leaves room for the hardware framing.
+ */
 #define ODL_TB5_FRAME_TAIL_RESERVE   64
-#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_SIZE - ODL_TB5_STREAM_HDR_SIZE - ODL_TB5_FRAME_TAIL_RESERVE)
+#define ODL_TB5_FRAME_LEN_MAX        (ODL_TB5_FRAME_SIZE - ODL_TB5_FRAME_TAIL_RESERVE)
+#define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_LEN_MAX - ODL_TB5_STREAM_HDR_SIZE)
 
 #define ODL_TB5_STREAM_ID_CTRL       0
 #define ODL_TB5_STREAM_ID_MAX        255
