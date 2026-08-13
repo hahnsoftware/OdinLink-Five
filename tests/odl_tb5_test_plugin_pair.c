@@ -196,44 +196,70 @@ static void *client_worker(void *arg)
         int size = g_sizes[r % g_nsizes];
         unsigned char byte = (unsigned char)(c->k * g_rounds + r);
         void *data = (void *)(uintptr_t)(0x100000000ULL + c->k);
-        rcclResult_t res;
 
         pthread_barrier_wait(&g_round_barrier);
-        if (fill_pattern(c->fd, (size_t)size, byte) < 0) {
-            fprintf(stderr, "conn %d: fill_pattern failed\n", c->k);
-            c->ok = 0;
-            break;
-        }
-        res = p->isend(c->comm, data, size, r, c->mh, &c->req);
-        if (res != rcclSuccess) {
-            fprintf(stderr, "conn %d round %d: isend rc=%d\n", c->k, r, res);
-            c->ok = 0;
-            break;
-        }
-        /* The sender's TX completes only when the server's retried RX
-         * pairs with it; the server may take ~20 s per attempt under its
-         * wire lock, so wait up to 60 s without retrying here. */
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        int done = 0, sz = 0;
-        while (!done) {
-            res = p->test(c->req, &done, &sz);
+        /* Retry the round symmetrically with the server: a READY can
+         * be dropped (arrives before our control stream, or before our
+         * request) and the kernel TX submit times out after 5 s if the
+         * server's RX slot for that READY was already reclaimed.  Each
+         * retry re-queues a fresh request that pairs with the server's
+         * next retried RX.  One attempt can take ~25 s under the wire
+         * lock, so bound each attempt by wall clock. */
+        int attempt;
+        int ok = 0;
+        for (attempt = 0; attempt < 12; attempt++) {
+            void *req = NULL;
+            rcclResult_t res;
+            int attempt_failed = 0;
+
+            if (fill_pattern(c->fd, (size_t)size, byte) < 0) {
+                fprintf(stderr, "conn %d: fill_pattern failed\n", c->k);
+                c->ok = 0;
+                break;
+            }
+            res = p->isend(c->comm, data, size, r, c->mh, &req);
             if (res != rcclSuccess) {
-                fprintf(stderr, "conn %d round %d: test rc=%d\n", c->k, r, res);
+                fprintf(stderr, "conn %d round %d: isend rc=%d\n",
+                        c->k, r, res);
                 c->ok = 0;
                 break;
             }
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            double elapsed = (double)(now.tv_sec - t0.tv_sec) +
-                             (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
-            if (elapsed > 60.0) {
-                fprintf(stderr, "conn %d round %d: test timeout\n", c->k, r);
-                c->ok = 0;
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            int done = 0, sz = 0;
+            while (!done && !attempt_failed) {
+                res = p->test(req, &done, &sz);
+                if (res != rcclSuccess) {
+                    attempt_failed = 1;
+                    break;
+                }
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double elapsed = (double)(now.tv_sec - t0.tv_sec) +
+                                 (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+                if (elapsed > 25.0) {
+                    attempt_failed = 1;
+                    break;
+                }
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+                nanosleep(&ts, NULL);
+            }
+            if (attempt_failed)
+                continue;   /* retry the round with a fresh isend */
+            if (done) {
+                if (sz != size) {
+                    fprintf(stderr, "conn %d round %d: sent %d want %d\n",
+                            c->k, r, sz, size);
+                    c->ok = 0;
+                }
+                ok = 1;
                 break;
             }
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
-            nanosleep(&ts, NULL);
+        }
+        if (!ok) {
+            fprintf(stderr, "conn %d round %d: gave up after retries\n",
+                    c->k, r);
+            c->ok = 0;
         }
         if (!c->ok)
             break;

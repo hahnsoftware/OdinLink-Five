@@ -122,6 +122,12 @@ static pthread_mutex_t g_wire_lock = PTHREAD_MUTEX_INITIALIZER;
 #define ODL_DMABUF_CTRL_SID      250
 #define ODL_DMABUF_MAGIC         0x4F444C44U  /* "ODLD" */
 #define ODL_DMABUF_KIND_READY    1
+/* How long the control reader waits for the matching isend after a
+ * READY before giving up on it.  The legit race is microseconds; the
+ * bound exists so a retried READY for a comm whose sender already gave
+ * up cannot stall the single reader (and every other comm's TX) for
+ * the life of the process. */
+#define ODL_DMABUF_READY_WAIT_S  10
 struct odl_dmabuf_msg {
 	uint32_t magic;
 	uint32_t kind;
@@ -755,9 +761,29 @@ static void *dmabuf_ctrl_reader(void *arg)
 				comm = NULL;	/* drained: nothing to do */
 				break;
 			}
-			/* READY arrived before the matching isend: wait for
-			 * it without holding any other resource. */
-			pthread_cond_wait(&g_dmabuf_cond, &g_dmabuf_mutex);
+			/* READY arrived before the matching isend: wait
+			 * briefly for it.  The wait is bounded — a retried
+			 * READY can arrive for a comm whose sender already
+			 * gave up, and an unbounded wait stalls the single
+			 * reader and every other comm's TX forever.  On
+			 * timeout the READY is dropped; the peer's retry
+			 * brings another that pairs with the fresh isend. */
+			{
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				ts.tv_sec += ODL_DMABUF_READY_WAIT_S;
+				if (pthread_cond_timedwait(
+					    &g_dmabuf_cond, &g_dmabuf_mutex,
+					    &ts) == ETIMEDOUT) {
+					pthread_mutex_unlock(&g_dmabuf_mutex);
+					DBG(2, "dmabuf ctrl: READY sid=%u "
+					    "with no pending request — "
+					    "dropped (peer will retry)",
+					    msg.sid);
+					comm = NULL;
+					break;
+				}
+			}
 		}
 		if (!comm)
 			continue;
