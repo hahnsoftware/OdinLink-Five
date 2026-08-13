@@ -1,0 +1,16 @@
+# rig.conf — dot-sourced template for the OdinLink regression gates.
+#
+# Copy to tools/gates/rig.conf and adjust.  Every KEY=VALUE here is a
+# *default*; the corresponding environment variable, when set, always
+# wins (the gates read env first).
+#
+#   ODL_PEER=root@<peer-host>       the controlled half of the rig
+#   ODL_BUILD_DIR=/root/odl/build    must hold tests/ + cli/ + lib/
+#   ODL_DEBUGFS=/sys/kernel/debug/odl_tb5/odl_tb5_0   fork-build counters
+#   ODL_MODPARAM=/sys/module/odl_tb5/parameters
+#   ODL_TRIALS=20                    default trial count for rate gates
+#   ODL_TRIAL_TIMEOUT=300            default per-trial wall clock (s)
+#   ODL_STOP_ON_FAIL=1               abort rate gate on first failure
+#   ODL_EXPECTED_PATHS=2             require 2+2 negotiated paths
+#   ODL_LINK_SPEED_GBPS=20           warn if link trains below 20 Gb/s
+#   ODL_FORK_BUILD=1                 set 0 if running origin/main (no debugfs)

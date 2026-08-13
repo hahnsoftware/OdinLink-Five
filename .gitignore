@@ -65,4 +65,8 @@ NOTES
 TODO
 *.note
 *.scratch
+
+# Local codebase knowledge graph
+.understand-anything/
+
 odl_stress
