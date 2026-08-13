@@ -106,21 +106,9 @@ struct ibv_context *odl_ibv_open_device(struct ibv_device *device)
         return NULL;
     }
 
-    /* Initialize context fields */
-    ctx->base.device        = device;
-    ctx->base.cmd_fd        = -1;
-    ctx->base.async_fd      = -1;
-
-    /*
-     * BUG16: this fd setup used to run BEFORE the block above, which then
-     * overwrote cmd_fd with -1. odl_worker_poll_fd() therefore always
-     * returned -EBADF, so the worker never waited for TX readiness and spun
-     * retrying EAGAIN forever -- no payload ever moved.
-     * Order matters: assign the fd AFTER the defaults.
-     *
-     * Non-blocking mode makes stream_send/recv return -EAGAIN instead of
-     * blocking; the worker polls POLLOUT before retrying.
-     */
+    /* Set non-blocking mode on the device fd so stream_send/recv
+     * ioctls return -EAGAIN instead of blocking. The verbs provider
+     * uses poll() + non-blocking ioctls for true async behavior. */
     int dev_fd = odl_tb5_get_fd(handle);
     if (dev_fd >= 0) {
         int flags = fcntl(dev_fd, F_GETFL, 0);
@@ -128,6 +116,11 @@ struct ibv_context *odl_ibv_open_device(struct ibv_device *device)
             fcntl(dev_fd, F_SETFL, flags | O_NONBLOCK);
         ctx->base.cmd_fd = dev_fd;
     }
+
+    /* Initialize context fields */
+    ctx->base.device        = device;
+    ctx->base.cmd_fd        = -1;
+    ctx->base.async_fd      = -1;
     ctx->base.num_comp_vectors = 1;
     ctx->dev                = odl_dev;
     ctx->handle             = handle;
@@ -136,6 +129,11 @@ struct ibv_context *odl_ibv_open_device(struct ibv_device *device)
     pthread_mutex_init(&ctx->mr_lock, NULL);
     pthread_mutex_init(&ctx->cq_lock, NULL);
     pthread_mutex_init(&ctx->qp_lock, NULL);
+
+    /* Seed the MR key sequence from the ASLR-randomized context address so
+     * the rkey/lkey an app hands to a peer is not a pointer (V7: no ASLR
+     * leak, no low-bit rkey collisions). */
+    ctx->mr_seq = ((uint32_t)((uintptr_t)ctx >> 3)) ^ 0x9e3779b9u;
 
     /* Initialize the ops table that libibverbs dispatches to */
     odl_init_context_ops(&ctx->base);
@@ -171,7 +169,7 @@ int odl_query_device_ex(struct ibv_context *context,
 
     attr->orig_attr.phys_port_cnt    = 1;
     attr->orig_attr.max_qp           = ODL_VERBS_MAX_QPS;
-    attr->orig_attr.max_qp_wr        = ODL_VERBS_SQ_DEPTH_MAX;
+    attr->orig_attr.max_qp_wr        = ODL_VERBS_SQ_DEPTH;
     attr->orig_attr.max_sge          = 1;
     attr->orig_attr.max_sge_rd       = 1;
     attr->orig_attr.max_cq           = ODL_VERBS_MAX_CQS;
@@ -221,12 +219,14 @@ int odl_query_port(struct ibv_context *context, uint8_t port_num,
     attr->sm_sl          = 0;
     attr->subnet_timeout = 0;
     attr->init_type_reply = 0;
+    attr->max_vl_num     = 1;
+    attr->link_layer    = IBV_LINK_LAYER_INFINIBAND;
 
     if (connected) {
         attr->state        = IBV_PORT_ACTIVE;
         attr->phys_state   = 5;
-        attr->active_width = IBV_WIDTH_4X;
-        attr->active_speed = IBV_SPEED_EDR;
+        attr->active_width = IBV_WIDTH_2X;
+        attr->active_speed = IBV_SPEED_QDR;
     } else {
         attr->state        = IBV_PORT_DOWN;
         attr->phys_state   = 3;

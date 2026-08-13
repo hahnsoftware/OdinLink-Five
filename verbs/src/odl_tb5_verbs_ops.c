@@ -20,27 +20,27 @@
 /* The struct _compat_ibv_port_attr definition from rdma-core:
  * Same layout as ibv_port_attr but used for the legacy dispatch path. */
 struct _compat_ibv_port_attr {
-	enum ibv_port_state	state;
-	enum ibv_mtu		max_mtu;
-	enum ibv_mtu		active_mtu;
-	int			phys_state;
-	/*
-	 * ibv_query_port() on the context's ops may fill in _compat fields
-	 * only. In that case gid_tbl_len, port_cap_flags, and max_msg_sz
-	 * are set to zero.
-	 */
-	uint16_t		gid_tbl_len;
-	uint32_t		port_cap_flags;
-	uint32_t		max_msg_sz;
-	uint16_t		bad_pkey_cnt;
-	uint16_t		qkey_viol_cnt;
-	uint16_t		pkey_tbl_len;
-	uint32_t		lid;
-	uint32_t		sm_lid;
-	uint8_t			lmc;
-	uint8_t			sm_sl;
-	uint8_t			subnet_timeout;
-	uint8_t			init_type_reply;
+    enum ibv_port_state state;
+    enum ibv_mtu max_mtu;
+    enum ibv_mtu active_mtu;
+    int gid_tbl_len;
+    uint32_t port_cap_flags;
+    uint32_t max_msg_sz;
+    uint32_t bad_pkey_cntr;
+    uint32_t qkey_viol_cntr;
+    uint16_t pkey_tbl_len;
+    uint16_t lid;
+    uint16_t sm_lid;
+    uint8_t lmc;
+    uint8_t max_vl_num;
+    uint8_t sm_sl;
+    uint8_t subnet_timeout;
+    uint8_t init_type_reply;
+    uint8_t active_width;
+    uint8_t active_speed;
+    uint8_t phys_state;
+    uint8_t link_layer;
+    uint8_t flags;
 };
 
 /* ── Legacy compat: ibv_query_device (via _compat_query_device) ─────── */
@@ -54,13 +54,20 @@ static int odl_compat_query_device(struct ibv_context *context,
     memset(attr, 0, sizeof(*attr));
     attr->phys_port_cnt    = 1;
     attr->max_qp           = ODL_VERBS_MAX_QPS;
-    attr->max_qp_wr        = ODL_VERBS_SQ_DEPTH_MAX;
+    attr->max_qp_wr        = ODL_VERBS_SQ_DEPTH;
     attr->max_sge          = 1;
     attr->max_cq           = ODL_VERBS_MAX_CQS;
-    attr->max_cqe          = ODL_VERBS_COMP_CHANNEL_MAX - 1;
+    attr->max_cqe          = ODL_VERBS_COMP_CHANNEL_BACKLOG;
     attr->max_mr           = ODL_VERBS_MAX_MRS;
     attr->max_pd           = ODL_VERBS_MAX_PDS;
     attr->max_mr_size      = SIZE_MAX;
+    /* One-sided ops are emulated over the stream transport (see qp.c).  Report
+     * outstanding-read/atomic depth so ib_read_bw and RCCL negotiate a
+     * non-zero max_rd_atomic instead of refusing RDMA READ. */
+    attr->max_qp_rd_atom      = 16;
+    attr->max_qp_init_rd_atom = 16;
+    attr->max_res_rd_atom     = ODL_VERBS_MAX_QPS * 16;
+    attr->device_cap_flags    = IBV_DEVICE_RC_RNR_NAK_GEN;
 
     ODL_TRACE_EXIT_VAL(0);
 }
@@ -87,8 +94,8 @@ static int odl_compat_query_port(struct ibv_context *context,
     attr->gid_tbl_len   = 1;
     attr->port_cap_flags = IBV_PORT_CM_SUP;
     attr->max_msg_sz    = 1 << 20;
-    attr->bad_pkey_cnt  = 0;
-    attr->qkey_viol_cnt = 0;
+    attr->bad_pkey_cntr  = 0;
+    attr->qkey_viol_cntr = 0;
     attr->pkey_tbl_len  = 0;
     attr->lid           = 0;
     attr->sm_lid        = 0;
@@ -96,6 +103,10 @@ static int odl_compat_query_port(struct ibv_context *context,
     attr->sm_sl         = 0;
     attr->subnet_timeout = 0;
     attr->init_type_reply = 0;
+    attr->max_vl_num    = 1;
+    attr->active_width = IBV_WIDTH_2X;
+    attr->active_speed = IBV_SPEED_QDR;
+    attr->link_layer   = IBV_LINK_LAYER_INFINIBAND;
 
     if (connected) {
         attr->state        = IBV_PORT_ACTIVE;
@@ -261,6 +272,85 @@ int ibv_dereg_mr(struct ibv_mr *mr)
     return real_fn ? real_fn(mr) : -ENOSYS;
 }
 
+/* Modern <infiniband/verbs.h> expands ibv_reg_mr(...) to a call to
+ * ibv_reg_mr_iova2(), so a caller compiled against current rdma-core (e.g.
+ * perftest) never reaches our ibv_reg_mr symbol above — it lands here.
+ * Route odl PDs to the same odl_reg_mr; forward everything else. */
+struct ibv_mr *ibv_reg_mr_iova2(struct ibv_pd *pd, void *addr, size_t length,
+                                uint64_t iova, unsigned int access)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_pd(pd))
+        return odl_reg_mr(pd, addr, length, iova, (int)access);
+    static struct ibv_mr *(*real_fn)(struct ibv_pd *, void *, size_t,
+                                     uint64_t, unsigned int);
+    if (!real_fn) { real_fn = dlsym(RTLD_NEXT, "ibv_reg_mr_iova2"); }
+    return real_fn ? real_fn(pd, addr, length, iova, access) : NULL;
+}
+
+/* ── ibv_reg_dmabuf_mr ──────────────────────────────────────────────────
+ * The zero-copy GPU path (RCCL, and any app registering GPU/dma_heap memory)
+ * registers through ibv_reg_dmabuf_mr, a real libibverbs symbol that would
+ * otherwise dispatch through the verbs_context our standalone lib doesn't wrap
+ * (garbage/EOPNOTSUPP on our fake context — same reason ibv_reg_mr_iova2 is
+ * interposed).  Route odl PDs to odl_reg_dmabuf_mr (mr_type=1, zero-copy send
+ * AND recv); forward everything else. */
+struct ibv_mr *ibv_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
+                                 size_t length, uint64_t iova,
+                                 int fd, int access)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_pd(pd))
+        return odl_reg_dmabuf_mr(pd, offset, length, iova, fd, access);
+    static struct ibv_mr *(*real_fn)(struct ibv_pd *, uint64_t, size_t,
+                                     uint64_t, int, int);
+    if (!real_fn) { real_fn = dlsym(RTLD_NEXT, "ibv_reg_dmabuf_mr"); }
+    return real_fn ? real_fn(pd, offset, length, iova, fd, access) : NULL;
+}
+
+/* ── ibv_query_gid ──────────────────────────────────────────────────────
+ * perftest queries the local GID to build its connection address vector.
+ * We have no real GID table; return an all-zero GID (consistent with the
+ * zero LID/GID query_port reports) so the standard tool can proceed instead
+ * of falling through to real libibverbs on our synthetic context. */
+int ibv_query_gid(struct ibv_context *context, uint8_t port_num,
+                  int index, union ibv_gid *gid)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_ctx(context)) {
+        if (gid)
+            memset(gid, 0, sizeof(*gid));
+        return 0;
+    }
+    int (*real_fn)(struct ibv_context *, uint8_t, int, union ibv_gid *) =
+        resolve_verbs_func("ibv_query_gid");
+    return real_fn ? real_fn(context, port_num, index, gid) : -ENOSYS;
+}
+
+/* Current rdma-core users prefer ibv_query_gid_ex() because it returns the
+ * address and its type in one call.  A synthetic OdinLink context has no
+ * rdma-core-internal GID table, so letting this fall through to libibverbs
+ * dereferences state that does not exist. */
+int _ibv_query_gid_ex(struct ibv_context *context, uint32_t port_num,
+                      uint32_t gid_index, struct ibv_gid_entry *entry,
+                      uint32_t flags, size_t entry_size)
+{
+    ODL_TRACE_ENTRY();
+    if (is_odl_ctx(context)) {
+        if (!entry || port_num != 1 || gid_index != 0 || flags != 0 ||
+            entry_size < sizeof(*entry))
+            return EINVAL;
+        memset(entry, 0, sizeof(*entry));
+        entry->gid_type = IBV_GID_TYPE_IB;
+        return 0;
+    }
+    int (*real_fn)(struct ibv_context *, uint32_t, uint32_t,
+                   struct ibv_gid_entry *, uint32_t, size_t) =
+        resolve_verbs_func("_ibv_query_gid_ex");
+    return real_fn ? real_fn(context, port_num, gid_index, entry, flags,
+                             entry_size)
+                   : ENOSYS;
+}
 /* ── ibv_create_cq / ibv_destroy_cq ─────────────────────────────────── */
 
 struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
@@ -326,6 +416,109 @@ int ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
         return odl_query_qp(qp, attr, attr_mask, init_attr);
     int (*real_fn)(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *) = resolve_verbs_func("ibv_query_qp");
     return real_fn ? real_fn(qp, attr, attr_mask, init_attr) : -ENOSYS;
+}
+
+/* RCCL resolves these calls directly from its dlopen() handle instead of
+ * using the process-wide symbol table. Export thin versions here so that
+ * handle contains the complete verbs surface RCCL checks at startup. */
+#undef ibv_poll_cq
+#undef ibv_post_send
+#undef ibv_post_recv
+
+int odl_ibv_poll_cq_export(struct ibv_cq *cq, int num_entries,
+                           struct ibv_wc *wc) __asm__("ibv_poll_cq");
+int odl_ibv_post_send_export(struct ibv_qp *qp, struct ibv_send_wr *wr,
+                             struct ibv_send_wr **bad_wr)
+    __asm__("ibv_post_send");
+int odl_ibv_post_recv_export(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+                             struct ibv_recv_wr **bad_wr)
+    __asm__("ibv_post_recv");
+
+const char *ibv_get_device_name(struct ibv_device *device)
+{
+    return device ? device->name : NULL;
+}
+
+int odl_ibv_poll_cq_export(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
+{
+    if (is_odl_cq(cq))
+        return odl_poll_cq(cq, num_entries, wc);
+    int (*real_fn)(struct ibv_cq *, int, struct ibv_wc *) =
+        resolve_verbs_func("ibv_poll_cq");
+    return real_fn ? real_fn(cq, num_entries, wc) : -ENOSYS;
+}
+
+int odl_ibv_post_send_export(struct ibv_qp *qp, struct ibv_send_wr *wr,
+                  struct ibv_send_wr **bad_wr)
+{
+    if (is_odl_qp(qp))
+        return odl_post_send(qp, wr, bad_wr);
+    int (*real_fn)(struct ibv_qp *, struct ibv_send_wr *,
+                   struct ibv_send_wr **) =
+        resolve_verbs_func("ibv_post_send");
+    return real_fn ? real_fn(qp, wr, bad_wr) : ENOSYS;
+}
+
+int odl_ibv_post_recv_export(struct ibv_qp *qp, struct ibv_recv_wr *wr,
+                  struct ibv_recv_wr **bad_wr)
+{
+    if (is_odl_qp(qp))
+        return odl_post_recv(qp, wr, bad_wr);
+    int (*real_fn)(struct ibv_qp *, struct ibv_recv_wr *,
+                   struct ibv_recv_wr **) =
+        resolve_verbs_func("ibv_post_recv");
+    return real_fn ? real_fn(qp, wr, bad_wr) : ENOSYS;
+}
+
+int ibv_get_async_event(struct ibv_context *context,
+                        struct ibv_async_event *event)
+{
+    if (is_odl_ctx(context)) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    int (*real_fn)(struct ibv_context *, struct ibv_async_event *) =
+        resolve_verbs_func("ibv_get_async_event");
+    return real_fn ? real_fn(context, event) : -1;
+}
+
+void ibv_ack_async_event(struct ibv_async_event *event)
+{
+    void (*real_fn)(struct ibv_async_event *) =
+        resolve_verbs_func("ibv_ack_async_event");
+    if (real_fn)
+        real_fn(event);
+}
+
+int ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece)
+{
+    if (is_odl_qp(qp))
+        return EOPNOTSUPP;
+    int (*real_fn)(struct ibv_qp *, struct ibv_ece *) =
+        resolve_verbs_func("ibv_query_ece");
+    return real_fn ? real_fn(qp, ece) : EOPNOTSUPP;
+}
+
+int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
+{
+    if (is_odl_qp(qp))
+        return EOPNOTSUPP;
+    int (*real_fn)(struct ibv_qp *, struct ibv_ece *) =
+        resolve_verbs_func("ibv_set_ece");
+    return real_fn ? real_fn(qp, ece) : EOPNOTSUPP;
+}
+
+int ibv_fork_init(void)
+{
+    int (*real_fn)(void) = resolve_verbs_func("ibv_fork_init");
+    return real_fn ? real_fn() : ENOSYS;
+}
+
+const char *ibv_event_type_str(enum ibv_event_type event)
+{
+    const char *(*real_fn)(enum ibv_event_type) =
+        resolve_verbs_func("ibv_event_type_str");
+    return real_fn ? real_fn(event) : "unknown";
 }
 
 /* ── Context Ops Table ─────────────────────────────────────────────── */

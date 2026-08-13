@@ -18,6 +18,24 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Allocate a non-zero, process-unique MR key (V7).  Keys are no longer derived
+ * from the MR pointer, so a peer learning an rkey cannot infer our address
+ * space layout, and distinct MRs cannot collide on low pointer bits.  With at
+ * most ODL_VERBS_MAX_MRS live MRs and a 32-bit counter, wrap is impossible in
+ * practice, so no in-use collision check is needed. */
+static uint32_t odl_alloc_mr_handle(struct odl_verbs_context *ctx)
+{
+	uint32_t h;
+
+	pthread_mutex_lock(&ctx->mr_lock);
+	h = ctx->mr_seq + 1;
+	if (h == 0)
+		h = 1;
+	ctx->mr_seq = h;
+	pthread_mutex_unlock(&ctx->mr_lock);
+	return h;
+}
+
 struct ibv_mr *odl_reg_mr(struct ibv_pd *pd, void *addr,
                            size_t length, uint64_t hca_va,
                            int access)
@@ -31,8 +49,11 @@ struct ibv_mr *odl_reg_mr(struct ibv_pd *pd, void *addr,
     mr->base.addr    = addr;
     mr->base.length  = length;
     mr->base.handle  = 0;
-    mr->base.lkey    = 0;
-    mr->base.rkey    = 0;
+    /* Unique, non-zero key (V7): monotonic handle, not a pointer.  RDMA
+     * WRITE/READ carry this rkey on the wire and the responder reverse-maps it
+     * (odl_find_mr_by_rkey) to find where remote_addr lands. */
+    mr->base.lkey    = odl_alloc_mr_handle(ctx);
+    mr->base.rkey    = mr->base.lkey;
     mr->base.context = pd->context;
     mr->mr_type      = 0; /* host */
     mr->access_flags = access;
@@ -86,8 +107,8 @@ struct ibv_mr *odl_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
     mr->host_addr        = NULL;
     mr->host_length      = 0;
 
-    /* Use a unique handle for lookup during send/recv */
-    mr->base.lkey = (uint32_t)(uintptr_t)mr;
+    /* Unique, non-zero key (V7): monotonic handle, not a pointer. */
+    mr->base.lkey = odl_alloc_mr_handle(ctx);
     mr->base.rkey = mr->base.lkey;
 
     pthread_mutex_lock(&ctx->mr_lock);
@@ -107,6 +128,25 @@ struct ibv_mr *odl_reg_dmabuf_mr(struct ibv_pd *pd, uint64_t offset,
                  (unsigned long long)iova, mr->base.lkey);
     ODL_TRACE_EXIT();
     return &mr->base;
+}
+
+/* Find a local MR by the rkey a remote peer advertised.  Both host and dmabuf
+ * MRs set base.rkey == base.lkey == (uint32_t)(uintptr_t)mr, so this doubles as
+ * the send-side lkey lookup used to pick host vs. zero-copy dmabuf. */
+struct odl_verbs_mr *odl_find_mr_by_rkey(struct odl_verbs_context *ctx,
+                                         uint32_t rkey)
+{
+    if (!rkey) return NULL;
+    pthread_mutex_lock(&ctx->mr_lock);
+    for (int i = 0; i < ctx->nmrs; i++) {
+        struct odl_verbs_mr *mr = ctx->mrs[i];
+        if (mr && (mr->base.rkey == rkey || mr->base.lkey == rkey)) {
+            pthread_mutex_unlock(&ctx->mr_lock);
+            return mr;
+        }
+    }
+    pthread_mutex_unlock(&ctx->mr_lock);
+    return NULL;
 }
 
 int odl_dereg_mr(struct ibv_mr *mr)

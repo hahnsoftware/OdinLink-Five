@@ -50,12 +50,15 @@ set(VERBS_LIBS
 
 add_library(odl_tb5_verbs SHARED
     ${VERBS_CORE_SOURCES}
-    src/odl_tb5_verbs_discovery.c
     src/odl_tb5_verbs_main.c
 )
 
 target_include_directories(odl_tb5_verbs PRIVATE ${VERBS_PRIVATE_INCLUDES})
 target_link_libraries(odl_tb5_verbs ${VERBS_LIBS})
+set_property(TARGET odl_tb5_verbs APPEND_STRING PROPERTY LINK_FLAGS
+    " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/odl_tb5_verbs.map")
+set_property(TARGET odl_tb5_verbs APPEND PROPERTY LINK_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/odl_tb5_verbs.map)
 
 set_target_properties(odl_tb5_verbs PROPERTIES
     VERSION    0.1.0
@@ -68,6 +71,21 @@ install(TARGETS odl_tb5_verbs
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     COMPONENT verbs
 )
+
+# RCCL/NCCL resolve verbs from a private dlopen() handle, which bypasses
+# ordinary symbol preloading. This bridge redirects that one load to
+# the standalone OdinLink provider while keeping the standard NET/IB path.
+add_library(odl_tb5_verbs_dlopen_bridge SHARED
+    src/odl_tb5_verbs_dlopen_bridge.c)
+target_link_libraries(odl_tb5_verbs_dlopen_bridge dl pthread)
+set_target_properties(odl_tb5_verbs_dlopen_bridge PROPERTIES
+    VERSION 0.1.0
+    SOVERSION 0
+    INSTALL_RPATH "${CMAKE_INSTALL_LIBDIR}"
+    BUILD_WITH_INSTALL_RPATH ON)
+install(TARGETS odl_tb5_verbs_dlopen_bridge
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    COMPONENT verbs)
 
 # ═══════════════════════════════════════════════════════════════════════
 # 2. rdma-core provider plugin — registered with libibverbs

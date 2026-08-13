@@ -39,22 +39,22 @@
 #ifndef IBV_SPEED_SDR
 #define IBV_SPEED_SDR      1
 #define IBV_SPEED_DDR      2
-#define IBV_SPEED_QDR      3
-#define IBV_SPEED_FDR10   4
-#define IBV_SPEED_FDR     5
-#define IBV_SPEED_EDR     6
-#define IBV_SPEED_HDR     7
-#define IBV_SPEED_NDR     8
+#define IBV_SPEED_QDR      4
+#define IBV_SPEED_FDR10    8
+#define IBV_SPEED_FDR     16
+#define IBV_SPEED_EDR     32
+#define IBV_SPEED_HDR     64
+#define IBV_SPEED_NDR    128
 #define IBV_SPEED_EDR_EX  9
 #define IBV_SPEED_NDR_EX 10
 #endif
 
 #ifndef IBV_WIDTH_1X
 #define IBV_WIDTH_1X      1
-#define IBV_WIDTH_2X      2
-#define IBV_WIDTH_4X      4
-#define IBV_WIDTH_8X      8
-#define IBV_WIDTH_12X    12
+#define IBV_WIDTH_2X     16
+#define IBV_WIDTH_4X      2
+#define IBV_WIDTH_8X      4
+#define IBV_WIDTH_12X     8
 #endif
 
 /* ── Constants ──────────────────────────────────────────────────────── */
@@ -64,22 +64,101 @@
 #define ODL_VERBS_MAX_MRS               512
 #define ODL_VERBS_MAX_QPS               256
 #define ODL_VERBS_MAX_CQS               128
-#define ODL_VERBS_RQ_DEPTH              256
-/* Yield-spin iterations before the RX worker sleeps. ~2000 sched_yield()s is
- * a few hundred microseconds of grace after the last completion, which covers
- * the inter-message gaps of a busy transfer without burning a core on an idle
- * link. */
-#define ODL_VERBS_RX_SPIN_ITERS         2000
-/* Max payload sent inline from the caller's thread. One frame's worth: big
- * enough for RPC control traffic and RCCL's small collectives (the latency
- * cases), small enough that the copy_from_user cost stays under a microsecond
- * and bulk transfers still go through the worker's pipelined path. */
-#define ODL_VERBS_INLINE_MAX            4096
-#define ODL_VERBS_COMP_CHANNEL_BACKLOG   64      /* floor, not the cap */
-#define ODL_VERBS_COMP_CHANNEL_MAX       65536   /* sanity ceiling */
-#define ODL_VERBS_SQ_DEPTH_MIN          64      /* floor, not the cap */
-#define ODL_VERBS_SQ_DEPTH_MAX          65535   /* sane allocation ceiling */
+/* Completion-ring depth.  odl_cq_post drops (and only logs) completions when
+ * this fills — a dropped WC hangs the app forever — so it must comfortably
+ * exceed the largest CQ an app creates (perftest bw uses tx_depth up to 128
+ * per QP, ×N QPs sharing one CQ).  64 was far too small under load. */
+#define ODL_VERBS_COMP_CHANNEL_BACKLOG   4096
+#define ODL_VERBS_SQ_DEPTH              64
+#define ODL_VERBS_RQ_DEPTH              512
 
+/* ── One-sided RDMA emulation over the stream transport ─────────────────
+ *
+ * The NHI stream transport is two-sided (SEND/RECV) and has no notion of a
+ * remote address.  To carry RDMA WRITE/READ — which RCCL/NCCL's IB net
+ * transport and ib_write_bw/ib_read_bw require — we layer a tiny operation
+ * header on top of every stream message.  Because the transport preserves
+ * message boundaries (1 stream_send == 1 stream_recv), each verb becomes:
+ *
+ *     [ odl_rdma_hdr ]                 (one small message)
+ *     [ payload ]                      (a second message, if length > 0)
+ *
+ * The responder's recv worker reads the header FIRST (no posted receive
+ * needed — one-sided ops are passive on the target) and dispatches:
+ *   WRITE      → look up local MR by rkey, place payload at remote_addr
+ *   WRITE_IMM  → as WRITE, plus consume an RQ WR and post RECV_RDMA_WITH_IMM
+ *   READ_REQ   → look up local MR by rkey, send READ_RESP + payload back
+ *   READ_RESP  → match read_id, place payload in the initiator's buffer,
+ *                complete the pending IBV_WR_RDMA_READ
+ *   SEND       → consume an RQ WR, place payload, post IBV_WC_RECV
+ *
+ * Both ends run this provider, so the framing is private and self-consistent.
+ * Header fields are little-endian native (both test boxes are x86_64). */
+
+#define ODL_RDMA_MAGIC 0x314c444fu /* "ODL1" */
+
+enum odl_rdma_op {
+    ODL_OP_SEND      = 1,
+    ODL_OP_WRITE     = 2,
+    ODL_OP_WRITE_IMM = 3,
+    ODL_OP_READ_REQ  = 4,
+    ODL_OP_READ_RESP = 5,
+};
+
+struct odl_rdma_hdr {
+    uint32_t magic;        /* ODL_RDMA_MAGIC */
+    uint32_t op;           /* enum odl_rdma_op */
+    uint32_t length;       /* payload byte count (0 => no payload message) */
+    uint32_t imm_data;     /* immediate for WRITE_WITH_IMM */
+    uint64_t remote_addr;  /* target VA (WRITE / READ_REQ) */
+    uint32_t rkey;         /* target MR key (WRITE / READ_REQ) */
+    uint32_t _pad;
+    uint64_t read_id;      /* matches READ_RESP to a pending READ WR */
+};
+
+/* Internal TX work descriptor.  post_send copies the app WR's fields here
+ * (so the app may reuse its ibv_send_wr immediately, per the verbs spec), and
+ * the recv worker enqueues READ_RESP descriptors here too — keeping ALL stream
+ * TX on the single send worker, which serialises the [hdr][payload] pair. */
+struct odl_tx_desc {
+    uint32_t              op;          /* enum odl_rdma_op */
+    uint64_t              wr_id;
+    struct odl_verbs_cq  *cq;          /* local completion target (NULL = none) */
+    int                   wc_opcode;   /* enum ibv_wc_opcode for completion */
+    bool                  signaled;    /* post a completion when done */
+    /* Payload source */
+    int                   dmabuf_fd;   /* >= 0 => zero-copy GPU source */
+    uint64_t              dmabuf_offset;
+    void                 *host_addr;   /* host payload source */
+    uint32_t              length;
+    bool                  free_host;   /* free host_addr after send (READ_RESP) */
+    /* Wire header */
+    uint32_t              rkey;
+    uint64_t              remote_addr;
+    uint32_t              imm_data;
+    uint64_t              read_id;
+};
+
+/* Outstanding RDMA READ awaiting its READ_RESP (FIFO per QP). */
+struct odl_read_pending {
+    uint64_t              read_id;
+    uint64_t              wr_id;
+    struct odl_verbs_cq  *cq;
+    bool                  signaled;
+    /* Local destination */
+    int                   dmabuf_fd;   /* >= 0 => zero-copy GPU dest */
+    uint64_t              dmabuf_offset;
+    void                 *host_addr;
+    uint32_t              length;
+};
+
+/* Owned copy of one posted receive. Applications may reuse the ibv_recv_wr
+ * and ibv_sge immediately after ibv_post_recv returns. */
+struct odl_recv_desc {
+    uint64_t              wr_id;
+    struct ibv_sge        sge;
+    int                   num_sge;
+};
 /* ── Forward declarations ───────────────────────────────────────────── */
 
 struct odl_verbs_context;
@@ -130,41 +209,17 @@ struct odl_verbs_cq {
     pthread_mutex_t           lock;
     uint32_t                  cq_handle;
 
-    /* Completion ring buffer.
-     *
-     * Sized from the cqe the caller asked ibv_create_cq for, NOT a fixed
-     * constant. It used to be ring[ODL_VERBS_COMP_CHANNEL_BACKLOG] (=64, so 63
-     * usable) while base.cqe reported back whatever was requested - the
-     * provider advertised a depth it did not have. ds4 asks for 512 and a bulk
-     * round can post 65 completions (64 recv + 1 signalled send); odl_cq_post
-     * drops on overflow, so the consumer waits forever for a completion that
-     * was discarded. */
-    struct ibv_wc            *ring;
-    int                       ring_cap;
+    /* Completion ring buffer */
+    struct ibv_wc             ring[ODL_VERBS_COMP_CHANNEL_BACKLOG];
     int                       head;
     int                       tail;
 
     /* Eventfd for async notification */
     int                       eventfd_fd;
     bool                      armed;
-
-    /* QP whose receive queue feeds this CQ. ibv_poll_cq() must drive receive
-     * progress: the QP worker also performs sends and can sit in its TX
-     * readiness poll, during which nothing would drain RX and both peers
-     * stall waiting on each other. */
-    struct odl_verbs_qp      *rx_qp;
 };
 
 /* ── Queue Pair ─────────────────────────────────────────────────────── */
-
-struct odl_verbs_send_entry {
-    uint64_t wr_id;
-    uint64_t addr;
-    uint32_t len;
-    uint32_t lkey;
-    int      num_sge;
-    void    *bounce;
-};
 
 struct odl_verbs_qp {
     struct ibv_qp             base;
@@ -172,69 +227,44 @@ struct odl_verbs_qp {
     struct odl_verbs_pd      *pd;
     struct odl_verbs_cq      *send_cq;
     struct odl_verbs_cq      *recv_cq;
-    /*
-     * TWO streams per QP, one per direction. A stream is a unidirectional
-     * pipe: the RCCL plugin (the only consumer known to work) opens a
-     * separate stream for send and for recv and never shares one. Using a
-     * single stream for both directions deadlocks bidirectional traffic
-     * immediately -- reproduced with odl_rdma_stress --bidir, both peers
-     * stall on message 1.
-     *
-     * rx_stream_id is what we advertise as qp_num, so the peer's
-     * IBV_QP_DEST_QPN names the stream it should deliver to.
-     */
-    uint8_t                   stream_id;      /* == rx_stream_id, receive on */
-    uint8_t                   tx_stream_id;   /* send from */
-    /* BUG15: remote stream to address sends at, taken from
-     * ibv_modify_qp(IBV_QP_DEST_QPN) at the RTR transition. Without this the
-     * worker sent everything to dst_id 0 and nothing reached the peer. */
-    uint8_t                   dest_qp;
+    uint8_t                   stream_id;      /* local stream (== qp_num) */
+    uint8_t                   dest_stream_id; /* peer stream, from modify_qp
+                                               * dest_qp_num at RTR */
 
-    /* Work submission queue (async via worker thread) */
+    /* Work submission queue (async via worker thread).  Holds internal
+     * descriptors copied from the app WR (or synthesised for READ_RESP), so
+     * the app may reuse its ibv_send_wr the moment post_send returns. */
     pthread_mutex_t           sq_lock;
-    /* BUG14: callers pass stack-allocated ibv_send_wr/ibv_sge and expect
-     * post_send to return immediately, so the worker must never dereference
-     * the caller's pointers. Store copies of the fields we need. */
-    struct odl_verbs_send_entry *sq;
-    int                       sq_depth;
-    /* ibv_post_send() is defined to consume the payload before returning, so
-     * callers reuse their send buffer immediately. odl_tb5_stream_send() only
-     * QUEUES the data, so by the time the worker DMAs it the caller has
-     * usually overwritten it -- silent corruption. Take a private copy at post
-     * time and transmit from that. */
-    /* True while the worker is trying the request at the queue head. Guarded
-     * by sq_lock; it also prevents the inline path from overtaking that send. */
-    bool                      tx_inflight;
+    pthread_cond_t            sq_cond;       /* signalled on SQ enqueue */
+    struct odl_tx_desc        sq[ODL_VERBS_SQ_DEPTH];
     int                       sq_head;
     int                       sq_tail;
     int                       sq_count;
 
-    /* Worker threads: TX and RX are independent, like a real HCA. A single
-     * thread serving both directions deadlocks bidirectional traffic - it
-     * blocks in the TX readiness poll and stops draining RX, so neither peer
-     * can drain the other and both stall. */
-    pthread_t                 worker;
-    pthread_t                 rx_worker;
-    bool                      worker_running;
-    bool                      rx_worker_running;
+    /* Outstanding RDMA READs awaiting their READ_RESP (FIFO). */
+    pthread_mutex_t           rp_lock;
+    struct odl_read_pending   rp[ODL_VERBS_SQ_DEPTH];
+    int                       rp_head;
+    int                       rp_tail;
+    int                       rp_count;
+    atomic_uint_least64_t     read_id_next;
 
-    /* Receive queue: buffers posted by the app, awaiting inbound data.
-     * ibv_post_recv() must NOT block or touch the wire -- it only enqueues.
-     * The worker thread drains the stream into these buffers and posts the
-     * completions. Callers pass stack-allocated ibv_recv_wr/ibv_sge, so we
-     * store COPIES, never the caller's pointers. */
+    /* Receive queue: post_recv copies posted buffers here and returns
+     * immediately (RDMA semantics); the worker drains them into arriving
+     * stream data and posts IBV_WC_RECV completions. */
     pthread_mutex_t           rq_lock;
-    /* Serialises odl_rq_drain(): it is now called from BOTH the QP worker and
-     * the application's ibv_poll_cq() thread, and it must release rq_lock
-     * around stream_recv(). Without exclusion two drainers interleave their
-     * receives and deliver messages out of order, corrupting the stream. */
-    pthread_mutex_t           drain_lock;
-    uint64_t                  rq_wr_id[ODL_VERBS_RQ_DEPTH];
-    uint64_t                  rq_addr[ODL_VERBS_RQ_DEPTH];
-    uint32_t                  rq_len[ODL_VERBS_RQ_DEPTH];
+    struct odl_recv_desc      rq[ODL_VERBS_RQ_DEPTH];
     int                       rq_head;
     int                       rq_tail;
     int                       rq_count;
+
+    /* Worker threads.  Send and receive run on separate threads so a
+     * blocking zero-copy dmabuf recv (odl_tb5_stream_recv_dmabuf is
+     * synchronous) can never stall a pending send the peer is waiting on. */
+    pthread_t                 worker;          /* send worker */
+    bool                      worker_running;
+    pthread_t                 recv_worker;     /* recv worker (drains RQ) */
+    bool                      recv_worker_running;
 
     /* Async tracking */
     atomic_int                pending_sends;
@@ -257,6 +287,7 @@ struct odl_verbs_context {
     pthread_mutex_t           mr_lock;
     struct odl_verbs_mr      *mrs[ODL_VERBS_MAX_MRS];
     int                       nmrs;
+    uint32_t                  mr_seq;     /* monotonic MR key source (V7) */
 
     pthread_mutex_t           cq_lock;
     struct odl_verbs_cq      *cqs[ODL_VERBS_MAX_CQS];
@@ -323,6 +354,9 @@ int odl_dealloc_pd(struct ibv_pd *);
 struct ibv_mr *odl_reg_mr(struct ibv_pd *, void *, size_t, uint64_t, int);
 struct ibv_mr *odl_reg_dmabuf_mr(struct ibv_pd *, uint64_t, size_t, uint64_t, int, int);
 int odl_dereg_mr(struct ibv_mr *);
+/* Reverse lookup for one-sided ops: find the local MR a remote peer named by
+ * rkey, so the responder can place/fetch data.  Returns NULL if unknown. */
+struct odl_verbs_mr *odl_find_mr_by_rkey(struct odl_verbs_context *, uint32_t);
 
 /* CQ */
 struct ibv_cq *odl_create_cq(struct ibv_context *, int, struct ibv_comp_channel *, int);
@@ -339,7 +373,6 @@ int odl_modify_qp(struct ibv_qp *, struct ibv_qp_attr *, int);
 int odl_query_qp(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
 int odl_post_send(struct ibv_qp *, struct ibv_send_wr *, struct ibv_send_wr **);
 int odl_post_recv(struct ibv_qp *, struct ibv_recv_wr *, struct ibv_recv_wr **);
-int odl_rq_drain(struct odl_verbs_qp *oqp);
 
 /* Ops table init */
 void odl_init_context_ops(struct ibv_context *ctx);

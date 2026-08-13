@@ -1,239 +1,632 @@
 /*
  * OdinLink — Verbs: Queue Pairs (The Actual Data Path)
  *
- * A QP (Queue Pair) is just a pair of send/receive queues — like a
- * pipe between two machines. This file maps an RDMA QP to an OdinLink
- * stream.
+ * A QP maps to an OdinLink stream.  On top of the stream's two-sided,
+ * message-framed SEND/RECV we emulate the full RC verb set — SEND/RECV,
+ * RDMA WRITE, RDMA WRITE_WITH_IMM and RDMA READ — by prefixing every message
+ * with a small odl_rdma_hdr (see odl_tb5_verbs.h).  Each verb is one header
+ * message optionally followed by one payload message; because the transport
+ * preserves message boundaries, the responder can read the header first and
+ * dispatch on the opcode.  This is the "software RDMA" pattern (à la Soft-RoCE
+ * / libfabric's socket providers): one-sided ops become a control header plus
+ * a data frame that the peer's recv worker services.
  *
- * How async I/O works here:
- * 1. ibv_post_send → enqueue the work request → return immediately
- * 2. A background worker thread polls the device fd (EPOLLOUT)
- * 3. When the hardware is ready, it tries the WR at the queue head via the
- *    kernel's stream_send ioctl (which is O_NONBLOCK)
- * 4. If the kernel says EAGAIN (busy), retain that WR at the head and poll
- *    again; remove it only after the send finishes
- * 5. On success, post a Work Completion to the CQ and wake the app
- *    via eventfd
+ * Threading:
+ *   send worker (odl_qp_worker)      — drains the SQ of odl_tx_desc, and is the
+ *                                      ONLY thread that transmits on the stream
+ *                                      (so the [hdr][payload] pair is atomic).
+ *   recv worker (odl_qp_recv_worker) — reads incoming headers and dispatches:
+ *                                      places WRITE data, answers READ_REQ by
+ *                                      enqueuing a READ_RESP onto the SQ,
+ *                                      matches READ_RESP, delivers SEND to an
+ *                                      RQ WR.  It never transmits directly.
  *
- * This gives true async I/O: the calling thread never blocks even
- * though the kernel path is synchronous under the hood.
+ * The send worker sleeps on a pthread_cond signalled by odl_post_send /
+ * sq_push, so it consumes no CPU while the SQ is empty and wakes within
+ * microseconds of a new descriptor.  The recv worker blocks on the driver's
+ * STREAM_WAIT_RX ioctl (1 ms window) instead of spinning; on the legacy
+ * driver that does not honour blocking waits on the O_NONBLOCK fd it gets
+ * -EAGAIN and falls back to the adaptive spin, so behaviour is unchanged
+ * there.  Everything else (payload drains, RQ waits, SQ back-pressure) keeps
+ * the adaptive odl_yield() backoff.
  */
-
-#include <sys/prctl.h>
-#include <sched.h>
 
 #include "odl_tb5_verbs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <poll.h>
+#include <sched.h>
+#include <time.h>
 
-/* ── Worker Thread ──────────────────────────────────────────────────── */
+/* Same on-wire geometry as driver/uapi/odl_tb5_uapi.h, copied here so the
+ * verbs provider does not pull in kernel uapi headers. */
+#define ODL_TB5_VERBS_PAYLOAD_MAX  (4096 - 1 - 5)  /* FRAME_LEN_MAX - HDR_SIZE */
 
-static int odl_worker_poll_fd(struct odl_verbs_qp *qp, int timeout_ms)
+/* Upper bound on a single message's payload we will ever try to drain on a
+ * discard.  Matches the driver's per-message cap (ODL_TB5_VERBS_PAYLOAD_MAX *
+ * 4096) so a hostile/buggy peer cannot make us block forever on a bogus length. */
+#define ODL_TB5_VERBS_MAX_MSG  (64u * 1024 * 1024)
+
+/* The recv worker blocks on STREAM_WAIT_RX; this backoff is the fallback used
+ * everywhere else (payload drains, RQ waits, SQ back-pressure, and the recv
+ * worker's degrade path on a legacy driver that does not block the wait ioctl).
+ *
+ * Two-stage adaptive backoff (P1-1): each wait loop keeps its own counter
+ * (reset to 0 when real work arrives).
+ *   Stage 1 — hot: spin with a CPU relax (pause) for ODL_YIELD_SPIN_LIMIT
+ *     iterations.  A completion normally lands within a few hundred iters, so
+ *     the core stays hot and fast completions are caught in <1 µs, with no
+ *     syscall and no 20 µs floor.
+ *   Stage 2 — warm idle: short 1 µs nanosleeps for ODL_YIELD_USPIN_LIMIT
+ *     iterations, bounding the poll loop to ~1 MHz while still catching fast
+ *     completions promptly.
+ *   Stage 3 — cold idle: a 20 µs nanosleep + sched_yield so a genuinely idle
+ *     QP stops burning a core. */
+#define ODL_YIELD_SPIN_LIMIT 4096
+#define ODL_YIELD_USPIN_LIMIT 1024
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#define odl_cpu_relax() _mm_pause()
+#else
+#define odl_cpu_relax() sched_yield()
+#endif
+static void odl_yield(unsigned *spins)
 {
-    struct odl_verbs_context *ctx = qp->ctx;
-    int dev_fd = ctx->base.cmd_fd;
-    if (dev_fd < 0) return -EBADF;
-
-    struct pollfd pfd = {
-        .fd     = dev_fd,
-        .events = POLLOUT,
-    };
-
-    int ret = poll(&pfd, 1, timeout_ms);
-    if (ret < 0) return -errno;
-    if (ret == 0) return -ETIMEDOUT;
-    return (pfd.revents & POLLOUT) ? 0 : -EAGAIN;
+	if ((*spins) < ODL_YIELD_SPIN_LIMIT) {
+		odl_cpu_relax();
+		(*spins)++;
+		return;
+	}
+	if ((*spins) < ODL_YIELD_SPIN_LIMIT + ODL_YIELD_USPIN_LIMIT) {
+		struct timespec ts = { 0, 1000 }; /* 1 µs warm nap */
+		nanosleep(&ts, NULL);
+		(*spins)++;
+		return;
+	}
+	struct timespec ts = { 0, 20000 }; /* 20 µs cold nap */
+	nanosleep(&ts, NULL);
+	sched_yield();
 }
+
+/* ── Small helpers ──────────────────────────────────────────────────── */
 
 /* Look up a dmabuf fd by lkey. Returns -1 if not a dmabuf MR. */
-int odl_lookup_dmabuf_pub(struct odl_verbs_context *ctx, uint32_t lkey);
 static int odl_lookup_dmabuf(struct odl_verbs_context *ctx, uint32_t lkey)
 {
-    if (!lkey) return -1;
-    pthread_mutex_lock(&ctx->mr_lock);
-    for (int i = 0; i < ctx->nmrs; i++) {
-        struct odl_verbs_mr *mr = ctx->mrs[i];
-        if (mr && mr->base.lkey == lkey && mr->mr_type == 1) {
-            int fd = mr->dmabuf_fd;
-            pthread_mutex_unlock(&ctx->mr_lock);
-            return fd;
-        }
-    }
-    pthread_mutex_unlock(&ctx->mr_lock);
-    return -1;
+    struct odl_verbs_mr *mr = odl_find_mr_by_rkey(ctx, lkey);
+    return (mr && mr->mr_type == 1) ? mr->dmabuf_fd : -1;
 }
 
-static void *odl_qp_rx_worker(void *arg)
+/* Transmit one stream message, retrying while the non-blocking fd is full.
+ * Only ever called from the send worker. */
+static int tx_msg(struct odl_verbs_qp *qp, const void *buf, uint32_t len)
 {
-    struct odl_verbs_qp *qp = arg;
-    int idle = 0;
-
-    /*
-     * Receive progress, independent of TX.
-     *
-     * The naive version slept 20 us whenever idle. That is a latency trap:
-     * the default timer slack is 50 us, so a 20 us nanosleep routinely sleeps
-     * ~70 us and every first message after an idle gap paid it. Two fixes:
-     *
-     *   - request 1 ns timer slack for this thread, so a short sleep is
-     *     actually short;
-     *   - spin briefly after the last completion before sleeping at all.
-     *     Traffic arrives in bursts, so the spin nearly always wins and the
-     *     sleep is reached only on a genuinely idle link.
-     *
-     * Adaptive on purpose: an unconditional spin would burn a core per QP,
-     * which is real on a 16-core part also running inference.
-     */
-#ifdef PR_SET_TIMERSLACK
-    prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
-#endif
-
-    while (qp->rx_worker_running) {
-        if (odl_rq_drain(qp) > 0) {
-            idle = 0;
-            continue;
-        }
-        if (idle < ODL_VERBS_RX_SPIN_ITERS) {
-            idle++;
-            sched_yield();          /* hot: stay on-CPU, no timer involved */
-            continue;
-        }
-        {                            /* cold: link genuinely idle */
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000 };
-            nanosleep(&ts, NULL);
-        }
+    odl_tb5_t h = qp->ctx->handle;
+    unsigned spins = 0;
+    for (;;) {
+        int ret = odl_tb5_stream_send(h, qp->stream_id,
+                                      qp->dest_stream_id, buf, len);
+        if (ret != -EAGAIN)
+            return ret;
+        if (!qp->worker_running)
+            return -EINTR;
+        odl_yield(&spins);
     }
-    return NULL;
+}
+
+static int tx_dmabuf(struct odl_verbs_qp *qp, int fd,
+                     uint64_t offset, uint32_t len)
+{
+    odl_tb5_t h = qp->ctx->handle;
+    unsigned spins = 0;
+    for (;;) {
+        int ret = odl_tb5_stream_send_dmabuf(h, qp->stream_id,
+                                             qp->dest_stream_id,
+                                             fd, offset, len);
+        if (ret != -EAGAIN)
+            return ret;
+        if (!qp->worker_running)
+            return -EINTR;
+        odl_yield(&spins);
+    }
+}
+
+/* Receive one whole stream message into buf, retrying until it arrives.
+ * Only ever called from the recv worker (after a header committed us to a
+ * payload frame that is already in flight). */
+static int rx_msg(struct odl_verbs_qp *qp, void *buf, uint32_t buf_len,
+                  uint32_t *actual)
+{
+    odl_tb5_t h = qp->ctx->handle;
+    uint8_t src = 0;
+    uint32_t act = 0;
+    unsigned spins = 0;
+    for (;;) {
+        int ret = odl_tb5_stream_recv(h, qp->stream_id, buf, buf_len,
+                                      &src, &act);
+        if (ret != -EAGAIN) {
+            if (actual) *actual = act;
+            return ret;
+        }
+        if (!qp->recv_worker_running)
+            return -EINTR;
+        odl_yield(&spins);
+    }
+}
+
+static int rx_dmabuf(struct odl_verbs_qp *qp, int fd,
+                     uint64_t offset, uint32_t len)
+{
+    odl_tb5_t h = qp->ctx->handle;
+    unsigned spins = 0;
+    for (;;) {
+        int ret = odl_tb5_stream_recv_dmabuf(h, qp->stream_id,
+                                             fd, offset, len);
+        if (ret != -EAGAIN)
+            return ret;
+        if (!qp->recv_worker_running)
+            return -EINTR;
+        odl_yield(&spins);
+    }
+}
+
+/* Consume an incoming payload message we cannot place (unknown rkey / OOB):
+ * drain it in bounded chunks so the stream stays in frame.  We never allocate
+ * more than one payload-frame buffer, so a hostile peer cannot force an
+ * unbounded malloc() (V6). */
+static void rx_discard(struct odl_verbs_qp *qp, uint32_t len)
+{
+	if (len == 0) return;
+	if (len > ODL_TB5_VERBS_MAX_MSG) {
+		odl_logerr("rx_discard: refusing absurd length %u — stream may desync",
+			   len);
+		return;
+	}
+	void *tmp = malloc(ODL_TB5_VERBS_PAYLOAD_MAX);
+	if (!tmp) {
+		odl_logerr("rx_discard: OOM draining %u bytes — stream may desync", len);
+		return;
+	}
+	uint32_t remaining = len;
+	while (remaining > 0) {
+		uint32_t chunk = (remaining > ODL_TB5_VERBS_PAYLOAD_MAX)
+				? ODL_TB5_VERBS_PAYLOAD_MAX : remaining;
+		rx_msg(qp, tmp, chunk, NULL);
+		remaining -= chunk;
+	}
+	free(tmp);
+}
+
+/* Pop the head owned RQ descriptor. */
+static bool rq_pop(struct odl_verbs_qp *qp, struct odl_recv_desc *out)
+{
+    bool found = false;
+    pthread_mutex_lock(&qp->rq_lock);
+    if (qp->rq_count > 0) {
+        *out = qp->rq[qp->rq_head];
+        qp->rq_head = (qp->rq_head + 1) % ODL_VERBS_RQ_DEPTH;
+        qp->rq_count--;
+        found = true;
+    }
+    pthread_mutex_unlock(&qp->rq_lock);
+    return found;
+}
+
+/* Wait for an RQ descriptor to be posted (RNR-style flow control). */
+static bool rq_pop_wait(struct odl_verbs_qp *qp, struct odl_recv_desc *out)
+{
+    unsigned spins = 0;
+    for (;;) {
+        if (rq_pop(qp, out)) return true;
+        if (!qp->recv_worker_running) return false;
+        odl_yield(&spins);
+    }
+}
+/* Enqueue an internal TX descriptor onto the SQ (used by the recv worker to
+ * hand a READ_RESP to the send worker).  Waits for space if the SQ is full. */
+static void sq_push(struct odl_verbs_qp *qp, const struct odl_tx_desc *d)
+{
+    unsigned spins = 0;
+    for (;;) {
+        pthread_mutex_lock(&qp->sq_lock);
+        if (qp->sq_count < ODL_VERBS_SQ_DEPTH) {
+            qp->sq[qp->sq_tail] = *d;
+            qp->sq_tail = (qp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
+            qp->sq_count++;
+            pthread_cond_signal(&qp->sq_cond);
+            pthread_mutex_unlock(&qp->sq_lock);
+            return;
+        }
+        pthread_mutex_unlock(&qp->sq_lock);
+        if (!qp->recv_worker_running) return;
+        odl_yield(&spins);
+    }
+}
+
+/* ── Send worker: drain the SQ, transmit [hdr][payload] ─────────────── */
+
+static void tx_execute(struct odl_verbs_qp *qp, struct odl_tx_desc *d)
+{
+    struct odl_rdma_hdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic       = ODL_RDMA_MAGIC;
+    hdr.op          = d->op;
+    hdr.length      = d->length;
+    hdr.imm_data    = d->imm_data;
+    hdr.remote_addr = d->remote_addr;
+    hdr.rkey        = d->rkey;
+    hdr.read_id     = d->read_id;
+
+    int ret = tx_msg(qp, &hdr, (uint32_t)sizeof(hdr));
+
+    /* Payload frame follows for everything except a READ request (whose
+     * length names the bytes to fetch, not bytes carried here). */
+    if (ret == 0 && d->length > 0 && d->op != ODL_OP_READ_REQ) {
+        if (d->dmabuf_fd >= 0)
+            ret = tx_dmabuf(qp, d->dmabuf_fd, d->dmabuf_offset, d->length);
+        else if (d->host_addr)
+            ret = tx_msg(qp, d->host_addr, d->length);
+    }
+
+    if (ret != 0 && ret != -EINTR)
+        odl_logerr("TX op=%u stream=%u dst=%u ret=%d len=%u",
+                   d->op, qp->stream_id, qp->dest_stream_id, ret, d->length);
+    else
+        odl_logverbose("TX op=%u stream=%u dst=%u ret=%d len=%u",
+                       d->op, qp->stream_id, qp->dest_stream_id, ret, d->length);
+
+    if (d->free_host && d->host_addr)
+        free(d->host_addr);
+
+    /* READ_REQ: completion is deferred until the READ_RESP lands (posted by
+     * the recv worker).  READ_RESP: internal, never completes locally. */
+    if (d->op == ODL_OP_READ_REQ || d->op == ODL_OP_READ_RESP)
+        return;
+
+    if (d->signaled && d->cq) {
+        struct ibv_wc wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.wr_id    = d->wr_id;
+        wc.qp_num   = qp->base.qp_num;
+        wc.opcode   = d->wc_opcode;
+        wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+        wc.byte_len = (ret == 0) ? d->length : 0;
+        odl_cq_post(d->cq, &wc);
+    }
+    atomic_fetch_sub(&qp->pending_sends, 1);
 }
 
 static void *odl_qp_worker(void *arg)
 {
     struct odl_verbs_qp *qp = arg;
-    struct odl_verbs_context *ctx = qp->ctx;
-    odl_tb5_t h = ctx->handle;
 
-    while (qp->worker_running) {
-        bool     have_wr = false;
-        void    *w_bounce = NULL;
-        uint64_t w_wr_id = 0, w_addr = 0;
-        uint32_t w_len = 0, w_lkey = 0;
-        int      w_num_sge = 0;
+    for (;;) {
+        struct odl_tx_desc d;
+        bool have = false;
 
-        /* Peek at one work request (copies, not caller pointers). Keep its
-         * ring slot occupied until the send finishes, so EAGAIN needs no
-         * requeue and producers cannot overwrite the request being retried. */
+        /* Sleep until the SQ has work (or shutdown).  odl_post_send and
+         * sq_push signal sq_cond under sq_lock; we check the predicate under
+         * the lock before waiting, so there is no lost wakeup. */
         pthread_mutex_lock(&qp->sq_lock);
+        while (qp->sq_count == 0 && qp->worker_running)
+            pthread_cond_wait(&qp->sq_cond, &qp->sq_lock);
+
         if (qp->sq_count > 0) {
-            struct odl_verbs_send_entry *entry = &qp->sq[qp->sq_head];
-            w_wr_id   = entry->wr_id;
-            w_addr    = entry->addr;
-            w_len     = entry->len;
-            w_lkey    = entry->lkey;
-            w_num_sge = entry->num_sge;
-            w_bounce  = entry->bounce;
-            qp->tx_inflight = true;
-            have_wr = true;
+            d = qp->sq[qp->sq_head];
+            qp->sq_head = (qp->sq_head + 1) % ODL_VERBS_SQ_DEPTH;
+            qp->sq_count--;
+            have = true;
         }
         pthread_mutex_unlock(&qp->sq_lock);
 
-        if (!have_wr) {
-            /* No send work: make receive progress, then yield briefly.
-             * The RX drain is what turns posted buffers into completions. */
-            odl_worker_poll_fd(qp, 2);
+        if (!have) {
+            /* Woken only because worker_running went false. */
+            if (!qp->worker_running)
+                break;
+            continue;
+        }
+        tx_execute(qp, &d);
+    }
+    return NULL;
+}
+
+/* ── Recv worker: read a header, service the op ─────────────────────── */
+
+/* SEND → deliver the payload into a posted RQ WR and post IBV_WC_RECV. */
+static void handle_send(struct odl_verbs_qp *qp, struct odl_rdma_hdr *hdr)
+{
+    struct odl_verbs_context *ctx = qp->ctx;
+    struct odl_recv_desc rdesc;
+    if (!rq_pop_wait(qp, &rdesc)) {
+        rx_discard(qp, hdr->length);
+        return;
+    }
+
+    struct ibv_sge *sge = (rdesc.num_sge > 0) ? &rdesc.sge : NULL;
+    int ret = 0;
+    uint32_t actual = 0;
+
+    if (sge && hdr->length > 0) {
+        /* Never write more than the consumer posted (V3).  A peer can name a
+         * larger hdr->length than the RQ SGE; clamp and drain the rest so the
+         * stream framing stays intact. */
+        uint32_t recv = (sge->length < hdr->length) ? sge->length : hdr->length;
+        if (recv == 0) {
+            rx_discard(qp, hdr->length);
+        } else {
+            int fd = odl_lookup_dmabuf(ctx, sge->lkey);
+            if (fd >= 0) {
+                ret = rx_dmabuf(qp, fd, 0, recv);
+                actual = (ret == 0) ? recv : 0;
+            } else {
+                ret = rx_msg(qp, (void *)(uintptr_t)sge->addr, recv, &actual);
+            }
+            if (hdr->length > recv) {
+                rx_discard(qp, hdr->length - recv);
+                odl_logverbose("SEND length %u exceeds posted RQ sge %u — "
+                               "truncating", hdr->length, sge->length);
+            }
+        }
+    } else if (hdr->length > 0) {
+        rx_discard(qp, hdr->length);
+    }
+
+    struct ibv_wc wc;
+    memset(&wc, 0, sizeof(wc));
+    wc.wr_id    = rdesc.wr_id;
+    wc.qp_num   = qp->base.qp_num;
+    wc.src_qp   = qp->dest_stream_id;
+    wc.opcode   = IBV_WC_RECV;
+    wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+    wc.byte_len = actual;
+    if (qp->recv_cq)
+        odl_cq_post(qp->recv_cq, &wc);
+    atomic_fetch_sub(&qp->pending_recvs, 1);
+}
+
+/* WRITE / WRITE_IMM → place the payload directly at the peer-named address. */
+static void handle_write(struct odl_verbs_qp *qp, struct odl_rdma_hdr *hdr)
+{
+    struct odl_verbs_context *ctx = qp->ctx;
+    struct odl_verbs_mr *mr = odl_find_mr_by_rkey(ctx, hdr->rkey);
+    int ret = 0;
+
+    if (hdr->length > 0) {
+        if (mr && mr->mr_type == 1) {
+            /* Zero-copy GPU dest: offset of remote_addr within the dmabuf.
+             * Validate the named range stays inside the registered MR (V1/V5). */
+            uint64_t end = hdr->remote_addr + (uint64_t)hdr->length;
+            if (hdr->remote_addr < mr->iova ||
+                end < hdr->remote_addr ||
+                end > mr->iova + mr->base.length) {
+                odl_logerr("WRITE dmabuf OOB: rkey=%08x ra=%llx len=%u "
+                           "(iova=%llx size=%zu)",
+                           hdr->rkey,
+                           (unsigned long long)hdr->remote_addr, hdr->length,
+                           (unsigned long long)mr->iova, mr->base.length);
+                rx_discard(qp, hdr->length);
+                ret = -EINVAL;
+            } else {
+                uint64_t off = hdr->remote_addr - mr->iova;
+                ret = rx_dmabuf(qp, mr->dmabuf_fd, off, hdr->length);
+            }
+        } else if (mr) {
+            /* Host dest: remote_addr must land inside the registered MR. */
+            uint64_t ra = (uint64_t)hdr->remote_addr;
+            uint64_t end = ra + (uint64_t)hdr->length;
+            uint64_t mbase = (uint64_t)(uintptr_t)mr->host_addr;
+            uint64_t mend = mbase + (uint64_t)mr->host_length;
+            if (ra < mbase || end < ra || end > mend) {
+                odl_logerr("WRITE host OOB: rkey=%08x ra=%llx len=%u "
+                           "(mr=%p..+%zu)",
+                           hdr->rkey, (unsigned long long)ra, hdr->length,
+                           mr->host_addr, mr->host_length);
+                rx_discard(qp, hdr->length);
+                ret = -EINVAL;
+            } else {
+                ret = rx_msg(qp, (void *)(uintptr_t)ra, hdr->length, NULL);
+            }
+        } else {
+            odl_logerr("WRITE to unknown rkey=%08x — discarding %u bytes",
+                       hdr->rkey, hdr->length);
+            rx_discard(qp, hdr->length);
+            ret = -EINVAL;
+        }
+    }
+
+    /* WRITE_WITH_IMM raises a receive completion carrying the immediate. */
+    if (hdr->op == ODL_OP_WRITE_IMM) {
+        struct odl_recv_desc rdesc;
+        bool have_recv = rq_pop_wait(qp, &rdesc);
+        struct ibv_wc wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.wr_id    = have_recv ? rdesc.wr_id : 0;
+        wc.qp_num   = qp->base.qp_num;
+        wc.src_qp   = qp->dest_stream_id;
+        wc.opcode   = IBV_WC_RECV_RDMA_WITH_IMM;
+        wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+        wc.byte_len = hdr->length;
+        wc.wc_flags = IBV_WC_WITH_IMM;
+        wc.imm_data = hdr->imm_data;
+        if (qp->recv_cq)
+            odl_cq_post(qp->recv_cq, &wc);
+        if (have_recv)
+            atomic_fetch_sub(&qp->pending_recvs, 1);
+    }
+}
+
+/* READ_REQ → fetch from our local MR and reply with a READ_RESP + payload. */
+static void handle_read_req(struct odl_verbs_qp *qp, struct odl_rdma_hdr *hdr)
+{
+    struct odl_verbs_context *ctx = qp->ctx;
+    struct odl_verbs_mr *mr = odl_find_mr_by_rkey(ctx, hdr->rkey);
+
+    struct odl_tx_desc d;
+    memset(&d, 0, sizeof(d));
+    d.op        = ODL_OP_READ_RESP;
+    d.length    = hdr->length;
+    d.read_id   = hdr->read_id;
+    d.dmabuf_fd = -1;
+
+    if (mr && mr->mr_type == 1) {
+        uint64_t end = hdr->remote_addr + (uint64_t)hdr->length;
+        if (hdr->remote_addr < mr->iova ||
+            end < hdr->remote_addr ||
+            end > mr->iova + mr->base.length) {
+            odl_logerr("READ_REQ dmabuf OOB: rkey=%08x ra=%llx len=%u "
+                       "(iova=%llx size=%zu)",
+                       hdr->rkey, (unsigned long long)hdr->remote_addr,
+                       hdr->length, (unsigned long long)mr->iova,
+                       mr->base.length);
+            d.host_addr = calloc(1, hdr->length ? hdr->length : 1);
+            d.free_host = true;
+        } else {
+            d.dmabuf_fd     = mr->dmabuf_fd;
+            d.dmabuf_offset = hdr->remote_addr - mr->iova;
+        }
+    } else if (mr) {
+        uint64_t ra = (uint64_t)hdr->remote_addr;
+        uint64_t end = ra + (uint64_t)hdr->length;
+        uint64_t mbase = (uint64_t)(uintptr_t)mr->host_addr;
+        uint64_t mend = mbase + (uint64_t)mr->host_length;
+        if (ra < mbase || end < ra || end > mend) {
+            odl_logerr("READ_REQ host OOB: rkey=%08x ra=%llx len=%u "
+                       "(mr=%p..+%zu)",
+                       hdr->rkey, (unsigned long long)ra, hdr->length,
+                       mr->host_addr, mr->host_length);
+            d.host_addr = calloc(1, hdr->length ? hdr->length : 1);
+            d.free_host = true;
+        } else {
+            d.host_addr = (void *)(uintptr_t)ra;
+        }
+    } else {
+        /* Unknown rkey: reply with zeros so the initiator doesn't hang. */
+        odl_logerr("READ from unknown rkey=%08x — replying zeros (%u bytes)",
+                   hdr->rkey, hdr->length);
+        d.host_addr = calloc(1, hdr->length ? hdr->length : 1);
+        d.free_host = true;
+    }
+    sq_push(qp, &d);
+}
+
+/* READ_RESP → deliver fetched bytes into the initiator's buffer and complete
+ * the pending IBV_WR_RDMA_READ. */
+static void handle_read_resp(struct odl_verbs_qp *qp, struct odl_rdma_hdr *hdr)
+{
+    struct odl_read_pending pend;
+    bool matched = false;
+
+    pthread_mutex_lock(&qp->rp_lock);
+    if (qp->rp_count > 0) {
+        pend = qp->rp[qp->rp_head];
+        qp->rp_head = (qp->rp_head + 1) % ODL_VERBS_SQ_DEPTH;
+        qp->rp_count--;
+        matched = true;
+    }
+    pthread_mutex_unlock(&qp->rp_lock);
+
+    if (!matched) {
+        odl_logerr("READ_RESP read_id=%llu with no pending read — discarding",
+                   (unsigned long long)hdr->read_id);
+        rx_discard(qp, hdr->length);
+        return;
+    }
+    if (pend.read_id != hdr->read_id)
+        odl_logerr("READ_RESP id mismatch: got %llu expected %llu",
+                   (unsigned long long)hdr->read_id,
+                   (unsigned long long)pend.read_id);
+
+    int ret = 0;
+    uint32_t actual = 0;
+    if (hdr->length > 0) {
+        /* Clamp to the buffer the initiator actually posted (V3). */
+        uint32_t recv = (hdr->length > pend.length) ? pend.length : hdr->length;
+        if (pend.dmabuf_fd >= 0) {
+            ret = rx_dmabuf(qp, pend.dmabuf_fd, pend.dmabuf_offset, recv);
+            actual = (ret == 0) ? recv : 0;
+        } else if (pend.host_addr) {
+            ret = rx_msg(qp, pend.host_addr, recv, &actual);
+        }
+        if (hdr->length > recv)
+            rx_discard(qp, hdr->length - recv);
+    }
+
+    if (pend.signaled && pend.cq) {
+        struct ibv_wc wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.wr_id    = pend.wr_id;
+        wc.qp_num   = qp->base.qp_num;
+        wc.opcode   = IBV_WC_RDMA_READ;
+        wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
+        wc.byte_len = actual;
+        odl_cq_post(pend.cq, &wc);
+    }
+    atomic_fetch_sub(&qp->pending_sends, 1);
+}
+
+static void *odl_qp_recv_worker(void *arg)
+{
+    struct odl_verbs_qp *qp = arg;
+    odl_tb5_t h = qp->ctx->handle;
+    unsigned spins = 0;
+
+    while (qp->recv_worker_running) {
+        struct odl_rdma_hdr hdr;
+        uint8_t src = 0;
+        uint32_t actual = 0;
+
+        /* Block for RX data (new driver: returns 0 as soon as a message is
+         * ready, -ETIMEDOUT if nothing arrives within the 1 ms window, and
+         * does NOT spin).  Legacy driver: the O_NONBLOCK fd makes the wait
+         * ioctl return -EAGAIN immediately, so we degrade to the adaptive
+         * spin below and behaviour is unchanged. */
+        int wret = odl_tb5_stream_wait_rx(h, qp->stream_id, 1);
+        if (wret == -EAGAIN) {
+            /* No blocking wait support: fall back to the adaptive spin. */
+            odl_yield(&spins);
+            continue;
+        }
+        if (wret == -ETIMEDOUT) {
+            /* Idle window: stay responsive to shutdown, bound idle CPU. */
+            spins = 0;
+            continue;
+        }
+        if (wret != 0) {
+            /* Other error: spin and retry so we never hot-loop forever. */
+            odl_yield(&spins);
             continue;
         }
 
-        /* Poll the device fd until it signals TX readiness.
-         * Since the fd is O_NONBLOCK, the stream_send ioctl will
-         * return -EAGAIN immediately if frames aren't available.
-         * We poll first to avoid unnecessary ioctl calls.
-         *
-         * If poll fails (e.g., bad fd in mock mode), fall back to
-         * immediate non-blocking send without waiting. */
-        int poll_ret = odl_worker_poll_fd(qp, 5000);
-        if (poll_ret == -ETIMEDOUT) {
-            /* No response in 5s — try anyway, the send may still work */
-        } else if (poll_ret != 0) {
-            /* Bad fd or signal — try a non-blocking send directly,
-             * then back off if it fails. */
-            odl_logverbose("worker poll failed for stream %u: %d, "
-                            "falling back to direct send",
-                            qp->stream_id, poll_ret);
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-            nanosleep(&ts, NULL);
+        spins = 0;
+        int ret = odl_tb5_stream_recv(h, qp->stream_id, &hdr, sizeof(hdr),
+                                       &src, &actual);
+        if (ret == -EAGAIN) {
+            /* Spurious wakeup / race with a discarded frame: just retry. */
+            continue;
+        }
+        if (ret != 0) {
+            odl_logverbose("RX hdr stream=%u ret=%d", qp->stream_id, ret);
+            odl_yield(&spins);
+            continue;
+        }
+        if (actual < sizeof(hdr) || hdr.magic != ODL_RDMA_MAGIC) {
+            odl_logerr("RX bad header stream=%u actual=%u magic=%08x",
+                        qp->stream_id, actual, hdr.magic);
+            continue;
         }
 
-        /* Execute the send (non-blocking — fd is O_NONBLOCK) */
-        int ret;
-        struct ibv_wc wc;
-        memset(&wc, 0, sizeof(wc));
-
-        if (w_num_sge > 0) {
-            int dmabuf_fd = odl_lookup_dmabuf(ctx, w_lkey);
-
-            if (dmabuf_fd >= 0) {
-                ret = odl_tb5_stream_send_dmabuf(
-                    h, qp->tx_stream_id, qp->dest_qp,
-                    dmabuf_fd, 0, w_len);
-            } else {
-                void *data = (void *)(uintptr_t)w_addr;
-                ret = odl_tb5_stream_send(
-                    h, qp->tx_stream_id, qp->dest_qp,
-                    data, w_len);
-            }
-
-            if (ret == -EAGAIN) {
-                /* The request never left the head slot, so it cannot be
-                 * reordered, overwritten, or dropped. A later worker pass
-                 * retries it after polling readiness again. */
-                pthread_mutex_lock(&qp->sq_lock);
-                qp->tx_inflight = false;
-                pthread_mutex_unlock(&qp->sq_lock);
-                odl_logverbose("send EAGAIN stream=%u, retaining SQ head",
-                               qp->stream_id);
-                /* Readiness can go stale before the ioctl. Back off so a
-                 * permanently busy device cannot turn this into a hot loop. */
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 20000 };
-                nanosleep(&ts, NULL);
-                continue;
-            }
-
-            wc.wr_id    = w_wr_id;
-            wc.status   = (ret == 0) ? IBV_WC_SUCCESS : IBV_WC_GENERAL_ERR;
-            wc.byte_len = (ret == 0) ? w_len : 0;
-            wc.opcode   = IBV_WC_SEND;
-            wc.qp_num   = qp->base.qp_num;
-
-            if (ret != 0)
-                odl_logerr("send failed stream=%u ret=%d", qp->stream_id, ret);
-        } else {
-            /* Zero-length send */
-            wc.wr_id    = w_wr_id;
-            wc.status   = IBV_WC_SUCCESS;
-            wc.byte_len = 0;
-            wc.opcode   = IBV_WC_SEND;
-            wc.qp_num   = qp->base.qp_num;
+        switch (hdr.op) {
+        case ODL_OP_SEND:      handle_send(qp, &hdr);      break;
+        case ODL_OP_WRITE:
+        case ODL_OP_WRITE_IMM: handle_write(qp, &hdr);     break;
+        case ODL_OP_READ_REQ:  handle_read_req(qp, &hdr);  break;
+        case ODL_OP_READ_RESP: handle_read_resp(qp, &hdr); break;
+        default:
+            odl_logerr("RX unknown op=%u stream=%u", hdr.op, qp->stream_id);
+            break;
         }
-
-        free(w_bounce);
-
-        pthread_mutex_lock(&qp->sq_lock);
-        qp->sq[qp->sq_head].bounce = NULL;
-        qp->sq_head = (qp->sq_head + 1) % qp->sq_depth;
-        qp->sq_count--;
-        qp->tx_inflight = false;      /* on the wire; ordering barrier lifted */
-        pthread_mutex_unlock(&qp->sq_lock);
-
-        /* Post completion to send CQ */
-        if (qp->send_cq)
-            odl_cq_post(qp->send_cq, &wc);
-
-        atomic_fetch_sub(&qp->pending_sends, 1);
     }
-
     return NULL;
 }
 
@@ -253,26 +646,17 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
         return NULL;
     }
 
+    /* Inline sends require copying bytes before ibv_post_send returns. We do
+     * not implement that path, so make callers use registered buffers. */
+    attr->cap.max_inline_data = 0;
     struct odl_verbs_qp *qp = calloc(1, sizeof(*qp));
     if (!qp) { errno = ENOMEM; return NULL; }
 
-    uint32_t requested_sq_depth = attr->cap.max_send_wr;
-    qp->sq_depth = requested_sq_depth > ODL_VERBS_SQ_DEPTH_MAX
-                 ? ODL_VERBS_SQ_DEPTH_MAX : (int)requested_sq_depth;
-    if (qp->sq_depth < ODL_VERBS_SQ_DEPTH_MIN)
-        qp->sq_depth = ODL_VERBS_SQ_DEPTH_MIN;
-    qp->sq = calloc((size_t)qp->sq_depth, sizeof(*qp->sq));
-    if (!qp->sq) {
-        free(qp);
-        errno = ENOMEM;
-        return NULL;
-    }
     /* Open an OdinLink-Five stream */
-    uint8_t stream_id = 0, tx_stream_id = 0;
+    uint8_t stream_id = 0;
     int ret = odl_tb5_stream_open(ctx->handle, 0, &stream_id);
     if (ret != 0) {
         odl_logerr("stream_open failed: %d", ret);
-        free(qp->sq);
         free(qp);
         errno = ENODEV;
         return NULL;
@@ -282,18 +666,6 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
     qp->base.pd          = pd;
     qp->base.send_cq     = attr->send_cq;
     qp->base.recv_cq     = attr->recv_cq;
-    ret = odl_tb5_stream_open(ctx->handle, 0, &tx_stream_id);
-    if (ret < 0) {
-        odl_logerr("tx stream_open failed: %d", ret);
-        odl_tb5_stream_close(ctx->handle, stream_id);
-        free(qp->sq);
-        free(qp);
-        errno = ENOMEM;
-        return NULL;
-    }
-
-    /* Advertise the RX stream: the peer's dest_qp_num must name where WE
-     * receive, not where we send from. */
     qp->base.qp_num      = stream_id;
     qp->base.qp_type     = attr->qp_type;
     qp->base.state       = IBV_QPS_RESET;
@@ -301,28 +673,18 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
     qp->pd               = odl_pd_from_ibv(pd);
     qp->send_cq          = attr->send_cq ? odl_cq_from_ibv(attr->send_cq) : NULL;
     qp->recv_cq          = attr->recv_cq ? odl_cq_from_ibv(attr->recv_cq) : NULL;
-    /*
-     * Polling EITHER CQ must drive receive progress. Wiring only the recv CQ
-     * deadlocks bidirectional traffic: both peers sit in ibv_poll_cq() on
-     * their SEND CQ waiting for completions, so neither drains RX, the rings
-     * fill, and TX never becomes ready again. Reproduced with
-     * odl_rdma_stress --bidir: both sides stall on message 1.
-     */
-    if (qp->recv_cq)
-        qp->recv_cq->rx_qp = qp;
-    if (qp->send_cq)
-        qp->send_cq->rx_qp = qp;
-    qp->stream_id        = stream_id;      /* receive on */
-    qp->tx_stream_id     = tx_stream_id;   /* send from */
+    qp->stream_id        = stream_id;
 
-    /* Initialize SQ */
     pthread_mutex_init(&qp->sq_lock, NULL);
+    pthread_cond_init(&qp->sq_cond, NULL);
+    qp->sq_head = qp->sq_tail = qp->sq_count = 0;
+
     pthread_mutex_init(&qp->rq_lock, NULL);
-    pthread_mutex_init(&qp->drain_lock, NULL);
     qp->rq_head = qp->rq_tail = qp->rq_count = 0;
-    qp->sq_head  = 0;
-    qp->sq_tail  = 0;
-    qp->sq_count = 0;
+
+    pthread_mutex_init(&qp->rp_lock, NULL);
+    qp->rp_head = qp->rp_tail = qp->rp_count = 0;
+    atomic_init(&qp->read_id_next, 1);
 
     atomic_init(&qp->pending_sends, 0);
     atomic_init(&qp->pending_recvs, 0);
@@ -333,7 +695,9 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
         pthread_mutex_unlock(&ctx->qp_lock);
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
-        free(qp->sq);
+        pthread_cond_destroy(&qp->sq_cond);
+        pthread_mutex_destroy(&qp->rq_lock);
+        pthread_mutex_destroy(&qp->rp_lock);
         free(qp);
         errno = ENOMEM;
         return NULL;
@@ -341,41 +705,40 @@ struct ibv_qp *odl_create_qp(struct ibv_pd *pd,
     ctx->qps[ctx->nqps++] = qp;
     pthread_mutex_unlock(&ctx->qp_lock);
 
-    /* Start async worker threads: TX and RX independently. */
+    /* Start async worker threads: one for sends, one for receives. */
     qp->worker_running = true;
     ret = pthread_create(&qp->worker, NULL, odl_qp_worker, qp);
     if (ret != 0) {
-        odl_logerr("pthread_create failed: %d", ret);
+        odl_logerr("pthread_create (send) failed: %d", ret);
         qp->worker_running = false;
-        odl_tb5_stream_close(ctx->handle, tx_stream_id);
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
-        free(qp->sq);
+        pthread_cond_destroy(&qp->sq_cond);
+        pthread_mutex_destroy(&qp->rq_lock);
+        pthread_mutex_destroy(&qp->rp_lock);
         free(qp);
         errno = EAGAIN;
         return NULL;
     }
 
-    qp->rx_worker_running = true;
-    ret = pthread_create(&qp->rx_worker, NULL, odl_qp_rx_worker, qp);
+    qp->recv_worker_running = true;
+    ret = pthread_create(&qp->recv_worker, NULL, odl_qp_recv_worker, qp);
     if (ret != 0) {
-        odl_logerr("rx pthread_create failed: %d", ret);
-        qp->rx_worker_running = false;
+        odl_logerr("pthread_create (recv) failed: %d", ret);
+        qp->recv_worker_running = false;
         qp->worker_running = false;
         pthread_join(qp->worker, NULL);
-        odl_tb5_stream_close(ctx->handle, tx_stream_id);
         odl_tb5_stream_close(ctx->handle, stream_id);
         pthread_mutex_destroy(&qp->sq_lock);
-        free(qp->sq);
+        pthread_cond_destroy(&qp->sq_cond);
+        pthread_mutex_destroy(&qp->rq_lock);
+        pthread_mutex_destroy(&qp->rp_lock);
         free(qp);
         errno = EAGAIN;
         return NULL;
     }
 
-    odl_loginfo("create_qp: rx_stream=%u tx_stream=%u qp_num=%u",
-                stream_id, tx_stream_id, qp->base.qp_num);
-    /* ibv_create_qp permits a provider to adjust requested capabilities. */
-    attr->cap.max_send_wr = qp->sq_depth;
+    odl_loginfo("create_qp: stream=%u qp_num=%u", stream_id, qp->base.qp_num);
     ODL_TRACE_EXIT();
     return &qp->base;
 }
@@ -390,31 +753,19 @@ int odl_destroy_qp(struct ibv_qp *qp)
     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
     struct odl_verbs_context *ctx = oqp->ctx;
 
-    /* Stop BOTH worker threads before touching anything they reference.
-     * The RX thread must be joined too, or it keeps draining into a freed
-     * QP after destroy. */
     oqp->worker_running = false;
-    oqp->rx_worker_running = false;
+    oqp->recv_worker_running = false;
+    /* Wake the send worker if it is parked in pthread_cond_wait on an empty
+     * SQ; the recv worker wakes on its own 1 ms STREAM_WAIT_RX timeout. */
+    pthread_mutex_lock(&oqp->sq_lock);
+    pthread_cond_broadcast(&oqp->sq_cond);
+    pthread_mutex_unlock(&oqp->sq_lock);
     pthread_join(oqp->worker, NULL);
-    pthread_join(oqp->rx_worker, NULL);
+    pthread_join(oqp->recv_worker, NULL);
 
-    /* Close both streams (one per direction) */
-    if (oqp->tx_stream_id > 0)
-        odl_tb5_stream_close(oqp->ctx->handle, oqp->tx_stream_id);
     if (oqp->stream_id > 0)
         odl_tb5_stream_close(ctx->handle, oqp->stream_id);
 
-    /* Release bounce buffers for work requests never transmitted. */
-    pthread_mutex_lock(&oqp->sq_lock);
-    while (oqp->sq_count > 0) {
-        free(oqp->sq[oqp->sq_head].bounce);
-        oqp->sq[oqp->sq_head].bounce = NULL;
-        oqp->sq_head = (oqp->sq_head + 1) % oqp->sq_depth;
-        oqp->sq_count--;
-    }
-    pthread_mutex_unlock(&oqp->sq_lock);
-
-    /* Remove from context */
     pthread_mutex_lock(&ctx->qp_lock);
     for (int i = 0; i < ctx->nqps; i++) {
         if (ctx->qps[i] == oqp) {
@@ -424,12 +775,13 @@ int odl_destroy_qp(struct ibv_qp *qp)
     }
     pthread_mutex_unlock(&ctx->qp_lock);
 
-    uint8_t stream_id = oqp->stream_id;
     pthread_mutex_destroy(&oqp->sq_lock);
-    free(oqp->sq);
+    pthread_cond_destroy(&oqp->sq_cond);
+    pthread_mutex_destroy(&oqp->rq_lock);
+    pthread_mutex_destroy(&oqp->rp_lock);
     free(oqp);
 
-    odl_loginfo("destroy_qp: stream=%u", stream_id);
+    odl_loginfo("destroy_qp done");
     ODL_TRACE_EXIT_VAL(0);
 }
 
@@ -441,19 +793,20 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
     ODL_TRACE_ENTRY();
     ODL_RETURN_EINVAL_IF(!qp, "null qp");
 
+    /* Capture the peer's stream id from the RDMA connection handshake.
+     * qp_num == stream_id on both ends, so dest_qp_num is the peer's stream. */
     if (attr_mask & IBV_QP_DEST_QPN) {
         struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
-        oqp->dest_qp = (uint8_t)attr->dest_qp_num;
-        odl_loginfo("modify_qp: qp_num=%u dest_qp_num=%u",
-                    qp->qp_num, attr->dest_qp_num);
+        oqp->dest_stream_id = (uint8_t)attr->dest_qp_num;
+        odl_loginfo("modify_qp: qp_num=%u dest_stream=%u",
+                     qp->qp_num, oqp->dest_stream_id);
     }
 
     if (attr_mask & IBV_QP_STATE) {
         qp->state = attr->qp_state;
-        odl_loginfo("modify_qp: qp_num=%u state=%d -> %d",
-                     qp->qp_num, qp->state, attr->qp_state);
+        odl_loginfo("modify_qp: qp_num=%u state -> %d",
+                     qp->qp_num, attr->qp_state);
 
-        /* On RTS transition, ensure peer is ready */
         if (attr->qp_state == IBV_QPS_RTS) {
             struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
             odl_tb5_wait_peer(oqp->ctx->handle, 5000);
@@ -465,224 +818,157 @@ int odl_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 
 /* ── Post Send (async) ──────────────────────────────────────────────── */
 
-/* ODL_VERBS_INLINE=0 disables the inline send fast path, so its benefit can be
- * A/B measured at a fixed payload size. Default on. */
-static bool odl_inline_enabled(void)
-{
-    static int cached = -1;
-
-    if (cached < 0) {
-        const char *e = getenv("ODL_VERBS_INLINE");
-        cached = (e && e[0] == '0') ? 0 : 1;
-    }
-    return cached != 0;
-}
-
 int odl_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
                    struct ibv_send_wr **bad_wr)
 {
     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
+    struct odl_verbs_context *ctx = oqp->ctx;
     *bad_wr = NULL;
 
-    pthread_mutex_lock(&oqp->sq_lock);
-
-    /*
-     * Inline fast path. For a small single-SGE request with nothing already
-     * queued, transmit straight from the caller's thread instead of handing
-     * off to the TX worker. That removes a thread handoff, a malloc+memcpy
-     * bounce and two poll() syscalls from the critical path.
-     *
-     * Buffer-reuse semantics (IBV_SEND_INLINE) come free: the kernel's
-     * copy_from_user inside the ioctl IS the copy, so the caller may reuse
-     * its buffer the moment we return - which is exactly what ibv_post_send
-     * promises. Only taken when the SQ is empty, so ordering cannot be
-     * violated; on -EAGAIN we fall through to the queued path.
-     */
-    if (odl_inline_enabled() &&
-        wr && !wr->next && wr->num_sge == 1 &&
-        oqp->sq_count == 0 && !oqp->tx_inflight &&
-        wr->sg_list[0].length <= ODL_VERBS_INLINE_MAX &&
-        odl_lookup_dmabuf_pub(oqp->ctx, wr->sg_list[0].lkey) < 0) {
-
-        int ret = odl_tb5_stream_send(oqp->ctx->handle, oqp->tx_stream_id,
-                                      oqp->dest_qp,
-                                      (const void *)(uintptr_t)wr->sg_list[0].addr,
-                                      wr->sg_list[0].length);
-        if (ret == 0) {
-            struct ibv_wc wc;
-            pthread_mutex_unlock(&oqp->sq_lock);
-
-            memset(&wc, 0, sizeof(wc));
-            wc.wr_id    = wr->wr_id;
-            wc.status   = IBV_WC_SUCCESS;
-            wc.opcode   = IBV_WC_SEND;
-            wc.byte_len = wr->sg_list[0].length;
-            wc.qp_num   = oqp->base.qp_num;
-            if (oqp->send_cq)
-                odl_cq_post(oqp->send_cq, &wc);
-            return 0;
-        }
-        /* -EAGAIN or error: fall through and queue it for the worker. */
-    }
-
     while (wr) {
-        if (oqp->sq_count >= oqp->sq_depth) {
+        struct ibv_sge *sge = (wr->num_sge > 0) ? &wr->sg_list[0] : NULL;
+        uint32_t len = sge ? sge->length : 0;
+
+        struct odl_tx_desc d;
+        memset(&d, 0, sizeof(d));
+        d.wr_id     = wr->wr_id;
+        d.length    = len;
+        d.dmabuf_fd = -1;
+        d.signaled  = (wr->send_flags & IBV_SEND_SIGNALED) != 0;
+        d.cq        = oqp->send_cq;
+
+        /* Payload source: host pointer or zero-copy dmabuf (by lkey). */
+        if (sge) {
+            int fd = odl_lookup_dmabuf(ctx, sge->lkey);
+            if (fd >= 0)
+                d.dmabuf_fd = fd;      /* offset 0 == whole registered buffer */
+            else
+                d.host_addr = (void *)(uintptr_t)sge->addr;
+        }
+
+        switch (wr->opcode) {
+        case IBV_WR_SEND:
+            d.op = ODL_OP_SEND;
+            d.wc_opcode = IBV_WC_SEND;
+            break;
+        case IBV_WR_RDMA_WRITE:
+            d.op = ODL_OP_WRITE;
+            d.wc_opcode = IBV_WC_RDMA_WRITE;
+            d.remote_addr = wr->wr.rdma.remote_addr;
+            d.rkey        = wr->wr.rdma.rkey;
+            break;
+        case IBV_WR_RDMA_WRITE_WITH_IMM:
+            d.op = ODL_OP_WRITE_IMM;
+            d.wc_opcode = IBV_WC_RDMA_WRITE;
+            d.remote_addr = wr->wr.rdma.remote_addr;
+            d.rkey        = wr->wr.rdma.rkey;
+            d.imm_data    = wr->imm_data;
+            break;
+        case IBV_WR_RDMA_READ: {
+            /* Register the outstanding read, then send a READ_REQ.  The
+             * READ_RESP will match this entry and complete the WR. */
+            d.op = ODL_OP_READ_REQ;
+            d.wc_opcode = IBV_WC_RDMA_READ;
+            d.remote_addr = wr->wr.rdma.remote_addr;
+            d.rkey        = wr->wr.rdma.rkey;
+            d.read_id = atomic_fetch_add(&oqp->read_id_next, 1);
+
+            struct odl_read_pending pend;
+            memset(&pend, 0, sizeof(pend));
+            pend.read_id  = d.read_id;
+            pend.wr_id    = wr->wr_id;
+            pend.cq       = oqp->send_cq;
+            pend.signaled = d.signaled;
+            pend.length   = len;
+            pend.dmabuf_fd = d.dmabuf_fd;     /* local dest by lkey */
+            pend.dmabuf_offset = 0;
+            pend.host_addr = (d.dmabuf_fd < 0) ? d.host_addr : NULL;
+
+            pthread_mutex_lock(&oqp->rp_lock);
+            if (oqp->rp_count >= ODL_VERBS_SQ_DEPTH) {
+                pthread_mutex_unlock(&oqp->rp_lock);
+                *bad_wr = wr;
+                odl_logerr("post_send: read-pending queue full on QP %u",
+                           qp->qp_num);
+                return -ENOMEM;
+            }
+            oqp->rp[oqp->rp_tail] = pend;
+            oqp->rp_tail = (oqp->rp_tail + 1) % ODL_VERBS_SQ_DEPTH;
+            oqp->rp_count++;
+            pthread_mutex_unlock(&oqp->rp_lock);
+            /* READ carries no payload frame; host_addr/dmabuf are the dest. */
+            d.host_addr = NULL;
+            break;
+        }
+        default:
             *bad_wr = wr;
+            odl_logerr("post_send: unsupported opcode %d on QP %u",
+                       wr->opcode, qp->qp_num);
+            return -EOPNOTSUPP;
+        }
+
+        /* Enqueue the descriptor for the send worker. */
+        pthread_mutex_lock(&oqp->sq_lock);
+        if (oqp->sq_count >= ODL_VERBS_SQ_DEPTH) {
             pthread_mutex_unlock(&oqp->sq_lock);
+            *bad_wr = wr;
             odl_logerr("post_send: SQ full on QP %u", qp->qp_num);
             return -ENOMEM;
         }
-
-        /* BUG14 fix: copy, never store the caller's stack pointer. */
-        struct odl_verbs_send_entry *entry = &oqp->sq[oqp->sq_tail];
-        entry->wr_id = wr->wr_id;
-        entry->num_sge = wr->num_sge;
-        if (wr->num_sge > 0) {
-            uint32_t blen = wr->sg_list[0].length;
-            void *bounce = NULL;
-
-            /* Copy now; the caller may reuse its buffer the moment we return.
-             * dmabuf MRs are zero-copy by definition and are left alone. */
-            if (odl_lookup_dmabuf_pub(oqp->ctx, wr->sg_list[0].lkey) < 0 &&
-                blen > 0) {
-                bounce = malloc(blen);
-                if (!bounce) {
-                    *bad_wr = wr;
-                    pthread_mutex_unlock(&oqp->sq_lock);
-                    odl_logerr("post_send: bounce alloc %u failed", blen);
-                    return -ENOMEM;
-                }
-                memcpy(bounce, (const void *)(uintptr_t)wr->sg_list[0].addr,
-                       blen);
-            }
-            entry->bounce = bounce;
-            entry->addr = bounce ? (uint64_t)(uintptr_t)bounce
-                                 : wr->sg_list[0].addr;
-            entry->len = blen;
-            entry->lkey = wr->sg_list[0].lkey;
-        } else {
-            entry->bounce = NULL;
-            entry->addr = 0;
-            entry->len = 0;
-            entry->lkey = 0;
-        }
-        oqp->sq_tail = (oqp->sq_tail + 1) % oqp->sq_depth;
+        oqp->sq[oqp->sq_tail] = d;
+        oqp->sq_tail = (oqp->sq_tail + 1) % ODL_VERBS_SQ_DEPTH;
         oqp->sq_count++;
         atomic_fetch_add(&oqp->pending_sends, 1);
+        pthread_cond_signal(&oqp->sq_cond);
+        pthread_mutex_unlock(&oqp->sq_lock);
 
         wr = wr->next;
     }
-
-    pthread_mutex_unlock(&oqp->sq_lock);
     return 0;
 }
 
-/* ── Post Recv (async via poll + non-blocking) ──────────────────────── */
+/* ── Post Recv (async: enqueue only, recv worker delivers) ──────────── */
 
 int odl_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
                    struct ibv_recv_wr **bad_wr)
 {
     struct odl_verbs_qp *oqp = odl_qp_from_ibv(qp);
-    *bad_wr = NULL;
+    if (bad_wr)
+        *bad_wr = NULL;
 
-    /*
-     * BUG13 fix: this used to poll(5000) and perform the receive inline,
-     * returning -ETIMEDOUT/-EAGAIN when no data had arrived yet. Every verbs
-     * consumer PRE-POSTS receive buffers before any traffic exists (llama.cpp
-     * posts 24, RCCL and perftest do the same), so the first post always
-     * failed and RDMA setup aborted. A real post_recv only enqueues a buffer
-     * and returns immediately; the completion arrives later via the CQ.
-     */
     pthread_mutex_lock(&oqp->rq_lock);
-
     while (wr) {
+        if (wr->num_sge < 0 || wr->num_sge > 1 ||
+            (wr->num_sge == 1 && !wr->sg_list)) {
+            if (bad_wr)
+                *bad_wr = wr;
+            pthread_mutex_unlock(&oqp->rq_lock);
+            return EINVAL;
+        }
         if (oqp->rq_count >= ODL_VERBS_RQ_DEPTH) {
-            *bad_wr = wr;
+            if (bad_wr)
+                *bad_wr = wr;
             pthread_mutex_unlock(&oqp->rq_lock);
             odl_logerr("post_recv: RQ full on QP %u", qp->qp_num);
-            return -ENOMEM;
+            return ENOMEM;
         }
-        if (wr->num_sge > 0) {
-            /* Copy: the caller's wr/sge are typically stack-allocated. */
-            oqp->rq_wr_id[oqp->rq_tail] = wr->wr_id;
-            oqp->rq_addr[oqp->rq_tail]  = wr->sg_list[0].addr;
-            oqp->rq_len[oqp->rq_tail]   = wr->sg_list[0].length;
-            oqp->rq_tail = (oqp->rq_tail + 1) % ODL_VERBS_RQ_DEPTH;
-            oqp->rq_count++;
-            atomic_fetch_add(&oqp->pending_recvs, 1);
-        }
+
+        struct odl_recv_desc *d = &oqp->rq[oqp->rq_tail];
+        memset(d, 0, sizeof(*d));
+        d->wr_id = wr->wr_id;
+        d->num_sge = wr->num_sge;
+        if (wr->num_sge == 1)
+            d->sge = wr->sg_list[0];
+
+        oqp->rq_tail = (oqp->rq_tail + 1) % ODL_VERBS_RQ_DEPTH;
+        oqp->rq_count++;
+        atomic_fetch_add(&oqp->pending_recvs, 1);
+
         wr = wr->next;
     }
-
     pthread_mutex_unlock(&oqp->rq_lock);
     return 0;
 }
-
-/* Drain inbound stream data into posted RX buffers; post one WC per message.
- * Non-blocking: returns the number of completions generated. */
-int odl_rq_drain(struct odl_verbs_qp *oqp)
-{
-    int completions = 0;
-
-    /* Exclusive: only one drainer at a time, so receives stay ordered.
-     * trylock, never block -- ibv_poll_cq() must not stall behind the worker. */
-    if (pthread_mutex_trylock(&oqp->drain_lock) != 0)
-        return 0;
-
-    for (;;) {
-        uint64_t wr_id, addr;
-        uint32_t len;
-
-        pthread_mutex_lock(&oqp->rq_lock);
-        if (oqp->rq_count == 0) {
-            pthread_mutex_unlock(&oqp->rq_lock);
-            break;
-        }
-        wr_id = oqp->rq_wr_id[oqp->rq_head];
-        addr  = oqp->rq_addr[oqp->rq_head];
-        len   = oqp->rq_len[oqp->rq_head];
-        pthread_mutex_unlock(&oqp->rq_lock);
-
-        uint8_t  src_id = 0;
-        uint32_t actual = 0;
-        int ret = odl_tb5_stream_recv(oqp->ctx->handle, oqp->stream_id,
-                                      (void *)(uintptr_t)addr, len,
-                                      &src_id, &actual);
-        if (ret == -EAGAIN)
-            break;                      /* nothing pending -- leave buffer posted */
-
-        /* Consume the buffer only once we know data (or an error) arrived. */
-        pthread_mutex_lock(&oqp->rq_lock);
-        if (oqp->rq_count > 0) {
-            oqp->rq_head = (oqp->rq_head + 1) % ODL_VERBS_RQ_DEPTH;
-            oqp->rq_count--;
-        }
-        pthread_mutex_unlock(&oqp->rq_lock);
-        atomic_fetch_sub(&oqp->pending_recvs, 1);
-
-        struct ibv_wc wc;
-        memset(&wc, 0, sizeof(wc));
-        wc.wr_id  = wr_id;
-        wc.qp_num = oqp->base.qp_num;
-        wc.src_qp = src_id;
-        wc.opcode = IBV_WC_RECV;
-        if (ret == 0) {
-            wc.status   = IBV_WC_SUCCESS;
-            wc.byte_len = actual;
-        } else {
-            wc.status   = IBV_WC_GENERAL_ERR;
-            wc.byte_len = 0;
-            odl_logerr("recv failed: stream=%u ret=%d", oqp->stream_id, ret);
-        }
-        if (oqp->recv_cq)
-            odl_cq_post(oqp->recv_cq, &wc);
-        completions++;
-    }
-
-    pthread_mutex_unlock(&oqp->drain_lock);
-    return completions;
-}
-
 /* ── Query QP ───────────────────────────────────────────────────────── */
 
 int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
@@ -704,8 +990,8 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
     attr->qp_access_flags  = IBV_ACCESS_LOCAL_WRITE |
                               IBV_ACCESS_REMOTE_WRITE |
                               IBV_ACCESS_REMOTE_READ;
-    attr->cap.max_send_wr  = odl_qp_from_ibv(qp)->sq_depth;
-    attr->cap.max_recv_wr  = ODL_VERBS_SQ_DEPTH_MIN;
+    attr->cap.max_send_wr  = ODL_VERBS_SQ_DEPTH;
+    attr->cap.max_recv_wr  = ODL_VERBS_SQ_DEPTH;
     attr->cap.max_send_sge = 1;
     attr->cap.max_recv_sge = 1;
     attr->cap.max_inline_data = 0;
@@ -725,9 +1011,4 @@ int odl_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
     }
 
     ODL_TRACE_EXIT_VAL(0);
-}
-
-int odl_lookup_dmabuf_pub(struct odl_verbs_context *ctx, uint32_t lkey)
-{
-    return odl_lookup_dmabuf(ctx, lkey);
 }
