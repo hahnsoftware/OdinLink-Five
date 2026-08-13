@@ -187,37 +187,6 @@ struct conn {
 static pthread_barrier_t g_round_barrier;
 static struct conn *g_conns_arr;
 
-/* Marker-file sync: the plugin's accept() completes without any wire
- * handshake, so the server would post irecvs (and fire READYs) before
- * the client process even started — the READYs then hit an empty pool
- * and the transfer hangs.  The client signals after its first isend is
- * posted (control stream open, reader running); the server waits. */
-#define READY_MARKER "/tmp/odl_plugin_pair_ready"
-
-static void marker_unlink(void)
-{
-    unlink(READY_MARKER);
-}
-
-static void marker_touch(void)
-{
-    int fd = open(READY_MARKER, O_WRONLY | O_CREAT, 0644);
-    if (fd >= 0)
-        close(fd);
-}
-
-static int marker_wait(int timeout_s)
-{
-    for (int i = 0; i < timeout_s * 10; i++) {
-        if (access(READY_MARKER, F_OK) == 0)
-            return 0;
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-        nanosleep(&ts, NULL);
-    }
-    fprintf(stderr, "timeout waiting for %s\n", READY_MARKER);
-    return -1;
-}
-
 static void *client_worker(void *arg)
 {
     struct conn *c = arg;
@@ -241,7 +210,6 @@ static void *client_worker(void *arg)
             c->ok = 0;
             break;
         }
-        marker_touch();
         /* poll until done, bounded */
         for (int spin = 0; spin < 10000; spin++) {
             int done = 0, sz = 0;
@@ -276,7 +244,6 @@ static void *server_worker(void *arg)
         int size = g_sizes[r % g_nsizes];
         unsigned char byte = (unsigned char)(c->k * g_rounds + r);
         void *data = (void *)(uintptr_t)(0x100000000ULL + c->k);
-        void *req = NULL;
         int sizes[1] = { size };
         int tags[1] = { r };
         void *datas[1] = { data };
@@ -284,24 +251,50 @@ static void *server_worker(void *arg)
         rcclResult_t res;
 
         pthread_barrier_wait(&g_round_barrier);
-        res = p->irecv(c->comm, 1, datas, sizes, tags, mhs, &req);
-        if (res != rcclSuccess) {
-            fprintf(stderr, "conn %d round %d: irecv rc=%d\n", c->k, r, res);
-            c->ok = 0;
-            break;
-        }
-        for (int spin = 0; spin < 10000; spin++) {
-            int done = 0, sz = 0;
-            res = p->test(req, &done, &sz);
+        /* Retry the round for up to 60 s: accept() completes with no wire
+         * handshake, so the first READY may be fired before the client
+         * process (and its control stream) exists; the driver drops it and
+         * the recv times out with zero bytes delivered.  A retry sends a
+         * fresh READY; once the client is up the READY is delivered, the
+         * sender posts TX, and the round completes.  Zero-byte timeouts
+         * carry no credits, so a retry can never duplicate data. */
+        int attempt;
+        for (attempt = 0; attempt < 12; attempt++) {
+            void *req = NULL;
+            int got = -1;
+
+            res = p->irecv(c->comm, 1, datas, sizes, tags, mhs, &req);
             if (res != rcclSuccess) {
-                fprintf(stderr, "conn %d round %d: test rc=%d\n", c->k, r, res);
+                fprintf(stderr, "conn %d round %d: irecv rc=%d\n", c->k, r, res);
                 c->ok = 0;
                 break;
             }
-            if (done) {
-                if (sz != size) {
+            int timed_out = 0;
+            for (int spin = 0; spin < 10000; spin++) {
+                int done = 0, sz = 0;
+                res = p->test(req, &done, &sz);
+                if (res != rcclSuccess) {
+                    fprintf(stderr, "conn %d round %d: test rc=%d\n", c->k, r, res);
+                    c->ok = 0;
+                    break;
+                }
+                if (done) {
+                    got = sz;
+                    break;
+                }
+                if (spin == 9999) {
+                    timed_out = 1;
+                    break;
+                }
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+                nanosleep(&ts, NULL);
+            }
+            if (!c->ok)
+                break;
+            if (got >= 0) {
+                if (got != size) {
                     fprintf(stderr, "conn %d round %d: got %d want %d\n",
-                            c->k, r, sz, size);
+                            c->k, r, got, size);
                     c->ok = 0;
                 } else if (check_pattern(c->fd, (size_t)size, byte) < 0) {
                     fprintf(stderr, "conn %d round %d: pattern MISMATCH\n",
@@ -310,13 +303,13 @@ static void *server_worker(void *arg)
                 }
                 break;
             }
-            if (spin == 9999) {
-                fprintf(stderr, "conn %d round %d: test timeout\n", c->k, r);
-                c->ok = 0;
+            if (!timed_out)
                 break;
-            }
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
-            nanosleep(&ts, NULL);
+        }
+        if (attempt == 12) {
+            fprintf(stderr, "conn %d round %d: gave up after retries\n",
+                    c->k, r);
+            c->ok = 0;
         }
         if (!c->ok)
             break;
@@ -355,7 +348,6 @@ int main(int argc, char **argv)
     if (!strcmp(g_role, "server")) {
         /* listen for every connection; the peer handle's stream id is
          * auto-assigned and identical on the client (same kernel ida). */
-        marker_unlink();
         for (int i = 0; i < g_conns; i++) {
             char handle[64] = {0};
             void *lh = NULL;
@@ -400,10 +392,6 @@ int main(int argc, char **argv)
             g_conns_arr[i].ok = 1;
         }
         pthread_t tid[64];
-        if (marker_wait(60) < 0) {
-            fprintf(stderr, "client never signaled readiness\n");
-            return 1;
-        }
         for (int i = 0; i < g_conns; i++)
             pthread_create(&tid[i], NULL, server_worker, &g_conns_arr[i]);
         for (int i = 0; i < g_conns; i++)
