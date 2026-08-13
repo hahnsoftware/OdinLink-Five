@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <limits.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -256,22 +257,46 @@ static rcclResult_t odl_tb5_devices(int *ndev)
 
 static rcclResult_t odl_tb5_getProperties(int dev, rcclNetProperties_v7_t *props)
 {
+	struct odl_tb5_peer_info peer;
+	odl_tb5_t handle = NULL;
+	int speed_mbps = 20000;
+	static int warned_speed_fallback;
+	bool have_speed = false;
+
 	if (dev < 0 || dev >= num_devices)
 		return rcclInvalidArgument;
+	if (odl_tb5_open(&handle, dev) == 0) {
+		if (odl_tb5_get_peer(handle, &peer) == 0 &&
+		    peer.link_speed > 0 && peer.link_width > 0) {
+			uint64_t measured = (uint64_t)peer.link_speed *
+					    peer.link_width * 1000;
+
+			if (measured <= INT_MAX) {
+				speed_mbps = (int)measured;
+				have_speed = true;
+			}
+		}
+		odl_tb5_close(handle);
+	}
+	if (!have_speed &&
+	    !__atomic_exchange_n(&warned_speed_fallback, 1, __ATOMIC_RELAXED))
+		WARN("link speed unavailable for device %d; using conservative "
+		     "%d Mb/s fallback", dev, speed_mbps);
 
 	memset(props, 0, sizeof(*props));
 	props->name = (char *)"OdinLink-TB5";
 	props->pciPath = (char *)"/sys/bus/thunderbolt";
 	props->guid = (uint64_t)dev;
 	props->ptrSupport = NCCL_PTR_HOST;   /* RCCL stages GPU<->host itself */
-	props->speed = 80000;
+	props->speed = speed_mbps;
 	props->port = dev;
 	props->latency = 0.0f;
 	props->maxComm = 0x7fffffff;
 	props->maxRecvs = 1;
 	props->netDeviceType = 0;            /* NCCL_NET_DEVICE_HOST */
 	props->netDeviceVersion = 0;
-	DBG(1, "getProperties dev=%d name=%s ptrSupport=HOST", dev, props->name);
+	DBG(1, "getProperties dev=%d name=%s ptrSupport=HOST speed=%d Mb/s",
+	    dev, props->name, props->speed);
 	return rcclSuccess;
 }
 
@@ -440,8 +465,25 @@ static rcclResult_t odl_tb5_regMrDmaBuf(void *comm, void *data, size_t size,
 					int type, uint64_t offset, int fd,
 					void **mhandle)
 {
-	(void)offset; (void)fd;
-	return odl_tb5_regMr(comm, data, (int)size, type, mhandle);
+	static int warned;
+
+	(void)comm;
+	(void)data;
+	(void)size;
+	(void)type;
+	(void)offset;
+	(void)fd;
+	if (mhandle)
+		*mhandle = NULL;
+
+	/*
+	 * This plugin advertises host pointers only and relies on RCCL to stage
+	 * GPU memory.  Treating a DMA-BUF request as ordinary host memory would
+	 * discard fd/offset while claiming that registration succeeded.
+	 */
+	if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+		WARN("DMA-BUF registration is unsupported by the host-staged RCCL plugin");
+	return rcclInvalidUsage;
 }
 
 static rcclResult_t odl_tb5_deregMr(void *comm, void *mhandle)
