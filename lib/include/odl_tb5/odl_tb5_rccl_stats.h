@@ -18,10 +18,14 @@ struct odl_rccl_stats {
 	uint64_t rx_bytes;
 	uint64_t tx_ops;
 	uint64_t rx_ops;
+	uint64_t dmabuf_tx_bytes;
+	uint64_t dmabuf_rx_bytes;
+	uint64_t dmabuf_tx_ops;
+	uint64_t dmabuf_rx_ops;
 	uint64_t start_time_ns;
 	uint64_t last_update_ns;
 	uint32_t active;
-	uint32_t reserved[15];
+	uint32_t reserved[7];
 };
 
 #endif /* ODL_TB5_RCCL_STATS_H */

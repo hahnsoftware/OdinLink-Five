@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <dlfcn.h>
 
 #include "net_v7.h"
@@ -68,17 +70,53 @@ int odl_tb5_test_plugin(void)
 		}
 	}
 
-	/* Host-staged transport must not claim that it registered a DMA-BUF. */
-	TEST("regMrDmaBuf refuses unsupported registration");
+	/* DMA-BUF registrations are real: the plugin duplicates the fd and
+	 * keeps it with the mhandle for the transfer path. */
+	TEST("regMrDmaBuf accepts and retains the fd");
 	{
-		void *mhandle = (void *)1;
-		rcclResult_t res = plugin->regMrDmaBuf(NULL, NULL, 4096,
-						      NCCL_PTR_DMABUF, 128, -1,
-						      &mhandle);
-		if (res == rcclInvalidUsage && mhandle == NULL) {
-			PASS();
+		int fd = open("/dev/null", O_RDONLY);
+		void *mhandle = NULL;
+		rcclResult_t res;
+
+		if (fd < 0) {
+			FAIL("cannot open /dev/null");
 		} else {
-			FAIL("Expected rcclInvalidUsage and a NULL memory handle");
+			res = plugin->regMrDmaBuf(NULL, (void *)0x1000, 4096,
+						  NCCL_PTR_DMABUF, 0, fd,
+						  &mhandle);
+			if (res == rcclSuccess && mhandle != NULL) {
+				rcclResult_t dres = plugin->deregMr(NULL,
+								    mhandle);
+				if (dres == rcclSuccess)
+					PASS();
+				else
+					FAIL("deregMr failed after regMrDmaBuf");
+			} else {
+				FAIL("expected rcclSuccess and a non-NULL handle");
+			}
+			close(fd);
+		}
+	}
+
+	/* A closed fd cannot be registered — must fail loudly, not claim
+	 * success while dropping the fd. */
+	TEST("regMrDmaBuf rejects an invalid fd");
+	{
+		int fd = open("/dev/null", O_RDONLY);
+		void *mhandle = (void *)1;
+		rcclResult_t res;
+
+		if (fd < 0) {
+			FAIL("cannot open /dev/null");
+		} else {
+			close(fd);   /* fd now invalid */
+			res = plugin->regMrDmaBuf(NULL, NULL, 4096,
+						  NCCL_PTR_DMABUF, 128, fd,
+						  &mhandle);
+			if (res != rcclSuccess && mhandle == NULL)
+				PASS();
+			else
+				FAIL("expected an error and a NULL handle");
 		}
 	}
 
@@ -103,9 +141,11 @@ int odl_tb5_test_plugin(void)
 
 		if (ndev > 0) {
 			rcclNetProperties_v7_t props;
+			int want = NCCL_PTR_HOST | NCCL_PTR_CUDA |
+				   NCCL_PTR_DMABUF;
 			rcclResult_t res = plugin->getProperties(0, &props);
 			if (res == rcclSuccess && props.speed > 0 &&
-			    props.ptrSupport == NCCL_PTR_HOST) {
+			    props.ptrSupport == want) {
 				printf("PASS (name=%s, speed=%d, ptr=%d)\n",
 				       props.name, props.speed, props.ptrSupport);
 				pass_count++;

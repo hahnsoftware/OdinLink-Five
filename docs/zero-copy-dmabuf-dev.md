@@ -19,9 +19,12 @@ plugin `regMrDmaBuf` entry point and then call the stream/DMA-BUF send/recv.
 
 ## DMA-BUF registration path
 
-The plugin's `regMrDmaBuf` refuses unsupported registrations (the single-box
-`odl_tb5_test` RCCL suite asserts this). Once a DMA-BUF fd is handed in, the
-library passes it straight to the kernel via the stream ioctls:
+The plugin's `regMrDmaBuf` duplicates the dmabuf fd and keeps it (plus
+the base offset) in the mhandle, which `isend`/`irecv` then pass to the
+stream DMA-BUF ioctls — the single-box `odl_tb5_test` RCCL suite
+asserts both the successful registration and the rejection of a bad
+fd. Once a DMA-BUF fd is handed in, the library passes it straight to
+the kernel via the stream ioctls:
 
 ```
 ODL_TB5_IOCTL_STREAM_SEND_DMABUF  0x26   struct odl_tb5_stream_dmabuf
@@ -31,6 +34,21 @@ ODL_TB5_IOCTL_STREAM_RECV_DMABUF  0x27   struct odl_tb5_stream_dmabuf
 (`driver/uapi/odl_tb5_uapi.h`). The kernel reads `dmabuf_fd`, `offset`, `len`,
 and `stream_id` and drives the DMA engine at the buffer's backing pages — no
 host copy.
+
+## DMA-BUF ordering across connections
+
+The kernel's dmabuf rings carry no stream header: the peer pairs a
+posted RX transfer with a TX transfer purely by post order. RCCL runs
+one proxy thread per channel, so transfers from different connections
+can reach the plugin in any order — if the two boxes posted in
+different orders, bytes would land in the wrong buffers. The plugin
+makes the pairing deterministic with a device-wide control stream
+(fixed id 250): the receiver announces each pending receive with a
+READY message (sent atomically with the RX post under `g_wire_lock`),
+and a single control-stream reader on the sender consumes READYs in
+arrival order and posts the matching TX. READY order == RX post order
+== TX post order on the wire by construction, so multi-channel RCCL
+runs pair transfers identically on both boxes.
 
 ## The raw zero-copy path (`raw_payload_ok`)
 

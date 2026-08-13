@@ -112,6 +112,10 @@ char *odl_daemon_rccl_get_json(void)
 		"\"rx_bytes\": %lu, "
 		"\"tx_ops\": %lu, "
 		"\"rx_ops\": %lu, "
+		"\"dmabuf_tx_bytes\": %lu, "
+		"\"dmabuf_rx_bytes\": %lu, "
+		"\"dmabuf_tx_ops\": %lu, "
+		"\"dmabuf_rx_ops\": %lu, "
 		"\"uptime_sec\": %lu"
 		"}",
 		s->active ? "true" : "false",
@@ -119,6 +123,10 @@ char *odl_daemon_rccl_get_json(void)
 		(unsigned long)s->rx_bytes,
 		(unsigned long)s->tx_ops,
 		(unsigned long)s->rx_ops,
+		(unsigned long)s->dmabuf_tx_bytes,
+		(unsigned long)s->dmabuf_rx_bytes,
+		(unsigned long)s->dmabuf_tx_ops,
+		(unsigned long)s->dmabuf_rx_ops,
 		(unsigned long)uptime_sec);
 
 	g_mutex_unlock(&g_rccl_cache.lock);
