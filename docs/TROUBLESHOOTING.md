@@ -8,6 +8,7 @@
 | Module won't load | Check `dmesg | grep odl_tb5`. Ensure TB5 hardware is present (`lspci | grep Thunderbolt`) |
 | No `/dev/odl_tb5_*` devices | Device appears only when a TB5 peer connects. Check `dmesg` for XDomain events. Use `loopback=1` for no-cable testing |
 | Permission denied | Install udev rule or `sudo chmod 660 /dev/odl_tb5_*` |
+| Probe fails with `DMA buf alloc failed` / `-12` | Host is likely booted with `iommu=pt` — the NHI then sits in an identity IOMMU domain and `dma_alloc_coherent` must return physically contiguous memory. The default `ring_size=4096` needs 16 MB order-12 blocks, which usually fail. The driver now retries with smaller sizes automatically; you can also `modprobe odl_tb5 ring_size=1024` (4 MB, order-10) |
 
 ## Daemon & Tray
 
@@ -30,6 +31,13 @@ If TB5 ports aren't working reliably, add to kernel command line:
 ```
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash pcie_port_pm=off"
 ```
+
+Note: some frameworks (e.g. RCCL) print `Missing "iommu=pt"` warnings and
+recommend booting with it. On virtualisation hosts that is useful — but
+`iommu=pt` puts Thunderbolt's NHI in an identity IOMMU domain, which makes
+large `dma_alloc_coherent` buffers (ODL default `ring_size=4096`, 16 MB)
+unallocatable. The driver now downgrades automatically; if you hit the
+old `DMA buf alloc failed ... -12` symptom, load with `odl_ring_size=1024`.
 
 ## Debug
 

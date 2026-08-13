@@ -2,32 +2,40 @@
 
 ## RCCL (AMD ROCm)
 
-```bash
-export RCCL_NET_PLUGIN=ODL_TB5
-export RCCL_PLUGIN_DIR=/path/to/build/rccl
+### Standard verbs transport (preferred)
 
-# Your RCCL/ROCm application will use TB5 automatically
-```
+Use RCCL's built-in InfiniBand transport through the OdinLink verbs preload.
+OdinLink has no kernel uverbs device, so a normal rdma-core plugin cannot
+discover it by itself.
 
-The RCCL plugin exports shared-memory statistics at `/run/odl_tb5/rccl_stats`.
-The daemon reads these and exposes them via D-Bus; the tray app displays
-TX/RX bytes, operation counts, and uptime in a dedicated RCCL Stats window.
+~~~bash
+export LD_LIBRARY_PATH=/path/to/build/lib:/path/to/build/verbs
+export LD_PRELOAD=/path/to/build/verbs/libodl_tb5_verbs.so
+export NCCL_NET_PLUGIN=IB
+export NCCL_IB_HCA=odl_tb5_0
+export NCCL_DEBUG=INFO
+~~~
 
+The custom ODL_TB5 RCCL plugin uses an old plugin interface and is retained
+only as a legacy path.
+
+For distributed llama.cpp, see [llama.cpp over OdinLink verbs](LLAMA_CPP_RDMA.md).
+Its cross-node path is RPC-RDMA; llama.cpp's HIP/RCCL option only joins GPUs
+visible to one process.
 ## NCCL (NVIDIA CUDA / PyTorch)
 
 ### Option 1: Built-in Verbs Transport (Recommended)
 
 NCCL has a built-in `IB` (InfiniBand Verbs) transport that discovers RDMA
-devices automatically via `ibv_get_device_list`. Once the OdinLink verbs
-provider plugin is installed, NCCL can use it without any custom plugin.
+devices automatically via `ibv_get_device_list`. Inject the standalone OdinLink provider into the NCCL process.
 
 ```bash
-# Install provider plugin (one-time)
-sudo cp build/verbs/libodl_tb5-rdmav34.so /usr/lib/aarch64-linux-gnu/libibverbs/
+export LD_LIBRARY_PATH=/path/to/build/lib:/path/to/build/verbs
+export LD_PRELOAD=/path/to/build/verbs/libodl_tb5_verbs.so
 
 # NCCL discovers ODL automatically via verbs
 export NCCL_NET_PLUGIN=IB
-export NCCL_IB_HCA=odl_tb5               # Restrict to ODL device
+export NCCL_IB_HCA=odl_tb5_0             # Restrict to ODL device
 export NCCL_IB_TIMEOUT=22
 export NCCL_IB_RETRY_CNT=7
 

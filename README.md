@@ -29,8 +29,31 @@ OdinLink turns a Thunderbolt cable into a high-speed RDMA interconnect between m
 | 🟢 | Async I/O | `poll()` + `O_NONBLOCK` ioctls end-to-end |
 | 🟢 | No-cable testing | `loopback=1` module param + mock library |
 | 🟢 | NCCL verbs transport | NCCL's built-in `NCCL_NET_PLUGIN=IB` transport auto-discovers ODL via `ibv_get_device_list` |
-| 🟡 | NCCL custom plugin | DMA-buf zero-copy path (legacy, use verbs transport instead) |
-| 🟡 | Async DMA-buf | Needs callback-based cleanup — stream path is already async via poll() |
+| 🟢 | DMA-buf zero-copy engine | `submit_tx/rx_dmabuf` verified end-to-end (64K–8M, integrity OK, no hang); **block-striped across DMA paths — 17.6 Gb/s**; shared by the verbs `ibv_reg_dmabuf_mr` path |
+| 🟡 | NCCL custom plugin | Deprecated — prefer the verbs transport, which drives the same zero-copy DMA engine |
+| 🟡 | Async / persistent DMA-buf | Transport is correct but synchronous and maps per transfer; completion callbacks exist — async cleanup + map-once (persistent MR) are TODO |
+
+## Measured Performance
+
+Measured point-to-point between two AMD Ryzen AI MAX+ 395 ("Strix Halo")
+boxes over a **USB4 v1** link negotiated at **20 Gb/s × 2 lanes** (kernel
+7.0.14-3-pve).
+
+| Path | Best throughput | Latency (64 B) |
+|---|---|---|
+| Stream, 4 streams / 2 DMA paths (MIMO) | **17.9 Gb/s** (2.24 GB/s) | 21.9 µs round-trip |
+| Zero-copy DMA-buf over verbs, 2 DMA paths | **17.6 Gb/s** (2.20 GB/s) | 4.85 µs (`ib_send_lat`, host path) |
+
+**Multi-path striping** is the throughput lever: the ~9.3 Gb/s cap is *per DMA
+path* (router credits), so aggregate scales with parallel ring/HopID pairs. On
+Strix Halo the NHI ring budget caps usable paths at **2**; the driver
+negotiates `min(local, remote)` paths and degrades gracefully. Both the stream
+path (`odl_num_paths`) and the zero-copy DMA-buf path (block-striped across
+negotiated paths) reach ~17.5–17.9 Gb/s — the DMA-buf path is the one an
+RCCL/GPU workload actually takes.
+
+📊 **Full results, per-benchmark reproduction commands, and single-vs-multi-path
+comparisons → [`BENCHMARKS.md`](BENCHMARKS.md)**
 
 ## Quick Start
 
@@ -253,6 +276,7 @@ working implementation. See [`COMPAT.md`](COMPAT.md).
 
 | Resource | Link |
 |----------|------|
+| Benchmarks + reproduction commands | [`BENCHMARKS.md`](BENCHMARKS.md) |
 | Install guide | [`docs/INSTALL.md`](docs/INSTALL.md) |
 | GPU / NCCL / RCCL | [`docs/GPU.md`](docs/GPU.md) |
 | Troubleshooting | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) |
