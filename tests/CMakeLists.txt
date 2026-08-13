@@ -51,3 +51,14 @@ target_include_directories(odl_stream_verify PRIVATE
     ${CMAKE_SOURCE_DIR}/driver/uapi
 )
 target_link_libraries(odl_stream_verify odl_tb5 pthread)
+
+add_executable(odl_tb5_test_plugin_pair
+    odl_tb5_test_plugin_pair.c
+)
+
+target_include_directories(odl_tb5_test_plugin_pair PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/include
+    ${CMAKE_SOURCE_DIR}/driver/uapi
+    ${CMAKE_SOURCE_DIR}/third_party/rccl
+)
+target_link_libraries(odl_tb5_test_plugin_pair rccl_net_odl_tb5 dl)
