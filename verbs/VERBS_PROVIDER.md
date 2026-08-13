@@ -72,10 +72,16 @@ LD_LIBRARY_PATH=build/verbs:build/lib \
 | `ibv_reg_dmabuf_mr` | DMA-buf fd passthrough | ✅ (GPU zero-copy) |
 | `ibv_create_cq` | completion ring + eventfd | N/A |
 | `ibv_create_qp` | `odl_tb5_stream_open` | N/A |
-| `ibv_post_send` | enqueue → worker → `stream_send` | ✅ (async) |
-| `ibv_post_recv` | `stream_recv` (blocking) | ❌ |
+| `ibv_post_send` (SEND) | enqueue → worker → `stream_send` | ✅ (async) |
+| `ibv_post_send` (RDMA WRITE / WRITE_WITH_IMM) | header + payload frame → peer places at `remote_addr` | ✅ (async) |
+| `ibv_post_send` (RDMA READ) | READ_REQ header → peer replies READ_RESP + payload | ✅ (async) |
+| `ibv_post_recv` | RQ ring, drained by recv worker | ❌ |
 | `ibv_poll_cq` | dequeue from eventfd ring | N/A |
-| `ibv_modify_qp` | stream state tracking | N/A |
+| `ibv_modify_qp` | stream state tracking + peer stream id | N/A |
+
+Supported `ibv_post_send` opcodes: `IBV_WR_SEND`, `IBV_WR_RDMA_WRITE`,
+`IBV_WR_RDMA_WRITE_WITH_IMM`, `IBV_WR_RDMA_READ`. `IBV_SEND_SIGNALED` is
+honoured; `max_send_sge`/`max_recv_sge` are 1 and inline data is unsupported.
 
 ## Async Completion Model
 
@@ -97,6 +103,70 @@ post struct ibv_wc → CQ ring
     ├── eventfd_write()     ← wakes ibv_get_cq_event()
     └── ibv_poll_cq()       ← drains from CQ ring
 ```
+
+## One-Sided RDMA over a Two-Sided Transport
+
+The NHI stream transport is **two-sided** (SEND/RECV) and has no concept of a
+remote address. RDMA WRITE/READ — which `ib_write_bw`/`ib_read_bw` and RCCL's
+IB net transport require — are emulated by prefixing every stream message with a
+small operation header (`struct odl_rdma_hdr`). Because the transport preserves
+message boundaries (1 `stream_send` == 1 `stream_recv`), the responder reads the
+header first and dispatches on the opcode. Each verb is one header message,
+optionally followed by one payload message:
+
+```
+initiator                         responder (recv worker = dispatcher)
+─────────                         ────────────────────────────────────
+RDMA WRITE   [hdr WRITE|rkey|va] → look up local MR by rkey, recv payload
+             [payload]           →   straight into remote_addr  (no completion)
+
+WRITE_IMM    [hdr WRITE_IMM|imm] → place payload, then consume an RQ WR and
+             [payload]           →   post IBV_WC_RECV_RDMA_WITH_IMM(imm)
+
+RDMA READ    [hdr READ_REQ|rkey] → read local MR, enqueue READ_RESP on the
+                                 ←   send worker: [hdr READ_RESP][payload]
+             place payload in local buffer, complete IBV_WC_RDMA_READ
+
+SEND         [hdr SEND]          → consume an RQ WR, recv payload,
+             [payload]           →   post IBV_WC_RECV
+```
+
+Key points:
+
+- **rkey → MR reverse map.** Every MR (host and dmabuf) gets a unique non-zero
+  `lkey`/`rkey`. `odl_find_mr_by_rkey()` maps the wire rkey back to the local MR
+  so the responder knows where `remote_addr` lands. For host MRs `remote_addr`
+  is directly a valid pointer into the responder's own registered buffer; for
+  dmabuf MRs it is the rkey-relative offset into the target dmabuf (zero-copy).
+- **All TX on one thread.** The send worker is the only thread that transmits,
+  so the `[hdr][payload]` pair is never interleaved with another op. The recv
+  worker answers a READ by *enqueuing* a READ_RESP descriptor onto the send
+  worker rather than transmitting itself.
+- **Passive target.** One-sided WRITE/READ need no posted receive on the target
+  — the recv worker always reads incoming headers, so it services them whether
+  or not the application posted anything.
+- **Both ends run this provider**, so the framing is private and self-consistent
+  (header fields are native little-endian; both test boxes are x86-64).
+
+### Bootstrap ordering caveat
+
+A *simultaneous* bidirectional first-contact SEND — both peers posting a send on
+a fresh QP before either has received anything — can drop one message on this
+transport. Real apps never do this: perftest and RCCL/NCCL exchange QP
+parameters over their own TCP bootstrap, and ping-pong benchmarks alternate
+directions. The `test_verbs_write_imm` rendezvous is therefore ordered
+(client sends first, server replies). RDMA WRITE/READ are unaffected — only the
+initial QP-level SEND handshake needs to avoid a dead heat.
+
+### Not yet implemented: RDMA CM
+
+`rdma_cm`/`librdmacm` connection management (`rping`, perftest `-R`) is **not**
+implemented. It is deliberately lowest priority: RCCL/NCCL's IB transport and
+default perftest exchange QP information (qpn, psn, rkey, VA) over their **own
+TCP bootstrap** and connect with `ibv_modify_qp` — they never call into
+`librdmacm`. A future CM shim would interpose the `rdma_*` entry points and run a
+small TCP-based rendezvous that drives the same `ibv_modify_qp` RESET→INIT→RTR→
+RTS sequence the ibverbs path already uses.
 
 ## Device Discovery
 
@@ -162,6 +232,55 @@ NCCL_DEBUG=INFO torchrun --nproc_per_node=1 --nnodes=2 \
     train.py
 ```
 
+## Native RCCL integration
+
+RCCL's built-in `NET/IB` transport opens `libibverbs` privately. A normal
+`LD_PRELOAD=libodl_tb5_verbs.so` does not affect calls looked up through that
+private handle. The small dlopen bridge redirects only RCCL/NCCL's private
+`libibverbs` load to the standalone OdinLink provider. It does not select the
+legacy OdinLink RCCL plugin.
+
+Build and install both libraries on every rank:
+
+```bash
+cmake --build build --target odl_tb5_verbs odl_tb5_verbs_dlopen_bridge -j"$(nproc)"
+sudo cmake --install build --component verbs
+sudo ldconfig
+```
+
+Run RCCL with its standard IB transport:
+
+```bash
+export LD_PRELOAD=/usr/local/lib/libodl_tb5_verbs_dlopen_bridge.so
+export ODL_TB5_VERBS_LIBRARY=/usr/local/lib/libodl_tb5_verbs.so.0
+export NCCL_NET=IB
+export NCCL_IB_HCA=odl_tb5_0
+export NCCL_DEBUG=INFO
+```
+
+`ODL_TB5_VERBS_LIBRARY` is optional when the provider is in the dynamic
+linker's normal search path. The bridge falls back to the real `libibverbs` if
+the OdinLink provider cannot be opened. Set
+`ODL_TB5_VERBS_DLOPEN_BRIDGE_ALL=1` only for the private-handle probe below;
+normal applications should leave it unset so unrelated libraries keep using
+the system provider.
+
+Hardware readiness and RCCL's private lookup can be checked independently:
+
+```bash
+LD_PRELOAD=build/verbs/libodl_tb5_verbs.so \
+  build/verbs/tests/test_verbs_rccl_probe
+
+LD_LIBRARY_PATH=build/verbs:build/lib \
+LD_PRELOAD=build/verbs/libodl_tb5_verbs_dlopen_bridge.so \
+ODL_TB5_VERBS_DLOPEN_BRIDGE_ALL=1 \
+ODL_TB5_VERBS_LIBRARY=build/verbs/libodl_tb5_verbs.so.0 \
+  build/verbs/tests/test_verbs_dlopen_probe
+```
+
+The first test checks that the cable device looks like an active 20 Gb/s IB
+port. The second checks every versioned verbs entry point that RCCL resolves
+and confirms that its private handle can see `odl_tb5_0`.
 ## Linux ↔ macOS Compatibility
 
 The verbs provider on Linux creates the same `ibv_*` API surface that Apple's `libthunderboltrdma.dylib` provides on macOS. If the NHI DMA ring protocol is wire-compatible, the same application code runs on both platforms without changes.

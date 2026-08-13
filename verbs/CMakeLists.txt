@@ -153,3 +153,24 @@ install(FILES
 message(STATUS "BUILD_VERBS: ON")
 message(STATUS "  Standalone lib:   odl_tb5_verbs")
 message(STATUS "  Provider plugin:  ${ODL_VERBS_BUILD_PROVIDER_PLUGIN}")
+
+# Hardware-facing smoke tests. They build with the provider but are not
+# registered with CTest because they require connected hosts and the driver.
+foreach(TEST_NAME
+    test_verbs_basic
+    test_verbs_dmabuf
+    test_verbs_write_imm
+    bench_verbs_dmabuf
+    test_verbs_rccl_probe)
+    add_executable(${TEST_NAME} tests/${TEST_NAME}.c)
+    target_include_directories(${TEST_NAME} PRIVATE ${VERBS_PRIVATE_INCLUDES})
+    target_link_libraries(${TEST_NAME} odl_tb5_verbs ${VERBS_LIBS})
+    set_target_properties(${TEST_NAME} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests)
+endforeach()
+
+add_executable(test_verbs_dlopen_probe tests/test_verbs_dlopen_probe.c)
+target_include_directories(test_verbs_dlopen_probe PRIVATE ${IBVERBS_INCLUDE_DIRS})
+target_link_libraries(test_verbs_dlopen_probe dl)
+set_target_properties(test_verbs_dlopen_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests)

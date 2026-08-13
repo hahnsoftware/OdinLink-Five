@@ -153,6 +153,7 @@ static int make_dmabuf_fd(size_t size, int *is_real)
 
 int main(void)
 {
+    int failures = 0;
     int ndev = odl_num_tb5_devices();
     printf("OdinLink devices found: %d\n", ndev);
 
@@ -194,8 +195,11 @@ int main(void)
         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 
     if (!mr) {
-        printf("ibv_reg_dmabuf_mr returned NULL (rdma-core too old?)\n");
-        printf("SKIP\n");
+        printf("ibv_reg_dmabuf_mr returned NULL\n");
+        if (is_real_dmabuf)
+            failures++;
+        else
+            printf("SKIP: memfd fallback is not a real DMA buffer\n");
         close(dmabuf_fd);
         goto cleanup_pd;
     }
@@ -293,7 +297,8 @@ int main(void)
             printf("10. CQ polled: wr_id=%lu status=%s\n",
                    (unsigned long)wc.wr_id,
                    wc.status == IBV_WC_SUCCESS ? "SUCCESS" : "FAIL");
-            assert(wc.status == IBV_WC_SUCCESS);
+            if (wc.status != IBV_WC_SUCCESS)
+                failures++;
         } else {
             printf("10. CQ poll timed out (no completion within 100ms)\n");
             /* This can happen with a memfd (kernel dma_buf_get fails).
@@ -301,11 +306,16 @@ int main(void)
              * exercised, the fd just can't map to real pages. */
             if (!is_real_dmabuf)
                 printf("    (expected with memfd — not a real dmabuf)\n");
+            else
+                failures++;
         }
     } else {
         printf("9. ibv_post_send returned %d (%s)\n",
-               ret, strerror(-ret));
-        printf("    (expected if no peer or memfd rejected by kernel)\n");
+               ret, strerror(ret > 0 ? ret : -ret));
+        if (is_real_dmabuf)
+            failures++;
+        else
+            printf("    (expected if memfd is rejected by kernel)\n");
     }
 
     /* ── cleanup ──────────────────────────────────────────────── */
@@ -318,6 +328,12 @@ int main(void)
 cleanup_pd:
     ibv_dealloc_pd(pd);
     ibv_close_device(ctx);
+
+    if (failures) {
+        printf("\nDMABUF VERBS TEST FAILED: %d completion timeout(s)\n",
+               failures);
+        return 1;
+    }
 
     printf("\n%s\n", is_real_dmabuf
            ? "ALL DMABUF VERBS TESTS PASSED"
