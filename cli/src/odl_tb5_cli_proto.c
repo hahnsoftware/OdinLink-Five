@@ -13,7 +13,12 @@
 #include <unistd.h>
 #include <stdlib.h>
 
-static uint32_t g_sequence;
+static uint32_t g_sequence = 1;
+
+uint32_t odl_cli_next_sequence(void)
+{
+	return __atomic_fetch_add(&g_sequence, 1, __ATOMIC_RELAXED);
+}
 
 int odl_cli_send_msg(odl_tb5_t handle, uint8_t stream_id, uint8_t dst_id,
 		     uint32_t type, uint32_t seq,
@@ -90,7 +95,7 @@ int odl_cli_send_hello(odl_tb5_t handle, uint8_t stream_id, uint8_t dst_id)
 	hello.capabilities = 0;
 
 	return odl_cli_send_msg(handle, stream_id, dst_id,
-				ODL_CLI_MSG_HELLO, g_sequence++,
+				ODL_CLI_MSG_HELLO, odl_cli_next_sequence(),
 				&hello.hostname, sizeof(hello) - sizeof(hello.hdr));
 }
 

@@ -207,6 +207,7 @@ static inline const char *odl_format_size(uint64_t bytes, char *buf, size_t len)
 int odl_cli_send_msg(odl_tb5_t handle, uint8_t stream_id, uint8_t dst_id,
 		     uint32_t type, uint32_t seq,
 		     const void *payload, size_t payload_len);
+uint32_t odl_cli_next_sequence(void);
 int odl_cli_recv_msg(odl_tb5_t handle, uint8_t stream_id,
 		     void *buf, size_t buf_size,
 		     uint32_t *type, uint32_t *seq, uint8_t *src_id);
@@ -226,7 +227,8 @@ int odl_cli_run_server(const struct odl_cli_params *params);
 int odl_cli_run_client(const struct odl_cli_params *params);
 
 int odl_cli_bandwidth_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
-			     const struct odl_cli_params *params);
+			     const struct odl_cli_params *params,
+			     uint32_t block_size, uint32_t request_seq);
 int odl_cli_latency_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			    const struct odl_cli_params *params);
 int odl_cli_latency_load_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
@@ -237,7 +239,8 @@ int odl_cli_jitter_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			   const struct odl_cli_params *params);
 
 int odl_cli_bandwidth_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,
-			      const struct odl_cli_test_req *req);
+			     const struct odl_cli_test_req *req,
+			     uint32_t request_seq);
 int odl_cli_latency_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			    const struct odl_cli_test_req *req);
 int odl_cli_latency_load_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,

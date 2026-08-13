@@ -12,11 +12,13 @@
 
 static int send_test_request(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			     const struct odl_cli_params *params,
-			     enum odl_cli_test_type test_type, uint32_t block_size)
+			     enum odl_cli_test_type test_type, uint32_t block_size,
+			     uint32_t *request_seq)
 {
 	struct odl_cli_test_req req;
 	char msg_buf[4096];
 	uint32_t type, seq;
+	uint32_t sent_seq = odl_cli_next_sequence();
 	int ret;
 
 	memset(&req, 0, sizeof(req));
@@ -32,7 +34,7 @@ static int send_test_request(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	if (params->warmup_iters > 0)
 		req.flags |= ODL_TEST_FLAG_WARMUP;
 
-	ret = odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_TEST_REQ, 0,
+	ret = odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_TEST_REQ, sent_seq,
 			       &req.test_type,
 			       sizeof(req) - sizeof(req.hdr));
 	if (ret < 0)
@@ -43,8 +45,10 @@ static int send_test_request(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	if (ret < 0)
 		return ret;
 
-	if (type != ODL_CLI_MSG_TEST_ACK)
+	if (type != ODL_CLI_MSG_TEST_ACK || seq != sent_seq)
 		return -EPROTO;
+	if (request_seq)
+		*request_seq = sent_seq;
 
 	return 0;
 }
@@ -57,19 +61,26 @@ static int run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 
 	switch (test_type) {
 	case ODL_TEST_BANDWIDTH:
-		ret = send_test_request(handle, sid, dst, params, test_type,
-					params->block_sizes[0]);
-		if (ret < 0)
-			return ret;
+		for (int i = 0; i < params->num_block_sizes; i++) {
+			uint32_t request_seq;
+			uint32_t block_size = params->block_sizes[i];
 
-		ret = odl_cli_bandwidth_client(handle, sid, dst, params);
+			ret = send_test_request(handle, sid, dst, params, test_type,
+						block_size, &request_seq);
+			if (ret < 0)
+				return ret;
+			ret = odl_cli_bandwidth_client(handle, sid, dst, params,
+						       block_size, request_seq);
+			if (ret < 0)
+				return ret;
+		}
 		break;
 
 	case ODL_TEST_LATENCY:
 		printf("\n--- Latency Test (%u iterations) ---\n",
 		       params->iterations);
 		ret = send_test_request(handle, sid, dst, params, test_type,
-					params->block_sizes[0]);
+					params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_latency_client(handle, sid, dst, params);
@@ -78,7 +89,7 @@ static int run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	case ODL_TEST_LATENCY_LOAD:
 		printf("\n--- Latency Under Load Test ---\n");
 		ret = send_test_request(handle, sid, dst, params, test_type,
-					params->block_sizes[0]);
+					params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_latency_load_client(handle, sid, dst, params);
@@ -88,7 +99,7 @@ static int run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 		printf("\n--- MIMO Test (%u streams) ---\n",
 		       params->num_streams);
 		ret = send_test_request(handle, sid, dst, params, test_type,
-					params->block_sizes[0]);
+					params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_mimo_client(handle, sid, dst, params);
@@ -98,7 +109,7 @@ static int run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 		printf("\n--- Jitter Test (%u iterations) ---\n",
 		       params->iterations);
 		ret = send_test_request(handle, sid, dst, params, test_type,
-					params->block_sizes[0]);
+					params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_jitter_client(handle, sid, dst, params);

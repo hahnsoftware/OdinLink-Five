@@ -5,6 +5,22 @@
  * simultaneously. Tests how well the multiplexed I/O path handles
  * concurrent traffic — relevant for NCCL collective operations where
  * multiple GPUs are sending at the same time.
+ *
+ * Each worker thread drives its OWN stream with a distinct stream ID.
+ * This matters for two reasons:
+ *   1. The driver pins a stream onto a TX path via stream_id %
+ *      tx_active_paths. Distinct IDs with mixed parity therefore spread
+ *      the load across both paths (real multi-path striping). A single
+ *      shared ID would pin everything onto one path.
+ *   2. Only one sender per stream keeps the stream-internal flow-control
+ *      (tx_in_flight / tx_queue_max) from deadlocking. Multiple senders
+ *      on one stream hang uninterruptibly at join.
+ *
+ * Client and server agree on the set of data-stream IDs implicitly:
+ * both derive them as ODL_MIMO_STREAM_BASE + i for i in [0, num_streams).
+ * num_streams travels to the server inside the TEST_REQ. A short ready
+ * handshake (server opens its N streams, then ACKs on the control stream)
+ * ensures the client does not send into filters the server has not opened.
  */
 #include "odl_tb5_cli.h"
 
@@ -14,19 +30,40 @@
 #include <errno.h>
 #include <pthread.h>
 
+/*
+ * Base filter/stream ID for MIMO data streams. Chosen to avoid the
+ * well-known control IDs (ODL_STREAM_TEST=1, ODL_STREAM_SYNC=2,
+ * ODL_STREAM_CLI=10). Even base + i gives mixed parity across streams so
+ * that, with 2 active paths, streams alternate between path 0 and path 1.
+ */
+#define ODL_MIMO_STREAM_BASE  20
+#define ODL_MIMO_STREAM_MAX   200   /* keep base + i within uint8 range */
+
+/* Resolve num_streams the same way on both sides. */
+static uint32_t mimo_resolve_streams(uint32_t requested)
+{
+	uint32_t n = requested ? requested : ODL_DEFAULT_STREAMS;
+
+	if (n > ODL_MIMO_STREAM_MAX)
+		n = ODL_MIMO_STREAM_MAX;
+	return n;
+}
+
+/* ── Client side ───────────────────────────────────────────────────── */
+
 struct mimo_stream_ctx {
-	odl_tb5_t    handle;
-	uint8_t      sid;
-	uint8_t      dst;
-	int          stream_id;
-	uint32_t     block_size;
-	uint32_t     duration_sec;
+	odl_tb5_t     handle;
+	uint8_t       sid;        /* local data stream we send FROM */
+	uint8_t       dst;        /* peer data stream we send TO */
+	int           stream_id;  /* logical index, for reporting */
+	uint32_t      block_size;
+	uint32_t      duration_sec;
 	volatile bool stop;
-	uint64_t     bytes_transferred;
-	uint64_t     elapsed_ns;
+	uint64_t      bytes_transferred;
+	uint64_t      elapsed_ns;
 };
 
-/* Worker thread for a single MIMO stream. */
+/* Worker thread for a single MIMO stream (one sender per stream). */
 static void *mimo_stream_thread(void *arg)
 {
 	struct mimo_stream_ctx *ctx = (struct mimo_stream_ctx *)arg;
@@ -62,6 +99,26 @@ static void *mimo_stream_thread(void *arg)
 	return NULL;
 }
 
+/* Wait for a specific control message on the control stream. */
+static int mimo_wait_ctrl(odl_tb5_t handle, uint8_t sid, uint32_t want_type)
+{
+	char buf[4096];
+	uint32_t type, seq;
+	int ret;
+
+	for (;;) {
+		ret = odl_cli_recv_msg(handle, sid, buf, sizeof(buf),
+				       &type, &seq, NULL);
+		if (ret == -ETIMEDOUT)
+			continue;
+		if (ret < 0)
+			return ret;
+		if (type == want_type)
+			return 0;
+		/* ignore unexpected control chatter */
+	}
+}
+
 /* Client (initiator) for MIMO test. */
 int odl_cli_mimo_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			 const struct odl_cli_params *params)
@@ -71,14 +128,14 @@ int odl_cli_mimo_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	uint32_t num_streams;
 	uint32_t block_size;
 	uint32_t duration_sec;
+	uint32_t opened = 0;
 	uint64_t total_bytes = 0;
 	uint64_t max_elapsed_ns = 0;
 	char msg_buf[4096];
 	uint32_t type, seq;
 	int ret;
 
-	num_streams = params->num_streams ? params->num_streams
-					  : ODL_DEFAULT_STREAMS;
+	num_streams = mimo_resolve_streams(params->num_streams);
 	block_size = params->block_sizes[0] ? params->block_sizes[0]
 					    : ODL_DEFAULT_BLOCK_SIZE;
 	duration_sec = params->duration_sec ? params->duration_sec
@@ -90,33 +147,52 @@ int odl_cli_mimo_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	       odl_format_size(block_size, size_buf, sizeof(size_buf)));
 	printf("  Duration: %u seconds\n", duration_sec);
 
-	ret = odl_cli_send_msg(handle, sid, dst,
-			       ODL_CLI_MSG_TEST_START, 0, NULL, 0);
-	if (ret < 0)
-		return ret;
-
 	streams = calloc(num_streams, sizeof(*streams));
-	if (!streams) {
-		ret = -ENOMEM;
-		goto out_stop;
-	}
+	if (!streams)
+		return -ENOMEM;
 
 	threads = calloc(num_streams, sizeof(*threads));
 	if (!threads) {
-		ret = -ENOMEM;
-		goto out_free;
+		free(streams);
+		return -ENOMEM;
 	}
 
+	/* Open one distinct data stream per worker. */
 	for (uint32_t i = 0; i < num_streams; i++) {
+		uint8_t filter = (uint8_t)(ODL_MIMO_STREAM_BASE + i);
+		uint8_t data_sid;
+
+		ret = odl_tb5_stream_open(handle, filter, &data_sid);
+		if (ret < 0) {
+			fprintf(stderr, "  Failed to open data stream %u: %s\n",
+				i, strerror(-ret));
+			goto out_close;
+		}
+
 		streams[i].handle = handle;
-		streams[i].sid = sid;
-		streams[i].dst = dst;
+		streams[i].sid = data_sid;
+		streams[i].dst = filter;   /* peer opens the same filter id */
 		streams[i].stream_id = (int)i;
 		streams[i].block_size = block_size;
 		streams[i].duration_sec = duration_sec;
 		streams[i].stop = false;
 		streams[i].bytes_transferred = 0;
 		streams[i].elapsed_ns = 0;
+		opened++;
+	}
+
+	/* Tell the server to start and open its matching data streams. */
+	ret = odl_cli_send_msg(handle, sid, dst,
+			       ODL_CLI_MSG_TEST_START, 0, NULL, 0);
+	if (ret < 0)
+		goto out_close;
+
+	/* Wait until the server has its data streams open (ready ACK). */
+	ret = mimo_wait_ctrl(handle, sid, ODL_CLI_MSG_TEST_ACK);
+	if (ret < 0) {
+		fprintf(stderr, "  Server did not become ready: %s\n",
+			strerror(-ret));
+		goto out_stop;
 	}
 
 	printf("  Launching %u streams...\n", num_streams);
@@ -131,7 +207,7 @@ int odl_cli_mimo_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			for (uint32_t j = 0; j < i; j++)
 				pthread_join(threads[j], NULL);
 			ret = -ret;
-			goto out_free;
+			goto out_stop;
 		}
 	}
 
@@ -188,10 +264,6 @@ int odl_cli_mimo_client(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 
 	ret = 0;
 
-out_free:
-	free(threads);
-	free(streams);
-
 out_stop:
 	odl_cli_send_msg(handle, sid, dst,
 			 ODL_CLI_MSG_TEST_STOP, 0, NULL, 0);
@@ -211,74 +283,160 @@ out_stop:
 				 &type, &seq, NULL);
 	}
 
+out_close:
+	for (uint32_t i = 0; i < opened; i++)
+		odl_tb5_stream_close(handle, streams[i].sid);
+
+	free(threads);
+	free(streams);
+
 	return ret;
+}
+
+/* ── Server side ───────────────────────────────────────────────────── */
+
+struct mimo_rx_ctx {
+	odl_tb5_t     handle;
+	uint8_t       sid;        /* local data stream we receive on */
+	uint32_t      buf_size;
+	volatile bool *stop;
+	uint64_t      bytes_received;
+	int           stream_id;
+};
+
+/* Receiver thread for a single MIMO data stream. */
+static void *mimo_rx_thread(void *arg)
+{
+	struct mimo_rx_ctx *ctx = (struct mimo_rx_ctx *)arg;
+	uint8_t *buf;
+
+	buf = malloc(ctx->buf_size);
+	if (!buf)
+		return NULL;
+
+	while (!*ctx->stop) {
+		uint8_t src_id;
+		uint32_t actual_len;
+		int ret;
+
+		ret = odl_tb5_stream_wait_rx(ctx->handle, ctx->sid, 500);
+		if (ret == -ETIMEDOUT)
+			continue;   /* re-check stop flag */
+		if (ret < 0)
+			break;
+
+		ret = odl_tb5_stream_recv(ctx->handle, ctx->sid, buf,
+					  ctx->buf_size, &src_id, &actual_len);
+		if (ret < 0)
+			break;
+
+		ctx->bytes_received += actual_len;
+	}
+
+	free(buf);
+	return NULL;
 }
 
 /* Server (responder) for MIMO test. */
 int odl_cli_mimo_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 			 const struct odl_cli_test_req *req)
 {
-	uint8_t *recv_buf = NULL;
-	uint32_t recv_buf_size;
+	struct mimo_rx_ctx *rx = NULL;
+	pthread_t *threads = NULL;
+	uint32_t num_streams;
+	uint32_t block_size;
+	uint32_t buf_size;
+	uint32_t opened = 0;
+	volatile bool stop = false;
 	char msg_buf[4096];
 	uint32_t type, seq;
 	uint64_t bytes_received = 0;
 	uint64_t t_start, t_end = 0;
 	int ret;
 
-	recv_buf_size = ODL_DEFAULT_BLOCK_SIZE > 4096 ?
-			ODL_DEFAULT_BLOCK_SIZE : 4096;
+	num_streams = mimo_resolve_streams(req->num_streams);
+	block_size = req->block_size ? req->block_size : ODL_DEFAULT_BLOCK_SIZE;
+	buf_size = block_size > 4096 ? block_size : 4096;
 
-	ret = odl_cli_recv_msg(handle, sid, msg_buf, sizeof(msg_buf),
-			       &type, &seq, NULL);
+	/* Wait for the client's TEST_START on the control stream. */
+	ret = mimo_wait_ctrl(handle, sid, ODL_CLI_MSG_TEST_START);
 	if (ret < 0)
 		return ret;
 
-	if (type != ODL_CLI_MSG_TEST_START)
-		return -EPROTO;
+	printf("  [Server] MIMO test starting (%u streams)\n", num_streams);
 
-	printf("  [Server] MIMO test started (%u streams)\n",
-	       req->num_streams);
-
-	recv_buf = malloc(recv_buf_size);
-	if (!recv_buf)
+	rx = calloc(num_streams, sizeof(*rx));
+	if (!rx)
 		return -ENOMEM;
+
+	threads = calloc(num_streams, sizeof(*threads));
+	if (!threads) {
+		free(rx);
+		return -ENOMEM;
+	}
+
+	/* Open the matching data streams before we ACK ready. */
+	for (uint32_t i = 0; i < num_streams; i++) {
+		uint8_t filter = (uint8_t)(ODL_MIMO_STREAM_BASE + i);
+		uint8_t data_sid;
+
+		ret = odl_tb5_stream_open(handle, filter, &data_sid);
+		if (ret < 0) {
+			fprintf(stderr,
+				"  [Server] Failed to open data stream %u: %s\n",
+				i, strerror(-ret));
+			goto out_close;
+		}
+
+		rx[i].handle = handle;
+		rx[i].sid = data_sid;
+		rx[i].buf_size = buf_size;
+		rx[i].stop = &stop;
+		rx[i].bytes_received = 0;
+		rx[i].stream_id = (int)i;
+		opened++;
+	}
 
 	t_start = odl_time_ns();
 
-	for (;;) {
-		uint8_t src_id;
-		uint32_t actual_len;
-
-		ret = odl_tb5_stream_wait_rx(handle, sid, 2000);
-		if (ret == -ETIMEDOUT)
-			continue;
-		if (ret < 0)
-			break;
-
-		ret = odl_tb5_stream_recv(handle, sid, recv_buf, recv_buf_size,
-					  &src_id, &actual_len);
-		if (ret < 0)
-			break;
-
-		/* Check for CLI control messages */
-		if (actual_len >= sizeof(struct odl_cli_header)) {
-			struct odl_cli_header *hdr =
-				(struct odl_cli_header *)recv_buf;
-			if (hdr->magic == ODL_CLI_MAGIC &&
-			    hdr->type == ODL_CLI_MSG_TEST_STOP) {
-				t_end = odl_time_ns();
-				break;
-			}
+	for (uint32_t i = 0; i < num_streams; i++) {
+		ret = pthread_create(&threads[i], NULL,
+				     mimo_rx_thread, &rx[i]);
+		if (ret != 0) {
+			fprintf(stderr,
+				"  [Server] Failed to create rx thread %u: %s\n",
+				i, strerror(ret));
+			stop = true;
+			for (uint32_t j = 0; j < i; j++)
+				pthread_join(threads[j], NULL);
+			ret = -ret;
+			goto out_close;
 		}
-
-		bytes_received += actual_len;
 	}
+
+	/* Signal readiness so the client starts sending. */
+	ret = odl_cli_send_msg(handle, sid, dst,
+			       ODL_CLI_MSG_TEST_ACK, 0, NULL, 0);
+	if (ret < 0) {
+		stop = true;
+		for (uint32_t i = 0; i < num_streams; i++)
+			pthread_join(threads[i], NULL);
+		goto out_close;
+	}
+
+	/* Run until the client says stop (on the control stream). */
+	ret = mimo_wait_ctrl(handle, sid, ODL_CLI_MSG_TEST_STOP);
+	t_end = odl_time_ns();
+
+	stop = true;
+	for (uint32_t i = 0; i < num_streams; i++)
+		pthread_join(threads[i], NULL);
+
+	for (uint32_t i = 0; i < num_streams; i++)
+		bytes_received += rx[i].bytes_received;
 
 	if (t_end == 0)
 		t_end = odl_time_ns();
-
-	free(recv_buf);
 
 	{
 		char size_buf2[64], tp_buf[64];
@@ -297,7 +455,7 @@ int odl_cli_mimo_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 					    tp_buf, sizeof(tp_buf)));
 	}
 
-	/* Receive client's RESULT, send server's RESULT */
+	/* Receive client's RESULT, send server's RESULT. */
 	{
 		struct odl_cli_result result;
 
@@ -307,13 +465,20 @@ int odl_cli_mimo_server(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 
 		ret = odl_cli_recv_msg(handle, sid, msg_buf, sizeof(msg_buf),
 				       &type, &seq, NULL);
-		if (ret < 0)
-			return ret;
-
-		odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_RESULT, 0,
-				 &result.bytes_transferred,
-				 sizeof(result) - sizeof(result.hdr));
+		if (ret >= 0)
+			odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_RESULT, 0,
+					 &result.bytes_transferred,
+					 sizeof(result) - sizeof(result.hdr));
 	}
 
-	return 0;
+	ret = 0;
+
+out_close:
+	for (uint32_t i = 0; i < opened; i++)
+		odl_tb5_stream_close(handle, rx[i].sid);
+
+	free(threads);
+	free(rx);
+
+	return ret;
 }

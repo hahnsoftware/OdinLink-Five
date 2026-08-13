@@ -255,11 +255,13 @@ static int daemon_send_test_request(odl_tb5_t handle, uint8_t sid,
 				    uint8_t dst,
 				    const struct odl_cli_params *params,
 				    enum odl_cli_test_type test_type,
-				    uint32_t block_size)
+				    uint32_t block_size,
+				    uint32_t *request_seq)
 {
 	struct odl_cli_test_req req;
 	char msg_buf[4096];
 	uint32_t type, seq;
+	uint32_t sent_seq = odl_cli_next_sequence();
 	int ret;
 
 	memset(&req, 0, sizeof(req));
@@ -275,7 +277,7 @@ static int daemon_send_test_request(odl_tb5_t handle, uint8_t sid,
 	if (params->warmup_iters > 0)
 		req.flags |= ODL_TEST_FLAG_WARMUP;
 
-	ret = odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_TEST_REQ, 0,
+	ret = odl_cli_send_msg(handle, sid, dst, ODL_CLI_MSG_TEST_REQ, sent_seq,
 			       &req.test_type,
 			       sizeof(req) - sizeof(req.hdr));
 	if (ret < 0)
@@ -286,8 +288,10 @@ static int daemon_send_test_request(odl_tb5_t handle, uint8_t sid,
 	if (ret < 0)
 		return ret;
 
-	if (type != ODL_CLI_MSG_TEST_ACK)
+	if (type != ODL_CLI_MSG_TEST_ACK || seq != sent_seq)
 		return -EPROTO;
+	if (request_seq)
+		*request_seq = sent_seq;
 
 	return 0;
 }
@@ -306,13 +310,17 @@ static int daemon_run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	switch (test_type) {
 	case ODL_TEST_BANDWIDTH:
 		for (int i = 0; i < params->num_block_sizes; i++) {
+			uint32_t request_seq;
+			uint32_t block_size = params->block_sizes[i];
+
 			ret = daemon_send_test_request(handle, sid, dst,
 						       params, test_type,
-						       params->block_sizes[i]);
+						       block_size, &request_seq);
 			if (ret < 0)
 				return ret;
 			ret = odl_cli_bandwidth_client(handle, sid, dst,
-						       params);
+						       params, block_size,
+						       request_seq);
 			if (ret < 0)
 				return ret;
 		}
@@ -321,7 +329,7 @@ static int daemon_run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	case ODL_TEST_LATENCY:
 		ret = daemon_send_test_request(handle, sid, dst, params,
 					       test_type,
-					       params->block_sizes[0]);
+					       params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_latency_client(handle, sid, dst, params);
@@ -330,7 +338,7 @@ static int daemon_run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	case ODL_TEST_LATENCY_LOAD:
 		ret = daemon_send_test_request(handle, sid, dst, params,
 					       test_type,
-					       params->block_sizes[0]);
+					       params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_latency_load_client(handle, sid, dst, params);
@@ -339,7 +347,7 @@ static int daemon_run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	case ODL_TEST_MIMO:
 		ret = daemon_send_test_request(handle, sid, dst, params,
 					       test_type,
-					       params->block_sizes[0]);
+					       params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_mimo_client(handle, sid, dst, params);
@@ -348,7 +356,7 @@ static int daemon_run_single_test(odl_tb5_t handle, uint8_t sid, uint8_t dst,
 	case ODL_TEST_JITTER:
 		ret = daemon_send_test_request(handle, sid, dst, params,
 					       test_type,
-					       params->block_sizes[0]);
+					       params->block_sizes[0], NULL);
 		if (ret < 0)
 			return ret;
 		ret = odl_cli_jitter_client(handle, sid, dst, params);
@@ -888,7 +896,7 @@ static gpointer device_worker_thread(gpointer data)
 					case ODL_TEST_BANDWIDTH:
 						odl_cli_bandwidth_server(
 							handle, sid, src_id,
-							req);
+							req, seq);
 						break;
 					case ODL_TEST_LATENCY:
 						odl_cli_latency_server(

@@ -98,9 +98,9 @@ int odl_cli_run_server(const struct odl_cli_params *params)
 		}
 
 		if (type != ODL_CLI_MSG_TEST_REQ) {
-			if (params->verbose)
-				fprintf(stderr, "Unexpected message type: 0x%x\n", type);
-			continue;
+			fprintf(stderr, "Unexpected message type: 0x%x\n", type);
+			ret = -EPROTO;
+			break;
 		}
 
 		struct odl_cli_test_req *req = (struct odl_cli_test_req *)msg_buf;
@@ -116,35 +116,41 @@ int odl_cli_run_server(const struct odl_cli_params *params)
 		case ODL_TEST_BANDWIDTH:
 			printf("[Server] Running bandwidth test (block=%u, dur=%us)...\n",
 			       req->block_size, req->duration_sec);
-			odl_cli_bandwidth_server(handle, sid, src_id, req);
+			ret = odl_cli_bandwidth_server(handle, sid, src_id, req, seq);
 			break;
 
 		case ODL_TEST_LATENCY:
 			printf("[Server] Running latency test (iters=%u)...\n",
 			       req->iterations);
-			odl_cli_latency_server(handle, sid, src_id, req);
+			ret = odl_cli_latency_server(handle, sid, src_id, req);
 			break;
 
 		case ODL_TEST_LATENCY_LOAD:
 			printf("[Server] Running latency-under-load test...\n");
-			odl_cli_latency_load_server(handle, sid, src_id, req);
+			ret = odl_cli_latency_load_server(handle, sid, src_id, req);
 			break;
 
 		case ODL_TEST_MIMO:
 			printf("[Server] Running MIMO test (streams=%u)...\n",
 			       req->num_streams);
-			odl_cli_mimo_server(handle, sid, src_id, req);
+			ret = odl_cli_mimo_server(handle, sid, src_id, req);
 			break;
 
 		case ODL_TEST_JITTER:
 			printf("[Server] Running jitter test (iters=%u)...\n",
 			       req->iterations);
-			odl_cli_jitter_server(handle, sid, src_id, req);
+			ret = odl_cli_jitter_server(handle, sid, src_id, req);
 			break;
 
 		default:
 			fprintf(stderr, "[Server] Unknown test type: %u\n",
 				req->test_type);
+			ret = -EINVAL;
+			break;
+		}
+		if (ret < 0) {
+			fprintf(stderr, "[Server] Test protocol failed: %s\n",
+				strerror(-ret));
 			break;
 		}
 
