@@ -198,6 +198,7 @@ struct odl_tb5_mr {
 
 static int comm_start_worker(struct odl_tb5_comm *comm);
 static void comm_stop_worker(struct odl_tb5_comm *comm);
+static int dmabuf_ctrl_open(void);
 
 static uint64_t clock_mono_ns(void)
 {
@@ -294,6 +295,17 @@ static rcclResult_t get_shared_handle(int dev, odl_tb5_t *out)
 			goto out;
 		}
 		if (odl_tb5_wait_peer(g_handle, 10000) < 0) {
+			odl_tb5_close(g_handle);
+			g_handle = NULL;
+			res = rcclSystemError;
+			goto out;
+		}
+		/* Open the control stream before any wire traffic: the peer's
+		 * READY (sent immediately after accept/irecv) can otherwise
+		 * arrive before the sender's first isend opens the stream, and
+		 * the driver drops it (rx_frames_no_stream) — the sender then
+		 * waits on a READY that is gone forever. */
+		if (dmabuf_ctrl_open() < 0) {
 			odl_tb5_close(g_handle);
 			g_handle = NULL;
 			res = rcclSystemError;
@@ -640,6 +652,8 @@ static int dmabuf_ctrl_open(void)
 		ret = odl_tb5_stream_open(g_handle, ODL_DMABUF_CTRL_SID, &sid);
 		if (ret < 0 || sid != ODL_DMABUF_CTRL_SID) {
 			pthread_mutex_unlock(&g_dmabuf_mutex);
+			WARN("dmabuf ctrl: stream open %u failed: %s (sid=%u)",
+			     ODL_DMABUF_CTRL_SID, strerror(-ret), sid);
 			return -1;
 		}
 		g_dmabuf_ctrl_sid = sid;
@@ -716,6 +730,7 @@ static void *dmabuf_ctrl_reader(void *arg)
 					  &msg, sizeof(msg), &src_id, &actual);
 		if (ret < 0)
 			break;		/* control stream gone */
+		DBG(2, "dmabuf ctrl: recv sid=%u actual=%u", src_id, actual);
 		if (actual != sizeof(msg) ||
 		    msg.magic != ODL_DMABUF_MAGIC ||
 		    msg.kind != ODL_DMABUF_KIND_READY) {
@@ -815,6 +830,8 @@ static int dmabuf_enqueue_send(struct odl_tb5_comm *comm,
 					&sid) < 0 ||
 		    sid != ODL_DMABUF_CTRL_SID) {
 			pthread_mutex_unlock(&g_dmabuf_mutex);
+			WARN("dmabuf ctrl: enqueue open %u failed (sid=%u)",
+			     ODL_DMABUF_CTRL_SID, sid);
 			return -1;
 		}
 		g_dmabuf_ctrl_sid = sid;
@@ -823,10 +840,12 @@ static int dmabuf_enqueue_send(struct odl_tb5_comm *comm,
 		pthread_t t;
 		if (pthread_create(&t, NULL, dmabuf_ctrl_reader, NULL) != 0) {
 			pthread_mutex_unlock(&g_dmabuf_mutex);
+			WARN("dmabuf ctrl: reader thread create failed");
 			return -1;
 		}
 		pthread_detach(t);
 		g_dmabuf_reader_started = 1;
+		DBG(1, "dmabuf ctrl: reader started");
 	}
 	req->next = NULL;
 	if (comm->d_tail)
