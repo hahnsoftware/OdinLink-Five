@@ -210,23 +210,29 @@ static void *client_worker(void *arg)
             c->ok = 0;
             break;
         }
-        /* poll until done, bounded */
-        for (int spin = 0; spin < 10000; spin++) {
-            int done = 0, sz = 0;
+        /* The sender's TX completes only when the server's retried RX
+         * pairs with it; the server may take ~20 s per attempt under its
+         * wire lock, so wait up to 60 s without retrying here. */
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int done = 0, sz = 0;
+        while (!done) {
             res = p->test(c->req, &done, &sz);
             if (res != rcclSuccess) {
                 fprintf(stderr, "conn %d round %d: test rc=%d\n", c->k, r, res);
                 c->ok = 0;
                 break;
             }
-            if (done)
-                break;
-            if (spin == 9999) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (double)(now.tv_sec - t0.tv_sec) +
+                             (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+            if (elapsed > 60.0) {
                 fprintf(stderr, "conn %d round %d: test timeout\n", c->k, r);
                 c->ok = 0;
                 break;
             }
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
             nanosleep(&ts, NULL);
         }
         if (!c->ok)
@@ -251,17 +257,22 @@ static void *server_worker(void *arg)
         rcclResult_t res;
 
         pthread_barrier_wait(&g_round_barrier);
-        /* Retry the round for up to 60 s: accept() completes with no wire
-         * handshake, so the first READY may be fired before the client
-         * process (and its control stream) exists; the driver drops it and
-         * the recv times out with zero bytes delivered.  A retry sends a
-         * fresh READY; once the client is up the READY is delivered, the
-         * sender posts TX, and the round completes.  Zero-byte timeouts
-         * carry no credits, so a retry can never duplicate data. */
+        /* Retry the round for up to ~2 min: accept() completes with no
+         * wire handshake, so the first READY may be fired before the
+         * client process (and its control stream) exists; the driver
+         * drops it and the recv times out with zero bytes delivered.
+         * Each retry posts a fresh READY; once the client is up, the
+         * READY is delivered, the sender posts TX, and the round
+         * completes.  Zero-byte timeouts carry no credits, so a retry
+         * can never duplicate data.  One attempt can take ~20 s: the
+         * recv path runs under the device-wide wire lock and a dropped
+         * READY only surfaces as a 10 s kernel timeout, so wait a full
+         * 25 s per attempt before trying again. */
         int attempt;
         for (attempt = 0; attempt < 12; attempt++) {
             void *req = NULL;
             int got = -1;
+            int attempt_failed = 0;
 
             res = p->irecv(c->comm, 1, datas, sizes, tags, mhs, &req);
             if (res != rcclSuccess) {
@@ -269,24 +280,30 @@ static void *server_worker(void *arg)
                 c->ok = 0;
                 break;
             }
-            int timed_out = 0;
-            for (int spin = 0; spin < 10000; spin++) {
+            struct timespec t0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            while (got < 0 && !attempt_failed) {
                 int done = 0, sz = 0;
                 res = p->test(req, &done, &sz);
                 if (res != rcclSuccess) {
-                    fprintf(stderr, "conn %d round %d: test rc=%d\n", c->k, r, res);
-                    c->ok = 0;
+                    /* req failed (or was freed by test) — retry the
+                     * round with a fresh irecv */
+                    attempt_failed = 1;
                     break;
                 }
                 if (done) {
                     got = sz;
                     break;
                 }
-                if (spin == 9999) {
-                    timed_out = 1;
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                double elapsed = (double)(now.tv_sec - t0.tv_sec) +
+                                 (double)(now.tv_nsec - t0.tv_nsec) / 1e9;
+                if (elapsed > 25.0) {
+                    attempt_failed = 1;
                     break;
                 }
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 };
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
                 nanosleep(&ts, NULL);
             }
             if (!c->ok)
@@ -303,8 +320,6 @@ static void *server_worker(void *arg)
                 }
                 break;
             }
-            if (!timed_out)
-                break;
         }
         if (attempt == 12) {
             fprintf(stderr, "conn %d round %d: gave up after retries\n",
