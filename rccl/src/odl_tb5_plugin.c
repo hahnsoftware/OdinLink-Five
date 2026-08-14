@@ -76,6 +76,7 @@
 
 #include "net_v7.h"
 #include <odl_tb5/odl_tb5.h>
+#include <odl_tb5/odl_tb5_ioctl.h>
 #include <odl_tb5/odl_tb5_rccl_stats.h>
 
 #define ODL_TB5_MAX_RCCL_DEVICES 16
@@ -253,6 +254,7 @@ struct odl_tb5_mr {
 static int comm_start_worker(struct odl_tb5_comm *comm);
 static void comm_stop_worker(struct odl_tb5_comm *comm);
 static int dmabuf_ctrl_open(void);
+static void *dmabuf_ctrl_reader(void *arg);
 
 static uint64_t clock_mono_ns(void)
 {
