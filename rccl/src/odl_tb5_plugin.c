@@ -38,6 +38,11 @@
  *  - the reader never holds a lock while waiting, so no deadlock even
  *    when RCCL posts isend before the peer's irecv.
  *
+ * RCCL matches a send to a receive by tag (tpRank/tpRemoteRank); the
+ * receive side posts speculative buffers at slice size while the send
+ * side posts connFifo-sized chunks, so READY-to-isend matching is by
+ * tag with the READY's len acting as receiver capacity, never by size.
+ *
  * Exposes shared-memory stats at /run/odl_tb5/rccl_stats.
  */
 #include <stdio.h>
@@ -646,6 +651,9 @@ static rcclResult_t odl_tb5_deregMr(void *comm, void *mhandle)
  *    sender's dst_id and identifies the connection.
  *  - the reader never holds a lock while waiting for a READY, so there
  *    is no deadlock even when RCCL posts isend before the peer's irecv.
+ *  - READY-to-isend matching is by tag (receiver capacity = READY len
+ *    >= send size); RCCL's receive sizes are speculative and never
+ *    equal the send sizes.
  */
 
 /* Ensure the device-wide control stream is open (fixed id on both
@@ -766,14 +774,19 @@ static void *dmabuf_ctrl_reader(void *arg)
 				comm = NULL;	/* drained: nothing to do */
 				break;
 			}
-			/* RCCL keeps several requests in flight on one comm
-			 * with different sizes and tags, so a READY must
-			 * match its request by (size, tag) — never by FIFO
-			 * position.  Requests whose READY has not arrived
-			 * yet stay queued and are matched later. */
+			/* RCCL posts receive buffers speculatively at slice size
+			 * (stepSize*sliceSteps) but sends what the kernel put
+			 * in connFifo — the sizes differ and never match.
+			 * Match the READY to its request by tag only, in FIFO
+			 * order: RCCL posts irecvs and isends both in step
+			 * order, so READY order == RX-post order == isend
+			 * order.  The READY's len is the receiver's buffer
+			 * capacity and must cover the send size.  Requests
+			 * whose READY has not arrived yet stay queued and
+			 * are matched later. */
 			for (req = comm->d_head; req; req = req->next) {
-				if (req->size == (int)msg.len &&
-				    req->tag == (int)msg.tag)
+				if (req->tag == (int)msg.tag &&
+				    (int)msg.len >= req->size)
 					break;
 				prev = req;
 			}
