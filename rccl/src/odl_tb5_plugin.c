@@ -133,6 +133,7 @@ struct odl_dmabuf_msg {
 	uint32_t kind;
 	uint32_t sid;    /* receiver's stream id (== sender's dst_id) */
 	uint32_t len;
+	uint32_t tag;    /* receiver's request tag (RCCL matches send/recv) */
 };
 
 static pthread_mutex_t g_dmabuf_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -173,6 +174,7 @@ struct odl_tb5_request {
 	struct odl_tb5_comm *comm;
 	void   *data;
 	int     size;         /* requested size */
+	int     tag;          /* RCCL request tag */
 	int     done_size;    /* actual transferred size */
 	int     is_send;
 	void   *mhandle;      /* registration handle (NULL = host memory) */
@@ -669,8 +671,10 @@ static int dmabuf_ctrl_open(void)
 }
 
 /* Announce a pending DMA-BUF receive.  Must run inside g_wire_lock so
- * READY order equals RX-post order. */
-static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size)
+ * READY order equals RX-post order.  The READY carries the request's
+ * size and tag so the sender can match it against its in-flight sends
+ * (RCCL keeps several requests per comm queued concurrently). */
+static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size, int tag)
 {
 	struct odl_dmabuf_msg msg;
 
@@ -680,6 +684,7 @@ static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size)
 	msg.kind = ODL_DMABUF_KIND_READY;
 	msg.sid = comm->stream_id;
 	msg.len = (uint32_t)size;
+	msg.tag = (uint32_t)tag;
 	return odl_tb5_stream_send(g_handle, g_dmabuf_ctrl_sid,
 				   ODL_DMABUF_CTRL_SID, &msg, sizeof(msg));
 }
@@ -747,6 +752,8 @@ static void *dmabuf_ctrl_reader(void *arg)
 
 		pthread_mutex_lock(&g_dmabuf_mutex);
 		for (;;) {
+			struct odl_tb5_request *prev = NULL;
+
 			comm = dmabuf_find_comm((uint8_t)msg.sid);
 			if (!comm) {
 				pthread_mutex_unlock(&g_dmabuf_mutex);
@@ -754,14 +761,32 @@ static void *dmabuf_ctrl_reader(void *arg)
 				     msg.sid);
 				break;
 			}
-			if (comm->d_head)
-				break;
 			if (comm->closed) {
 				pthread_mutex_unlock(&g_dmabuf_mutex);
 				comm = NULL;	/* drained: nothing to do */
 				break;
 			}
-			/* READY arrived before the matching isend: wait
+			/* RCCL keeps several requests in flight on one comm
+			 * with different sizes and tags, so a READY must
+			 * match its request by (size, tag) — never by FIFO
+			 * position.  Requests whose READY has not arrived
+			 * yet stay queued and are matched later. */
+			for (req = comm->d_head; req; req = req->next) {
+				if (req->size == (int)msg.len &&
+				    req->tag == (int)msg.tag)
+					break;
+				prev = req;
+			}
+			if (req) {
+				if (prev)
+					prev->next = req->next;
+				else
+					comm->d_head = req->next;
+				if (!req->next)
+					comm->d_tail = prev;
+				break;
+			}
+			/* READY arrived before its matching isend: wait
 			 * briefly for it.  The wait is bounded — a retried
 			 * READY can arrive for a comm whose sender already
 			 * gave up, and an unbounded wait stalls the single
@@ -777,9 +802,10 @@ static void *dmabuf_ctrl_reader(void *arg)
 					    &ts) == ETIMEDOUT) {
 					pthread_mutex_unlock(&g_dmabuf_mutex);
 					DBG(2, "dmabuf ctrl: READY sid=%u "
-					    "with no pending request — "
-					    "dropped (peer will retry)",
-					    msg.sid);
+					    "len=%u tag=%u with no matching "
+					    "request — dropped (peer will "
+					    "retry)",
+					    msg.sid, msg.len, msg.tag);
 					comm = NULL;
 					break;
 				}
@@ -787,22 +813,8 @@ static void *dmabuf_ctrl_reader(void *arg)
 		}
 		if (!comm)
 			continue;
-		req = comm->d_head;
-		comm->d_head = req->next;
-		if (!comm->d_head)
-			comm->d_tail = NULL;
 		comm->refs++;   /* pin: closeSend defers the free while we work */
 		pthread_mutex_unlock(&g_dmabuf_mutex);
-
-		if ((uint32_t)req->size != msg.len) {
-			WARN("dmabuf send sid=%u: READY len=%u but request "
-			     "size=%d — protocol mismatch", comm->stream_id,
-			     msg.len, req->size);
-			req->failed = 1;
-			req->done_size = 0;
-			__atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
-			goto reader_release;
-		}
 
 		mr = req->mhandle;
 		if (dmabuf_offset(mr, req->data, req->size, &off_dmabuf) < 0) {
@@ -926,7 +938,7 @@ static void do_transfer(struct odl_tb5_comm *comm, struct odl_tb5_request *req)
 		}
 
 		pthread_mutex_lock(&g_wire_lock);
-		ret = dmabuf_send_ready(comm, req->size);
+		ret = dmabuf_send_ready(comm, req->size, req->tag);
 		if (ret >= 0)
 			ret = odl_tb5_stream_recv_dmabuf(comm->handle,
 							 comm->stream_id,
@@ -1100,8 +1112,8 @@ static void comm_stop_worker(struct odl_tb5_comm *comm)
 }
 
 static rcclResult_t start_request(struct odl_tb5_comm *comm, void *data,
-				  int size, int is_send, void *mhandle,
-				  void **request)
+				  int size, int tag, int is_send,
+				  void *mhandle, void **request)
 {
 	struct odl_tb5_request *req = calloc(1, sizeof(*req));
 	int is_dmabuf = mhandle &&
@@ -1112,14 +1124,24 @@ static rcclResult_t start_request(struct odl_tb5_comm *comm, void *data,
 	req->comm = comm;
 	req->data = data;
 	req->size = size;
+	req->tag = tag;
 	req->is_send = is_send;
 	req->mhandle = mhandle;
 	req->done = 0;
 	req->next = NULL;
 
 	/* DMA-BUF sends wait for the peer's READY on the control stream;
-	 * the reader services them in READY order (see the ctrl comment). */
+	 * the reader services them in READY order (see the ctrl comment).
+	 * A zero-size send carries no cells and needs no RX pairing, so
+	 * it completes immediately — the peer's zero-size receive does
+	 * the same (do_transfer), keeping RCCL's sync messages moving. */
 	if (is_dmabuf && is_send) {
+		if (size == 0) {
+			req->done_size = 0;
+			__atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
+			*request = req;
+			return rcclSuccess;
+		}
 		if (dmabuf_enqueue_send(comm, req) < 0) {
 			free(req);
 			return rcclSystemError;
@@ -1146,7 +1168,7 @@ static rcclResult_t odl_tb5_isend(void *sendComm, void *data, int size,
 {
 	struct odl_tb5_comm *c = sendComm;
 	DBG(1, "isend   POST comm=%p sid=%u dst=%u size=%d tag=%d", sendComm, c->stream_id, c->dst_id, size, tag);
-	return start_request(sendComm, data, size, 1, mhandle, request);
+	return start_request(sendComm, data, size, tag, 1, mhandle, request);
 }
 
 static rcclResult_t odl_tb5_irecv(void *recvComm, int n, void **data,
@@ -1167,8 +1189,9 @@ static rcclResult_t odl_tb5_irecv(void *recvComm, int n, void **data,
 		WARN("irecv called with n=%d but maxRecvs=1 - refusing", n);
 		return rcclInvalidArgument;
 	}
-	DBG(1, "irecv   POST comm=%p sid=%u n=%d size=%d", recvComm, c->stream_id, n, sizes[0]);
-	return start_request(recvComm, data[0], sizes[0], 0,
+	DBG(1, "irecv   POST comm=%p sid=%u n=%d size=%d tag=%d", recvComm, c->stream_id, n, sizes[0], tags ? tags[0] : -1);
+	return start_request(recvComm, data[0], sizes[0],
+			     tags ? tags[0] : 0, 0,
 			     mhandles ? mhandles[0] : NULL, request);
 }
 
