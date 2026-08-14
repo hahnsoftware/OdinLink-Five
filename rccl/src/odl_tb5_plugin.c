@@ -35,8 +35,8 @@
  *    handshake exists precisely to move the EXACT send size to the
  *    receiver before any cell is posted;
  *  - receiver: on REQ, find the matching pending irecv (FIFO by tag)
- *    and, atomically under g_wire_lock, send READY {len} and post its
- *    RX cells for that exact len — so READY order == RX post order;
+ *    and, atomically under g_wire_lock, post its RX cells for that exact
+ *    len and then send READY {len} — so READY never races ahead of RX;
  *  - sender: the reader fires the TX in READY arrival order, so TX
  *    order == READY order == RX order on the wire by construction;
  *  - the RX post is a kernel NOWAIT submit: the receiver's reader posts
@@ -63,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <errno.h>
 #include <limits.h>
 #include <dirent.h>
@@ -127,7 +128,6 @@ static int stats_fd = -1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static odl_tb5_t       g_handle;            /* opened lazily */
 static int             g_handle_refs;
-static uint8_t         g_next_cid = 1;      /* connection/stream id alloc */
 
 /* Serializes every DMA-BUF receive on this box: the receiver sends the
  * READY announcement and posts its RX cells inside one critical
@@ -164,15 +164,18 @@ struct odl_dmabuf_msg {
 	uint32_t sid;    /* receiver's stream id (== sender's dst_id) */
 	uint32_t len;    /* EXACT transfer length (REQ: send size, READY: same) */
 	uint32_t tag;    /* receiver's request tag (RCCL matches send/recv) */
+	uint64_t seq;    /* per-connection transfer id; stable across retries */
 };
 
 static pthread_mutex_t g_dmabuf_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_dmabuf_cond = PTHREAD_COND_INITIALIZER;
 static uint8_t         g_dmabuf_ctrl_sid;      /* 0 = control stream not open */
 static int             g_dmabuf_reader_started;
+static int             g_dmabuf_fatal;
 static struct odl_tb5_comm *g_dmabuf_comms;    /* registered send comms */
 
 struct odl_tb5_request;
+struct odl_pending_req;
 
 /* Per-connection communicator.  A single worker thread drains a FIFO queue
  * of requests so transfers on this stream happen strictly in the order RCCL
@@ -192,7 +195,12 @@ struct odl_tb5_comm {
 	 * order).  The control reader pairs each REQ with the head entry
 	 * and posts the RX cells; completions land in rx_head/rx_tail. */
 	struct odl_tb5_request *r_head, *r_tail;
+	struct odl_pending_req *pr_head, *pr_tail; /* REQs awaiting an irecv */
 	struct odl_pending_rx *rx_head, *rx_tail;   /* NOWAIT transfers in flight */
+	uint64_t        next_tx_seq;
+	uint64_t        rx_replay_seq; /* most recent RX post, for REQ retries */
+	uint32_t        rx_replay_len;
+	uint32_t        rx_replay_tag;
 	struct odl_tb5_comm *dmabuf_next;   /* registry linkage */
 	int             closed;
 	int             refs;       /* reader pins; free at last put */
@@ -220,7 +228,14 @@ struct odl_tb5_request {
 	int     req_sent;     /* REQ announced to the peer */
 	int     req_retries;  /* REQ resends after handshake loss */
 	uint64_t req_sent_at; /* monotonic ns of the last REQ */
+	uint64_t seq;         /* unchanged when REQ is retried */
 	struct odl_tb5_request *next;   /* queue linkage */
+};
+
+/* A control REQ which arrived before RCCL posted its matching irecv. */
+struct odl_pending_req {
+	struct odl_dmabuf_msg msg;
+	struct odl_pending_req *next;
 };
 
 /* An RX transfer the receiver posted (NOWAIT) and is polling. */
@@ -640,7 +655,7 @@ static rcclResult_t odl_tb5_regMrDmaBuf(void *comm, void *data, size_t size,
 	if (!mhandle)
 		return rcclInvalidArgument;
 	*mhandle = NULL;   /* RCCL relies on NULL on every failure */
-	if (fd < 0 || size == 0)
+	if (fd < 0 || size == 0 || (uint64_t)size > UINT64_MAX - offset)
 		return rcclInvalidArgument;
 
 	/* Duplicate the fd so we own it: RCCL may close its copy after
@@ -719,17 +734,21 @@ static int dmabuf_ctrl_open(void)
  * READY order equals RX-post order.  The READY carries the EXACT
  * transfer length (from the peer's REQ) so the sender can post exactly
  * that many bytes. */
-static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size, int tag)
+static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size, int tag,
+			     uint64_t seq)
 {
-	struct odl_dmabuf_msg msg;
+	struct odl_dmabuf_msg msg = { 0 };
 
-	if (dmabuf_ctrl_open() < 0)
-		return -1;
+	/* The reader only calls this after opening the shared control stream.
+	 * Avoid dmabuf_ctrl_open() here because it takes g_dmabuf_mutex. */
+	if (!g_dmabuf_ctrl_sid)
+		return -ENODEV;
 	msg.magic = ODL_DMABUF_MAGIC;
 	msg.kind = ODL_DMABUF_KIND_READY;
 	msg.sid = comm->stream_id;
 	msg.len = (uint32_t)size;
 	msg.tag = (uint32_t)tag;
+	msg.seq = seq;
 	return odl_tb5_stream_send(g_handle, g_dmabuf_ctrl_sid,
 				   ODL_DMABUF_CTRL_SID, &msg, sizeof(msg));
 }
@@ -741,13 +760,14 @@ static int dmabuf_send_ready(struct odl_tb5_comm *comm, int size, int tag)
 static int dmabuf_send_req(struct odl_tb5_comm *comm,
 			   struct odl_tb5_request *req)
 {
-	struct odl_dmabuf_msg msg;
+	struct odl_dmabuf_msg msg = { 0 };
 
 	msg.magic = ODL_DMABUF_MAGIC;
 	msg.kind = ODL_DMABUF_KIND_REQ;
 	msg.sid = comm->dst_id;
 	msg.len = (uint32_t)req->size;
 	msg.tag = (uint32_t)req->tag;
+	msg.seq = req->seq;
 	return odl_tb5_stream_send(g_handle, g_dmabuf_ctrl_sid,
 				   ODL_DMABUF_CTRL_SID, &msg, sizeof(msg));
 }
@@ -758,18 +778,26 @@ static int dmabuf_send_req(struct odl_tb5_comm *comm,
 static int dmabuf_offset(struct odl_tb5_mr *mr, const void *data, int size,
 			 uint64_t *out)
 {
+	uintptr_t base = (uintptr_t)mr->data;
+	uintptr_t ptr = (uintptr_t)data;
 	uint64_t in;
 
+	if (size < 0)
+		return -1;
 	if (!data) {
 		in = 0;
-	} else if ((const char *)data >= (const char *)mr->data) {
-		in = (uint64_t)((const char *)data - (const char *)mr->data);
+	} else if (ptr >= base) {
+		in = (uint64_t)(ptr - base);
 	} else {
 		return -1;
 	}
 	if (in > mr->size || (uint64_t)size > mr->size - in)
 		return -1;
+	if (in > UINT64_MAX - mr->offset)
+		return -1;
 	*out = mr->offset + in;
+	if ((uint64_t)size > UINT64_MAX - *out)
+		return -1;
 	return 0;
 }
 
@@ -835,6 +863,50 @@ static void dmabuf_req_done(struct odl_tb5_request *req, int failed, int size)
 	__atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
 }
 
+/* Raw DMA-BUF receives are one device-wide FIFO.  Once an RX slot may have
+ * been posted without its READY reaching the peer, no later transfer can be
+ * allowed to overtake it.  Fail every queued request and detach request
+ * objects from posted RX tokens; the process must restart before raw traffic
+ * can resume.  Caller holds g_dmabuf_mutex. */
+static void dmabuf_poison_locked(const char *reason)
+{
+	struct odl_tb5_comm *c;
+
+	if (!g_dmabuf_fatal)
+		WARN("dmabuf transport poisoned: %s", reason);
+	g_dmabuf_fatal = 1;
+	for (c = g_dmabuf_comms; c; c = c->dmabuf_next) {
+		struct odl_tb5_request *req;
+		struct odl_pending_req *pending;
+		struct odl_pending_rx *pe;
+
+		while ((req = c->d_head) != NULL) {
+			c->d_head = req->next;
+			req->next = NULL;
+			dmabuf_req_done(req, 1, 0);
+		}
+		c->d_tail = NULL;
+		while ((req = c->r_head) != NULL) {
+			c->r_head = req->next;
+			req->next = NULL;
+			dmabuf_req_done(req, 1, 0);
+		}
+		c->r_tail = NULL;
+		while ((pending = c->pr_head) != NULL) {
+			c->pr_head = pending->next;
+			free(pending);
+		}
+		c->pr_tail = NULL;
+		for (pe = c->rx_head; pe; pe = pe->next) {
+			if (pe->req) {
+				req = pe->req;
+				pe->req = NULL;
+				dmabuf_req_done(req, 1, 0);
+			}
+		}
+	}
+}
+
 /* READY from the peer's receiver: its RX cells for one of our REQs are
  * posted.  Fire the matching TX in READY arrival order (== RX post
  * order).  The TX ioctl blocks here, but that is safe: the READY
@@ -844,7 +916,7 @@ static void dmabuf_req_done(struct odl_tb5_request *req, int failed, int size)
 static void reader_handle_ready(const struct odl_dmabuf_msg *msg)
 {
 	struct odl_tb5_comm *comm;
-	struct odl_tb5_request *req, *prev = NULL;
+	struct odl_tb5_request *req;
 	struct odl_tb5_mr *mr;
 	uint64_t off_dmabuf = 0;
 	int ret;
@@ -856,28 +928,33 @@ static void reader_handle_ready(const struct odl_dmabuf_msg *msg)
 		WARN("dmabuf ctrl: READY for unknown sid=%u", msg->sid);
 		return;
 	}
-	/* Handshakes pair in FIFO order: the READY belongs to the oldest
-	 * announced request whose tag matches and whose buffer can hold
-	 * the exact length.  Tags are constant per connection, so this
-	 * degenerates to the queue head. */
-	for (req = comm->d_head; req; req = req->next) {
-		if (req->tag == (int)msg->tag &&
-		    (int)msg->len <= req->size)
-			break;
-		prev = req;
-	}
+	/* Only the queue head has been announced.  A READY must echo its
+	 * exact sequence, tag and length; accepting a later queued request
+	 * would put an unannounced transfer on the global raw FIFO. */
+	req = comm->d_head;
 	if (!req) {
 		pthread_mutex_unlock(&g_dmabuf_mutex);
 		DBG(2, "dmabuf ctrl: READY sid=%u len=%u with no matching request - dropped",
 		    msg->sid, msg->len);
 		return;
 	}
-	if (prev)
-		prev->next = req->next;
-	else
-		comm->d_head = req->next;
+	if (msg->seq < req->seq) {
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		DBG(2, "dmabuf ctrl: stale READY sid=%u seq=%llu dropped",
+		    msg->sid, (unsigned long long)msg->seq);
+		return;
+	}
+	if (req->seq != msg->seq || req->tag != (int)msg->tag ||
+	    req->size != (int)msg->len) {
+		WARN("dmabuf ctrl: READY metadata mismatch sid=%u seq=%llu",
+		     msg->sid, (unsigned long long)msg->seq);
+		dmabuf_poison_locked("READY metadata mismatch");
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		return;
+	}
+	comm->d_head = req->next;
 	if (!req->next)
-		comm->d_tail = prev;
+		comm->d_tail = NULL;
 	comm->refs++;   /* pin: closeSend defers the free while we work */
 	pthread_mutex_unlock(&g_dmabuf_mutex);
 
@@ -890,7 +967,7 @@ static void reader_handle_ready(const struct odl_dmabuf_msg *msg)
 	}
 
 	mr = req->mhandle;
-	if (dmabuf_offset(mr, req->data, req->size, &off_dmabuf) < 0) {
+	if (dmabuf_offset(mr, req->data, (int)msg->len, &off_dmabuf) < 0) {
 		WARN("dmabuf send sid=%u: data %p size %d outside MR [%p,+%zu]",
 		     comm->stream_id, req->data, req->size, mr->data, mr->size);
 		dmabuf_req_done(req, 1, 0);
@@ -906,6 +983,9 @@ static void reader_handle_ready(const struct odl_dmabuf_msg *msg)
 		WARN("dmabuf send sid=%u failed: %s", comm->stream_id,
 		     strerror(-ret));
 		dmabuf_req_done(req, 1, 0);
+		pthread_mutex_lock(&g_dmabuf_mutex);
+		dmabuf_poison_locked("DMA-BUF send failed after READY");
+		pthread_mutex_unlock(&g_dmabuf_mutex);
 	} else {
 		stats_record_tx_dmabuf((int)msg->len);
 		dmabuf_req_done(req, 0, (int)msg->len);
@@ -914,12 +994,14 @@ reader_ready_release:
 	pthread_mutex_lock(&g_dmabuf_mutex);
 	if (--comm->refs == 0)
 		free(comm);
+	else
+		pthread_cond_broadcast(&g_dmabuf_cond);
 	pthread_mutex_unlock(&g_dmabuf_mutex);
 }
 
 /* REQ from the peer's sender: it wants to send exactly len bytes with
  * this tag.  Pair it with the oldest pending irecv (strictly FIFO),
- * then, under g_wire_lock, answer READY and post the RX cells for the
+ * then, under g_wire_lock, post the RX cells and answer READY for the
  * exact length (NOWAIT — the reader polls their completion later, so
  * this handler never blocks in a transfer wait). */
 static void reader_handle_req(const struct odl_dmabuf_msg *msg)
@@ -930,6 +1012,7 @@ static void reader_handle_req(const struct odl_dmabuf_msg *msg)
 	struct odl_pending_rx *pe;
 	uint64_t off_dmabuf = 0;
 	int token = -1;
+	int ready_failed = 0;
 	int ret;
 
 	pthread_mutex_lock(&g_dmabuf_mutex);
@@ -939,40 +1022,79 @@ static void reader_handle_req(const struct odl_dmabuf_msg *msg)
 		WARN("dmabuf ctrl: REQ for unknown sid=%u", msg->sid);
 		return;
 	}
-	/* The irecv for this step may not be posted yet (RCCL's recv
-	 * proxy runs independently of the send proxy); wait bounded — the
-	 * sender re-sends the REQ after its own timeout, so a dropped
-	 * REQ is recovered.  Pair strictly FIFO: the first pending irecv
-	 * that can hold the exact length. */
-	for (;;) {
-		struct odl_tb5_request *prev = NULL;
-		for (req = comm->r_head; req; req = req->next) {
-			if (req->tag == (int)msg->tag &&
-			    (int)msg->len <= req->size)
-				break;
-			prev = req;
+	if (g_dmabuf_fatal) {
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		return;
+	}
+	/* A retry must never consume another speculative irecv.  Once RX was
+	 * posted, replay READY for the same transfer id. */
+	if (msg->seq == comm->rx_replay_seq) {
+		int valid = msg->len == comm->rx_replay_len &&
+			    msg->tag == comm->rx_replay_tag;
+		comm->refs++;
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		if (!valid) {
+			WARN("dmabuf ctrl: conflicting retry sid=%u seq=%llu",
+			     msg->sid, (unsigned long long)msg->seq);
+			pthread_mutex_lock(&g_dmabuf_mutex);
+			dmabuf_poison_locked("conflicting REQ retry metadata");
+			pthread_mutex_unlock(&g_dmabuf_mutex);
+		} else {
+			pthread_mutex_lock(&g_wire_lock);
+			ret = dmabuf_send_ready(comm, (int)msg->len,
+						(int)msg->tag, msg->seq);
+			pthread_mutex_unlock(&g_wire_lock);
+			if (ret < 0)
+				WARN("dmabuf ctrl: READY replay sid=%u seq=%llu failed: %s",
+				     msg->sid, (unsigned long long)msg->seq,
+				     strerror(-ret));
 		}
-		if (req) {
-			if (prev)
-				prev->next = req->next;
-			else
-				comm->r_head = req->next;
-			if (!req->next)
-				comm->r_tail = prev;
-			break;
+		goto reader_req_release;
+	}
+	if (msg->seq < comm->rx_replay_seq) {
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		DBG(2, "dmabuf ctrl: stale REQ sid=%u seq=%llu dropped",
+		    msg->sid, (unsigned long long)msg->seq);
+		return;
+	}
+	{
+		/* Tags are constant for a connection, so pairing must use the
+		 * oldest receive.  Skipping an undersized head would shift every
+		 * later raw transfer by one slot. */
+		req = comm->r_head;
+		if (req && (req->tag != (int)msg->tag ||
+			    (int)msg->len > req->size)) {
+			WARN("dmabuf ctrl: FIFO mismatch sid=%u seq=%llu len=%u tag=%u",
+			     msg->sid, (unsigned long long)msg->seq,
+			     msg->len, msg->tag);
+			dmabuf_poison_locked("receive FIFO metadata mismatch");
+			pthread_mutex_unlock(&g_dmabuf_mutex);
+			return;
 		}
-		{
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			ts.tv_sec += ODL_DMABUF_READY_WAIT_S;
-			if (pthread_cond_timedwait(&g_dmabuf_cond,
-					&g_dmabuf_mutex, &ts) == ETIMEDOUT) {
-				pthread_mutex_unlock(&g_dmabuf_mutex);
-				DBG(2, "dmabuf ctrl: REQ sid=%u len=%u tag=%u with no matching irecv - dropped (sender will retry)",
-				    msg->sid, msg->len, msg->tag);
-				return;
+		if (!req) {
+			struct odl_pending_req *pending;
+			for (pending = comm->pr_head; pending; pending = pending->next)
+				if (pending->msg.seq == msg->seq)
+					break;
+			if (!pending) {
+				pending = calloc(1, sizeof(*pending));
+				if (pending) {
+					pending->msg = *msg;
+					if (comm->pr_tail)
+						comm->pr_tail->next = pending;
+					else
+						comm->pr_head = pending;
+					comm->pr_tail = pending;
+				}
 			}
+			pthread_mutex_unlock(&g_dmabuf_mutex);
+			DBG(2, "dmabuf ctrl: queued REQ sid=%u seq=%llu awaiting irecv",
+			    msg->sid, (unsigned long long)msg->seq);
+			return;
 		}
+		comm->r_head = req->next;
+		if (!req->next)
+			comm->r_tail = NULL;
 	}
 	comm->refs++;   /* pin: closeRecv defers the free while we work */
 	pthread_mutex_unlock(&g_dmabuf_mutex);
@@ -982,21 +1104,31 @@ static void reader_handle_req(const struct odl_dmabuf_msg *msg)
 		 * ack with a zero-len READY (no cells behind it), then
 		 * complete the irecv — nothing goes on the wire. */
 		pthread_mutex_lock(&g_wire_lock);
-		ret = dmabuf_send_ready(comm, 0, (int)msg->tag);
+		pthread_mutex_lock(&g_dmabuf_mutex);
+		comm->rx_replay_seq = msg->seq;
+		comm->rx_replay_len = msg->len;
+		comm->rx_replay_tag = msg->tag;
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		ret = dmabuf_send_ready(comm, 0, (int)msg->tag, msg->seq);
 		pthread_mutex_unlock(&g_wire_lock);
 		if (ret < 0) {
 			WARN("dmabuf recv sid=%u zero-len READY failed: %s",
 			     comm->stream_id, strerror(-ret));
 			dmabuf_req_done(req, 1, 0);
+			pthread_mutex_lock(&g_dmabuf_mutex);
+			dmabuf_poison_locked("zero-length READY send failed");
+			pthread_mutex_unlock(&g_dmabuf_mutex);
 		} else {
 			stats_record_rx_dmabuf(0);
 			dmabuf_req_done(req, 0, 0);
 		}
+		/* There is no data operation to wait for.  Keep the sequence
+		 * tombstone so a retry gets READY without consuming an irecv. */
 		goto reader_req_release;
 	}
 
 	mr = req->mhandle;
-	if (dmabuf_offset(mr, req->data, req->size, &off_dmabuf) < 0) {
+	if (dmabuf_offset(mr, req->data, (int)msg->len, &off_dmabuf) < 0) {
 		WARN("dmabuf recv sid=%u: data %p size %d outside MR [%p,+%zu]",
 		     comm->stream_id, req->data, req->size, mr->data, mr->size);
 		dmabuf_req_done(req, 1, 0);
@@ -1008,14 +1140,36 @@ static void reader_handle_req(const struct odl_dmabuf_msg *msg)
 		dmabuf_req_done(req, 1, 0);
 		goto reader_req_release;
 	}
-	/* READY + RX post in one critical section: READY order == RX post
-	 * order on the wire, and the sender fires TX in READY order. */
+	/* RX post + READY in one critical section: READY cannot reach the
+	 * sender before the kernel has a destination slot for its TX. */
 	pthread_mutex_lock(&g_wire_lock);
-	ret = dmabuf_send_ready(comm, (int)msg->len, (int)msg->tag);
-	if (ret >= 0)
-		ret = odl_tb5_stream_recv_dmabuf_nowait(comm->handle,
+	ret = odl_tb5_stream_recv_dmabuf_nowait(comm->handle,
 				comm->stream_id, mr->fd, off_dmabuf,
 				(uint64_t)msg->len, &token);
+	if (ret >= 0) {
+		pe->req = req;
+		pe->token = token;
+		pe->actual = (int)msg->len;
+		pthread_mutex_lock(&g_dmabuf_mutex);
+		comm->rx_replay_seq = msg->seq;
+		comm->rx_replay_len = msg->len;
+		comm->rx_replay_tag = msg->tag;
+		if (comm->rx_tail)
+			comm->rx_tail->next = pe;
+		else
+			comm->rx_head = pe;
+		comm->rx_tail = pe;
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		if (dmabuf_send_ready(comm, (int)msg->len,
+					 (int)msg->tag, msg->seq) < 0) {
+			WARN("dmabuf recv sid=%u: READY failed after RX post",
+			     comm->stream_id);
+			pthread_mutex_lock(&g_dmabuf_mutex);
+			dmabuf_poison_locked("READY failed after RX post");
+			pthread_mutex_unlock(&g_dmabuf_mutex);
+			ready_failed = 1;
+		}
+	}
 	pthread_mutex_unlock(&g_wire_lock);
 	if (ret < 0) {
 		free(pe);
@@ -1024,26 +1178,48 @@ static void reader_handle_req(const struct odl_dmabuf_msg *msg)
 		dmabuf_req_done(req, 1, 0);
 		goto reader_req_release;
 	}
+	if (ready_failed)
+		goto reader_req_release;
 	DBG(2, "  dmabuf recv sid=%u fd=%d off=%llu size=%u token=%d",
 	    comm->stream_id, mr->fd, (unsigned long long)off_dmabuf,
 	    msg->len, token);
-
-	/* Track the posted transfer for the RX completion pass. */
-	pe->req = req;
-	pe->token = token;
-	pe->actual = (int)msg->len;
-	pthread_mutex_lock(&g_dmabuf_mutex);
-	if (comm->rx_tail)
-		comm->rx_tail->next = pe;
-	else
-		comm->rx_head = pe;
-	comm->rx_tail = pe;
-	pthread_mutex_unlock(&g_dmabuf_mutex);
 reader_req_release:
 	pthread_mutex_lock(&g_dmabuf_mutex);
 	if (--comm->refs == 0)
 		free(comm);
+	else
+		pthread_cond_broadcast(&g_dmabuf_cond);
 	pthread_mutex_unlock(&g_dmabuf_mutex);
+}
+
+/* Revisit control REQs which arrived before their irecv.  Work is
+ * detached from the queue before calling the normal handler. */
+static void reader_match_pending_reqs(void)
+{
+	for (;;) {
+		struct odl_tb5_comm *c;
+		struct odl_pending_req *pending = NULL;
+
+		pthread_mutex_lock(&g_dmabuf_mutex);
+		for (c = g_dmabuf_comms; c; c = c->dmabuf_next) {
+			struct odl_tb5_request *req;
+			if (!c->pr_head)
+				continue;
+			req = c->r_head;
+			if (req) {
+				pending = c->pr_head;
+				c->pr_head = pending->next;
+				if (!c->pr_head)
+					c->pr_tail = NULL;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&g_dmabuf_mutex);
+		if (!pending)
+			return;
+		reader_handle_req(&pending->msg);
+		free(pending);
+	}
 }
 
 /* Complete posted RX transfers whose kernel cells have landed.  Called
@@ -1066,12 +1242,14 @@ static void reader_rx_poll(void)
 			if (ret < 0) {
 				WARN("dmabuf recv sid=%u token=%d failed: %s",
 				     c->stream_id, pe->token, strerror(-ret));
-				dmabuf_req_done(pe->req, 1, 0);
+				if (pe->req)
+					dmabuf_req_done(pe->req, 1, 0);
 			} else {
 				stats_record_rx_dmabuf(pe->actual);
 				DBG(1, "xfer  DONE   RECV comm=%p sid=%u size=%d",
 				    (void *)c, c->stream_id, pe->actual);
-				dmabuf_req_done(pe->req, 0, pe->actual);
+				if (pe->req)
+					dmabuf_req_done(pe->req, 0, pe->actual);
 			}
 			*pp = pe->next;
 			if (!*pp)
@@ -1110,14 +1288,15 @@ static void *dmabuf_ctrl_reader(void *arg)
 
 		now = clock_mono_ns();
 
-		/* REQ-send + handshake-retry pass. */
+		/* REQ-send + handshake-retry pass.  Only the head request is
+		 * announced per comm, making the per-comm sequence cumulative. */
 		pthread_mutex_lock(&g_dmabuf_mutex);
 		{
 			struct odl_tb5_comm *c;
 			for (c = g_dmabuf_comms; c; c = c->dmabuf_next) {
-				struct odl_tb5_request *req, *prev = NULL;
+				struct odl_tb5_request *req;
 				req = c->d_head;
-				while (req) {
+				if (req) {
 					struct odl_tb5_request *next = req->next;
 					uint64_t elapsed;
 					if (!req->req_sent) {
@@ -1130,42 +1309,32 @@ static void *dmabuf_ctrl_reader(void *arg)
 						req->req_sent = 1;
 						req->req_retries = 0;
 						req->req_sent_at = clock_mono_ns();
-						prev = req;
-						req = next;
 						continue;
 					}
 					elapsed = now - req->req_sent_at;
 					if (elapsed < (uint64_t)ODL_DMABUF_READY_WAIT_S * 1000000000ULL) {
-						prev = req;
-						req = next;
 						continue;
 					}
 					if (++req->req_retries > ODL_DMABUF_REQ_MAX_RETRIES) {
 						WARN("dmabuf send sid=%u: no READY for %d bytes tag=%d after %d retries - failing",
 						     c->stream_id, req->size,
 						     req->tag, req->req_retries);
-						dmabuf_req_done(req, 1, 0);
-						goto unlink_req;
+						dmabuf_poison_locked("READY retry limit exceeded");
+						continue;
 					}
 					DBG(2, "dmabuf ctrl: REQ retry sid=%u size=%d (try %d)",
 					    c->stream_id, req->size,
 					    req->req_retries);
 					if (dmabuf_send_req(c, req) < 0) {
-						dmabuf_req_done(req, 1, 0);
-						goto unlink_req;
+						dmabuf_poison_locked("REQ retry send failed");
+						continue;
 					}
 					req->req_sent_at = clock_mono_ns();
-					prev = req;
-					req = next;
 					continue;
 				unlink_req:
-					if (prev)
-						prev->next = next;
-					else
-						c->d_head = next;
+					c->d_head = next;
 					if (!next)
-						c->d_tail = prev;
-					req = next;
+						c->d_tail = NULL;
 				}
 			}
 		}
@@ -1187,7 +1356,8 @@ static void *dmabuf_ctrl_reader(void *arg)
 				    strerror(-ret));
 				nanosleep(&ts_1ms, NULL);
 			} else if (actual != sizeof(msg) ||
-				   msg.magic != ODL_DMABUF_MAGIC) {
+				   msg.magic != ODL_DMABUF_MAGIC || !msg.seq ||
+				   msg.len > INT_MAX) {
 				WARN("dmabuf ctrl: malformed control message "
 				     "(ret=%d actual=%u kind=%u)", ret, actual,
 				     msg.kind);
@@ -1199,6 +1369,8 @@ static void *dmabuf_ctrl_reader(void *arg)
 				WARN("dmabuf ctrl: unknown kind %u", msg.kind);
 			}
 		}
+
+		reader_match_pending_reqs();
 
 		/* RX completion pass: poll every posted NOWAIT transfer. */
 		reader_rx_poll();
@@ -1212,13 +1384,18 @@ static int dmabuf_enqueue_send(struct odl_tb5_comm *comm,
 			       struct odl_tb5_request *req)
 {
 	pthread_mutex_lock(&g_dmabuf_mutex);
-	if (comm->closed) {
+	if (comm->closed || g_dmabuf_fatal) {
 		pthread_mutex_unlock(&g_dmabuf_mutex);
 		return -1;
 	}
 	if (dmabuf_ensure_reader_locked() < 0) {
 		pthread_mutex_unlock(&g_dmabuf_mutex);
 		return -1;
+	}
+	if (!req->seq) {
+		req->seq = ++comm->next_tx_seq;
+		if (!req->seq)
+			req->seq = ++comm->next_tx_seq;
 	}
 	req->next = NULL;
 	if (comm->d_tail)
@@ -1237,7 +1414,7 @@ static int dmabuf_enqueue_recv(struct odl_tb5_comm *comm,
 			       struct odl_tb5_request *req)
 {
 	pthread_mutex_lock(&g_dmabuf_mutex);
-	if (comm->closed) {
+	if (comm->closed || g_dmabuf_fatal) {
 		pthread_mutex_unlock(&g_dmabuf_mutex);
 		return -1;
 	}
@@ -1575,6 +1752,10 @@ static rcclResult_t odl_tb5_closeSend(void *sendComm)
 		if (*pp)
 			*pp = comm->dmabuf_next;
 	}
+	/* A reader may have pinned this comm before it was unregistered.
+	 * Let it finish before close invalidates the stream/shared handle. */
+	while (comm->refs > 1)
+		pthread_cond_wait(&g_dmabuf_cond, &g_dmabuf_mutex);
 	while (comm->d_head) {
 		struct odl_tb5_request *req = comm->d_head;
 		comm->d_head = req->next;
@@ -1596,13 +1777,21 @@ static rcclResult_t odl_tb5_closeSend(void *sendComm)
 		free(req);	/* deregistered before close: no poller left */
 	}
 	comm->r_tail = NULL;
+	while (comm->pr_head) {
+		struct odl_pending_req *pending = comm->pr_head;
+		comm->pr_head = pending->next;
+		free(pending);
+	}
+	comm->pr_tail = NULL;
 	while (comm->rx_head) {
 		struct odl_pending_rx *pe = comm->rx_head;
 		comm->rx_head = pe->next;
-		pe->req->failed = 1;
-		pe->req->done_size = 0;
-		__atomic_store_n(&pe->req->done, 1, __ATOMIC_RELEASE);
-		free(pe->req);	/* deregistered before close: no poller left */
+		if (pe->req) {
+			pe->req->failed = 1;
+			pe->req->done_size = 0;
+			__atomic_store_n(&pe->req->done, 1, __ATOMIC_RELEASE);
+			free(pe->req); /* deregistered before close: no poller left */
+		}
 		free(pe);
 	}
 	comm->rx_tail = NULL;
