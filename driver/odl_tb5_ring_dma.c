@@ -1473,7 +1473,8 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
  * Returns true if the ring drained and is still running, false if it had
  * to be stop+started. */
 static bool odl_tb5_dmabuf_reclaim(struct odl_tb5_ring_ctx *rc,
-				       long baseline, long need)
+				       long baseline, long need,
+				       bool unpublished)
 {
 	bool drained;
 
@@ -1487,10 +1488,13 @@ static bool odl_tb5_dmabuf_reclaim(struct odl_tb5_ring_ctx *rc,
 		atomic_read(&rc->completed) >= baseline + need,
 		msecs_to_jiffies(5000));
 	if (drained) {
-		/* Every in-flight frame completed; keep the ring running and
-		 * re-baseline so the next call's wait starts already-satisfied
-		 * (completions fired for these frames are not in submitted). */
-		atomic_set(&rc->submitted, atomic_read(&rc->completed));
+		/* Partial-submit error frames were posted but never published in
+		 * submitted; account for exactly those descriptors.  A parked
+		 * NOWAIT transfer was already published, so rebasing it to the
+		 * current completion count would move the reservation tail behind
+		 * later tokens which are still in flight. */
+		if (unpublished)
+			atomic_add(need, &rc->submitted);
 		return true;
 	}
 
@@ -1727,10 +1731,11 @@ static int odl_tb5_dmabuf_wait(struct odl_tb5_device *dev,
 			 * wait.  odl_tb5_dmabuf_reclaim drains and keeps the
 			 * ring running; only a wedged ring gets stop+started. */
 			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
-						    x->fidx[p]) &&
+						    x->fidx[p], false) &&
 			    x->rx_shared)
 				dev->paths[p].rx_target = 0;
-			ret = 0;
+			ret = atomic_read(&rc->completed) >=
+			      x->base[p] + x->fidx[p] ? 0 : -EIO;
 		}
 	}
 	return ret;
@@ -1754,7 +1759,7 @@ static int odl_tb5_dmabuf_finish(struct odl_tb5_device *dev,
 			if (x->fidx[p] == 0 || !rc->ring || !rc->started)
 				continue;
 			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
-						    x->fidx[p]) &&
+						    x->fidx[p], false) &&
 			    x->rx_shared)
 				dev->paths[p].rx_target = 0;
 		}
@@ -2095,7 +2100,11 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 			}
 
 			if (!fidx[p])
-				base[p] = atomic_read(&rc->completed);
+				/* Submits are serialized by the direction lock, so
+				 * submitted is this transfer's stable position in the
+				 * completion FIFO.  Using completed gives concurrent
+				 * NOWAIT transfers overlapping wait ranges. */
+				base[p] = atomic_read(&rc->submitted);
 
 			if (fidx[p] >= rc->ring_size) {
 				ret = -ENOSPC;
@@ -2290,7 +2299,8 @@ err_unmap:
 
 		/* All frames posted by this call have completed iff the
 		 * completion counter passed base[p] + fidx[p]. */
-		if (!odl_tb5_dmabuf_reclaim(rc, base[p], fidx[p]) && rx_shared)
+		if (!odl_tb5_dmabuf_reclaim(rc, base[p], fidx[p], true) &&
+		    rx_shared)
 			dev->paths[p].rx_target = 0;
 	}
 	x->is_tx = is_tx;
