@@ -148,11 +148,16 @@ struct odl_tb5_stream_hdr {
 #define ODL_TB5_THROUGHPUT_THRESH	65536	/* bytes: msg > 64KB → throughput */
 #define ODL_TB5_MODE_HYSTERESIS		4	/* consecutive low polls to downshift */
 
+struct odl_tb5_dmabuf_xfer;
+
 struct odl_tb5_frame_slot {
 	void			*virt;
 	dma_addr_t		phys;
 	struct ring_frame	frame;
 	struct odl_tb5_tx_msg	*tx_msg;
+	/* Set only while this pool slot backs a framed dma-buf receive. */
+	struct odl_tb5_dmabuf_xfer *dmabuf_xfer;
+	u8			dmabuf_path;
 	int			slot_idx;
 	bool			in_use;
 };
@@ -404,6 +409,9 @@ struct odl_tb5_dmabuf_xfer {
 	int				nps, ndp;
 	long				base[ODL_TB5_MAX_PATHS];
 	int				fidx[ODL_TB5_MAX_PATHS];
+	/* Exact callback count for this transfer.  Ring-wide completion
+	 * counters cannot identify one of several parked NOWAIT receives. */
+	atomic_t			done[ODL_TB5_MAX_PATHS];
 	size_t				len;
 	bool				rx_shared;
 	bool				rx_armed;

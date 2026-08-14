@@ -168,6 +168,20 @@ static void odl_tb5_tx_completed(struct odl_tb5_device *dev)
 		wake_up_all(&dev->verify_waitq);
 }
 
+/* One dma-buf transfer owns every frame in its stage array until WAIT has
+ * observed all callbacks and releases the mapping. */
+struct odl_tb5_dmabuf_stage {
+	struct odl_tb5_frame_slot *slot;	/* NULL for raw-payload cells */
+	void *cpu;
+	dma_addr_t dma;		/* payload DMA address (raw: exporter page) */
+	u32 seg_off;		/* chunk start offset within its sg */
+	size_t offset;		/* dmabuf byte offset (framed copy only) */
+	size_t len;		/* payload chunk */
+	struct odl_tb5_dmabuf_xfer *xfer;
+	u8 path;
+	struct ring_frame frame; /* raw posts live here (no pool slot) */
+};
+
 static void odl_tb5_queue_ctrl_reply(struct odl_tb5_device *dev, int path_idx,
 				    bool send_ack)
 {
@@ -896,6 +910,8 @@ void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
 {
 	struct odl_tb5_ring_ctx *ctx;
 	struct odl_tb5_device *dev;
+	struct odl_tb5_frame_slot *slot;
+	struct odl_tb5_dmabuf_xfer *x;
 
 	ctx = odl_tb5_ring_to_ctx(ring);
 	if (WARN_ON_ONCE(!ctx))
@@ -907,6 +923,15 @@ void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
 
 	if (canceled)
 		return;
+
+	/* Framed dma-buf RX uses a pool slot, but unlike the shared stream
+	 * callback the slot stays owned by the parked transfer until WAIT.
+	 * Charge the callback to that transfer before publishing the ring-wide
+	 * completion. */
+	slot = container_of(frame, struct odl_tb5_frame_slot, frame);
+	x = READ_ONCE(slot->dmabuf_xfer);
+	if (!WARN_ON_ONCE(!x || slot->dmabuf_path >= ODL_TB5_MAX_PATHS))
+		atomic_inc(&x->done[slot->dmabuf_path]);
 
 	/* Count this arrival as RX activity so the poll timer's idle-grace
 	 * resets, and re-arm it if it had disarmed — keeps the completion pump
@@ -924,6 +949,8 @@ void odl_tb5_rx_dmabuf_raw_callback(struct tb_ring *ring,
 {
 	struct odl_tb5_ring_ctx *ctx;
 	struct odl_tb5_device *dev;
+	struct odl_tb5_dmabuf_stage *stage;
+	struct odl_tb5_dmabuf_xfer *x;
 
 	ctx = odl_tb5_ring_to_ctx(ring);
 	if (WARN_ON_ONCE(!ctx))
@@ -936,6 +963,11 @@ void odl_tb5_rx_dmabuf_raw_callback(struct tb_ring *ring,
 	if (canceled)
 		return;
 
+	stage = container_of(frame, struct odl_tb5_dmabuf_stage, frame);
+	x = READ_ONCE(stage->xfer);
+	if (WARN_ON_ONCE(!x || stage->path >= ODL_TB5_MAX_PATHS))
+		x = NULL;
+
 	/* The NHI writes the received byte count into the completed
 	 * descriptor; charge it to the cumulative raw-RX counter so the
 	 * submit-side length validation can compare the transfer's delta. */
@@ -944,6 +976,11 @@ void odl_tb5_rx_dmabuf_raw_callback(struct tb_ring *ring,
 
 	ODL_STAT_INC(dev, rx_frames_seen);
 	odl_tb5_poll_kick(dev);
+	/* Publish transfer completion only after the callback's final access to
+	 * the private stage/frame.  A timeout=0 poll may release it as soon as
+	 * this counter changes. */
+	if (x)
+		atomic_inc(&x->done[stage->path]);
 
 	atomic_inc(&ctx->completed);
 	wake_up_interruptible(&ctx->waitq);
@@ -1450,10 +1487,9 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
  * its own absolute buffer_phy, so cross-path arrival ordering is irrelevant;
  * only same-path FIFO order matters, and per path we post in ascending offset.
  *
- * Completion accounting is per ring context (path->{tx,rx}.submitted/completed/
- * waitq); the dmabuf callbacks already increment the ctx of the ring the frame
- * came from, so no cross-path bookkeeping is needed — we just publish the
- * per-path submitted counts and then wait on every path we posted to.
+ * TX completion accounting uses each ring context.  RX additionally charges
+ * every callback to its owning transfer: several NOWAIT receives may share a
+ * ring, so a ring-wide count cannot say which parked token completed.
  *
  * nps == 1 collapses to the original single-path behaviour (everything on
  * paths[0]).
@@ -1461,6 +1497,9 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
 
 /* Drain a ring that still has in-flight frames before the DMA mapping is
  * dropped (teardown UAF (B)), and after a signal interrupted the submit.
+ * RX must wait on @owned: unrelated NOWAIT transfers share the ring-wide
+ * counter and may complete later descriptors while this transfer is short.
+ * TX is synchronous/serialized and continues to use its ring FIFO range.
  * Re-baseline the counters and keep the ring running so the next submit
  * stays compatible.  stop+start is the last resort: it resets the
  * driver-side head to 0 but the NHI controller's internal descriptor
@@ -1474,6 +1513,7 @@ int odl_tb5_submit_rx(struct odl_tb5_device *dev,
  * to be stop+started. */
 static bool odl_tb5_dmabuf_reclaim(struct odl_tb5_ring_ctx *rc,
 				       long baseline, long need,
+				       atomic_t *owned,
 				       bool unpublished)
 {
 	bool drained;
@@ -1481,11 +1521,12 @@ static bool odl_tb5_dmabuf_reclaim(struct odl_tb5_ring_ctx *rc,
 	if (!rc->ring || !rc->started)
 		return true;
 
-	/* `need` more posted frames must complete.  Transfers are sequential
-	 * on completion, so the only in-flight frames are this call's; their
-	 * callbacks wake rc->waitq. */
+	/* A receive mapping is safe to drop only after this transfer's private
+	 * frames called back.  Ring FIFO progress alone is not ownership proof
+	 * when several NOWAIT tokens are parked concurrently. */
 	drained = wait_event_timeout(rc->waitq,
-		atomic_read(&rc->completed) >= baseline + need,
+		owned ? atomic_read(owned) >= need :
+			atomic_read(&rc->completed) >= baseline + need,
 		msecs_to_jiffies(5000));
 	if (drained) {
 		/* Partial-submit error frames were posted but never published in
@@ -1499,9 +1540,10 @@ static bool odl_tb5_dmabuf_reclaim(struct odl_tb5_ring_ctx *rc,
 	}
 
 	pr_warn("odl_tb5: ring drain timeout (completed=%d submitted=%d "
-		"baseline=%ld need=%ld tx_inflight=%d poll_active=%d "
+		"owned=%d baseline=%ld need=%ld tx_inflight=%d poll_active=%d "
 		"poll_idle_ticks=%u e2e=%d); canceling frames via ring stop\n",
 		atomic_read(&rc->completed), atomic_read(&rc->submitted),
+		owned ? atomic_read(owned) : -1,
 		baseline, need,
 		atomic_read(&rc->dev->tx_inflight),
 		atomic_read(&rc->dev->poll_active),
@@ -1589,16 +1631,6 @@ static int odl_tb5_dmabuf_walk(struct sg_table *sgt, size_t offset,
 	return total_remaining == 0 ? 0 : -EIO;
 }
 
-struct odl_tb5_dmabuf_stage {
-	struct odl_tb5_frame_slot *slot;	/* NULL for raw-payload cells */
-	void *cpu;
-	dma_addr_t dma;		/* payload DMA address (raw: exporter page) */
-	u32 seg_off;		/* chunk start offset within its sg */
-	size_t offset;		/* dmabuf byte offset (framed copy only) */
-	size_t len;		/* payload chunk */
-	struct ring_frame frame; /* raw posts live here (no pool slot) */
-};
-
 /* Release a parked transfer's mapping, staged frames and pool slots.
  * @deliver: copy received payload back (success path).  The raw-payload
  * length validation runs here — with no in-band header the received byte
@@ -1666,9 +1698,9 @@ static int odl_tb5_dmabuf_release(struct odl_tb5_device *dev,
 /* Wait for every posted cell to complete.  timeout_ms == 0 is a pure
  * poll: return -EAGAIN while any cell is pending, never sleep — the RCCL
  * plugin's control reader uses it to service RX completions between
- * control messages.  The per-path baselines are absolute (captured at
- * submit), so several NOWAIT transfers can be in flight on the same
- * rings concurrently and each waits for exactly its own cells. */
+ * control messages.  RX callbacks charge the owning transfer directly, so
+ * several NOWAIT transfers can be in flight on the same rings without one
+ * token's callbacks satisfying another token's wait. */
 static int odl_tb5_dmabuf_wait(struct odl_tb5_device *dev,
 			       struct odl_tb5_dmabuf_xfer *x, int timeout_ms)
 {
@@ -1677,19 +1709,29 @@ static int odl_tb5_dmabuf_wait(struct odl_tb5_device *dev,
 	for (p = 0; p < x->nps; p++) {
 		struct odl_tb5_ring_ctx *rc =
 			x->is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
-		long need = x->base[p] + x->fidx[p];
+		long need = x->is_tx ? x->base[p] + x->fidx[p]
+				     : x->fidx[p];
 
 		if (x->fidx[p] == 0)
 			continue;
 		if (timeout_ms == 0) {
-			if (atomic_read(&rc->completed) < need) {
+			bool pending = x->is_tx ?
+				atomic_read(&rc->completed) < need :
+				atomic_read(&x->done[p]) < need;
+
+			if (pending) {
+				pr_debug_ratelimited("odl_tb5: dmabuf RX token pending path=%d own=%d/%d ring=%d/%d\n",
+					p, atomic_read(&x->done[p]), x->fidx[p],
+					atomic_read(&rc->completed),
+					atomic_read(&rc->submitted));
 				ret = -EAGAIN;
 				break;
 			}
 			continue;
 		}
 		ret = wait_event_interruptible_timeout(rc->waitq,
-			atomic_read(&rc->completed) >= need,
+			x->is_tx ? atomic_read(&rc->completed) >= need :
+				   atomic_read(&x->done[p]) >= need,
 			msecs_to_jiffies(timeout_ms));
 		if (ret == 0) {
 			/* Bounded wait.  A completion that never lands used to
@@ -1731,11 +1773,15 @@ static int odl_tb5_dmabuf_wait(struct odl_tb5_device *dev,
 			 * wait.  odl_tb5_dmabuf_reclaim drains and keeps the
 			 * ring running; only a wedged ring gets stop+started. */
 			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
-						    x->fidx[p], false) &&
+						    x->fidx[p],
+						    x->is_tx ? NULL : &x->done[p],
+						    false) &&
 			    x->rx_shared)
 				dev->paths[p].rx_target = 0;
-			ret = atomic_read(&rc->completed) >=
-			      x->base[p] + x->fidx[p] ? 0 : -EIO;
+			ret = (x->is_tx ?
+			       atomic_read(&rc->completed) >=
+				       x->base[p] + x->fidx[p] :
+			       atomic_read(&x->done[p]) >= x->fidx[p]) ? 0 : -EIO;
 		}
 	}
 	return ret;
@@ -1759,7 +1805,9 @@ static int odl_tb5_dmabuf_finish(struct odl_tb5_device *dev,
 			if (x->fidx[p] == 0 || !rc->ring || !rc->started)
 				continue;
 			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
-						    x->fidx[p], false) &&
+						    x->fidx[p],
+						    x->is_tx ? NULL : &x->done[p],
+						    false) &&
 			    x->rx_shared)
 				dev->paths[p].rx_target = 0;
 		}
@@ -1809,6 +1857,9 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 	 * keep the value defined. */
 	bool raw = READ_ONCE(dev->raw_payload_ok);
 	bool raw_ok = false;
+
+	for (p = 0; p < ODL_TB5_MAX_PATHS; p++)
+		atomic_set(&x->done[p], 0);
 
 	if (dev->state != ODL_TB5_STATE_CONNECTED &&
 	    dev->state != ODL_TB5_STATE_READY)
@@ -2124,6 +2175,8 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 			}
 			bounce->offset = (size_t)offset + sent;
 			bounce->len = chunk;
+			bounce->xfer = x;
+			bounce->path = p;
 			if (raw_ok) {
 				bounce->seg_off = sg_dma_len(sg) - sg_remaining;
 				bounce->dma = sg_dma_address(sg) +
@@ -2170,6 +2223,10 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 				}
 				bounce->cpu = bounce->slot->virt;
 				bounce->dma = bounce->slot->phys;
+				if (!is_tx) {
+					bounce->slot->dmabuf_xfer = x;
+					bounce->slot->dmabuf_path = p;
+				}
 				if (is_tx) {
 					struct odl_tb5_stream_hdr *hdr =
 						bounce->cpu;
@@ -2297,9 +2354,10 @@ err_unmap:
 		if (fidx[p] == 0 || !rc->ring || !rc->started)
 			continue;
 
-		/* All frames posted by this call have completed iff the
-		 * completion counter passed base[p] + fidx[p]. */
-		if (!odl_tb5_dmabuf_reclaim(rc, base[p], fidx[p], true) &&
+		/* RX teardown follows this call's private callbacks; TX teardown
+		 * follows its serialized ring FIFO range. */
+		if (!odl_tb5_dmabuf_reclaim(rc, base[p], fidx[p],
+					      is_tx ? NULL : &x->done[p], true) &&
 		    rx_shared)
 			dev->paths[p].rx_target = 0;
 	}
@@ -2552,6 +2610,8 @@ struct odl_tb5_frame_slot *odl_tb5_frame_pool_get(struct odl_tb5_frame_pool *poo
 	slot = &pool->slots[idx];
 	slot->in_use = true;
 	slot->tx_msg = NULL;
+	slot->dmabuf_xfer = NULL;
+	slot->dmabuf_path = 0;
 	pool->free_count--;
 
 	spin_unlock_irqrestore(&pool->lock, flags);
@@ -2568,6 +2628,8 @@ void odl_tb5_frame_pool_put(struct odl_tb5_frame_pool *pool,
 	clear_bit(slot->slot_idx, pool->bitmap);
 	slot->in_use = false;
 	slot->tx_msg = NULL;
+	slot->dmabuf_xfer = NULL;
+	slot->dmabuf_path = 0;
 	pool->free_count++;
 
 	spin_unlock_irqrestore(&pool->lock, flags);
