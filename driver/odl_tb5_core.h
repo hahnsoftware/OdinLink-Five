@@ -295,10 +295,10 @@ struct odl_tb5_ring_ctx {
 	atomic_t		submitted;
 	wait_queue_head_t	waitq;
 
-	/* Raw-payload RX: cumulative bytes the NHI reported on zero-copy
+	/* Raw-payload RX: aggregate bytes the NHI reported on zero-copy
 	 * frames (empty-descriptor cells completed via
-	 * odl_tb5_rx_dmabuf_raw_callback).  Per-transfer deltas against a
-	 * captured base give the exact received count for length validation. */
+	 * odl_tb5_rx_dmabuf_raw_callback).  Per-transfer validation uses each
+	 * parked transfer's private completed frames. */
 	atomic_t		rx_raw_bytes;
 
 	/* Legacy double-buffer fields (kept for proto layer compat) */
@@ -403,8 +403,6 @@ struct odl_tb5_dmabuf_xfer {
 	enum dma_data_direction		dir;
 	int				nps, ndp;
 	long				base[ODL_TB5_MAX_PATHS];
-	long				raw_base[ODL_TB5_MAX_PATHS];
-	int				raw_used[ODL_TB5_MAX_PATHS];
 	int				fidx[ODL_TB5_MAX_PATHS];
 	size_t				len;
 	bool				rx_shared;
@@ -769,7 +767,9 @@ void odl_tb5_tx_dmabuf_callback(struct tb_ring *ring,
 void odl_tb5_rx_dmabuf_callback(struct tb_ring *ring,
 				struct ring_frame *frame, bool canceled);
 /* Raw-payload RX completions additionally charge the received byte count
- * into dev->paths[p].rx.rx_raw_bytes for the transfer length check. */
+ * into dev->paths[p].rx.rx_raw_bytes for device-wide statistics.  Transfer
+ * validation reads the completed private frames so concurrent receives do
+ * not contaminate one another's byte counts. */
 void odl_tb5_rx_dmabuf_raw_callback(struct tb_ring *ring,
 				    struct ring_frame *frame, bool canceled);
 

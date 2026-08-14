@@ -1609,11 +1609,15 @@ static int odl_tb5_dmabuf_release(struct odl_tb5_device *dev,
 	if (deliver && x->raw_ok && !x->is_tx) {
 		size_t got = 0;
 
-		for (p = 0; p < x->nps; p++)
-			if (x->raw_used[p])
-				got += (size_t)(atomic_read(
-					&dev->paths[p].rx.rx_raw_bytes) -
-					x->raw_base[p]);
+		/* Each raw RX stage owns the exact ring_frame posted for this
+		 * transfer, and the NHI writes that descriptor's received length
+		 * before invoking its callback.  Summing the transfer's frames is
+		 * concurrency-safe; subtracting a device-wide byte-counter baseline
+		 * also counted later NOWAIT receives that completed first. */
+		smp_rmb(); /* completion count was observed before frame lengths */
+		for (p = 0; p < x->stage_count; p++)
+			if (!x->stage[p].slot)
+				got += x->stage[p].frame.size;
 		if (got != x->len) {
 			pr_warn_ratelimited("odl_tb5: raw RX length mismatch "
 				"(got %zu want %zu)\n", got, x->len);
@@ -1779,8 +1783,6 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 	int fidx[ODL_TB5_MAX_PATHS] = { 0 };	/* per-path frame index */
 	int needed[ODL_TB5_MAX_PATHS] = { 0 }; /* dry-run descriptors per path */
 	long base[ODL_TB5_MAX_PATHS] = { 0 };	/* per-path completion baseline */
-	long raw_base[ODL_TB5_MAX_PATHS] = { 0 }; /* per-path raw RX byte base */
-	int raw_used[ODL_TB5_MAX_PATHS] = { 0 };  /* path posted raw RX cells */
 	int nps, ndp, p, k = 0;
 	int nents_i;
 	int ret = 0;
@@ -2117,15 +2119,6 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 				bounce->seg_off = sg_dma_len(sg) - sg_remaining;
 				bounce->dma = sg_dma_address(sg) +
 					      bounce->seg_off;
-				/* Capture the per-path raw-RX byte baseline
-				 * before the first zero-copy frame so the
-				 * post-wait length check sees only this
-				 * transfer's deltas. */
-				if (!is_tx && !raw_used[p]) {
-					raw_base[p] = atomic_read(
-						&rc->rx_raw_bytes);
-					raw_used[p] = 1;
-				}
 				/* Zero-copy: the NHI DMAes the exporter pages
 				 * directly — no pool slot, no in-band header,
 				 * no memcpy.  The frame identity is the posted
@@ -2271,8 +2264,6 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 	x->len = len;
 	x->posted_total = k;
 	memcpy(x->base, base, sizeof(base));
-	memcpy(x->raw_base, raw_base, sizeof(raw_base));
-	memcpy(x->raw_used, raw_used, sizeof(raw_used));
 	memcpy(x->fidx, fidx, sizeof(fidx));
 	return 0;
 
@@ -2323,8 +2314,6 @@ err_unmap:
 	x->len = len;
 	x->posted_total = k;
 	memcpy(x->base, base, sizeof(base));
-	memcpy(x->raw_base, raw_base, sizeof(raw_base));
-	memcpy(x->raw_used, raw_used, sizeof(raw_used));
 	memcpy(x->fidx, fidx, sizeof(fidx));
 	odl_tb5_dmabuf_release(dev, x, false);
 	return ret;
