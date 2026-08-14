@@ -48,9 +48,9 @@
  *  - the READY carries the receiver's stream id, which identifies the
  *    connection (it equals the sender's dst_id).
  *
- * Zero-byte transfers complete locally.  They have no memory or wire slot,
- * so routing them from a possibly-NULL mhandle could otherwise put the two
- * peers on different protocols (framed host versus DMA-BUF handshake).
+ * Zero-byte transfers ride the same handshake (REQ/READY with len 0)
+ * and complete without posting any cells, so the irecvs RCCL posts for
+ * zero-size steps are still completed in order.
  *
  * RCCL matches a send to a receive by step order (the tags are the
  * constant tpRank/tpRemoteRank), so both sides pair handshakes with
@@ -1634,21 +1634,12 @@ static rcclResult_t start_request(struct odl_tb5_comm *comm, void *data,
 	req->done = 0;
 	req->next = NULL;
 
-	/* A zero-byte operation has neither a buffer nor a raw wire slot.
-	 * RCCL may therefore supply a NULL mhandle on either side.  Complete
-	 * it locally before choosing a transport; otherwise one peer can enter
-	 * the framed host path while the other waits for a DMA-BUF REQ.  It
-	 * deliberately consumes no sequence id, keeping later payload REQs
-	 * aligned. */
-	if (size == 0) {
-		req->done_size = 0;
-		__atomic_store_n(&req->done, 1, __ATOMIC_RELEASE);
-		*request = req;
-		return rcclSuccess;
-	}
-
 	/* DMA-BUF transfers are handshaked on the control stream; the
-	 * reader services them in REQ/READY order (see the ctrl comment). */
+	 * reader services them in REQ/READY order (see the ctrl comment).
+	 * Zero-size transfers ride the handshake too: RCCL posts irecvs
+	 * for zero-size steps, so the receiver must complete them in
+	 * step order — the reader completes a zero-len REQ/READY without
+	 * posting any cells. */
 	if (is_dmabuf) {
 		if (is_send) {
 			if (dmabuf_enqueue_send(comm, req) < 0) {
