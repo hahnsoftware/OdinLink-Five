@@ -143,13 +143,34 @@ struct odl_tb5_stream_wait {
 	__u32 timeout_ms;
 };
 
+/* DMA-BUF submit flags (struct odl_tb5_stream_dmabuf.flags).  NOWAIT
+ * submits the RX cells and returns a token instead of blocking until the
+ * transfer completes; the caller then polls completion with
+ * ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT.  Required by the RCCL plugin's
+ * control reader, which must never block in a transfer wait (it would
+ * stop processing the peer's control messages and deadlock the link). */
+#define ODL_TB5_DMABUF_F_NOWAIT        (1 << 0)
+
+/* Per-call stream xfer flag: return -EAGAIN from STREAM_RECV when no
+ * message is queued for this stream, regardless of the fd's O_NONBLOCK
+ * (the device fd is shared with threads that rely on blocking recv). */
+#define ODL_STREAM_XFER_F_NONBLOCK     (1 << 0)
+
 struct odl_tb5_stream_dmabuf {
 	__u8  stream_id;
 	__u8  dst_id;
-	__u16 reserved;
+	__u8  flags;
+	__u8  reserved;
 	__s32 dmabuf_fd;
 	__u64 offset;
 	__u64 len;
+	__s32 token;      /* out: pending-slot token (NOWAIT only) */
+	__s32 reserved2;
+};
+
+struct odl_tb5_stream_dmabuf_wait {
+	__s32 token;      /* token from a NOWAIT submit */
+	__u32 timeout_ms; /* 0 = poll once, return -EAGAIN if pending */
 };
 
 /* ── Stream ioctls ──────────────────────────────────────────────────── */
@@ -161,7 +182,8 @@ struct odl_tb5_stream_dmabuf {
 #define ODL_TB5_IOCTL_STREAM_WAIT_TX   _IOW (ODL_TB5_IOCTL_MAGIC, 0x24, struct odl_tb5_stream_wait)
 #define ODL_TB5_IOCTL_STREAM_WAIT_RX   _IOW (ODL_TB5_IOCTL_MAGIC, 0x25, struct odl_tb5_stream_wait)
 #define ODL_TB5_IOCTL_STREAM_SEND_DMABUF _IOW(ODL_TB5_IOCTL_MAGIC, 0x26, struct odl_tb5_stream_dmabuf)
-#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF _IOW(ODL_TB5_IOCTL_MAGIC, 0x27, struct odl_tb5_stream_dmabuf)
+#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF _IOWR(ODL_TB5_IOCTL_MAGIC, 0x27, struct odl_tb5_stream_dmabuf)
+#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT _IOWR(ODL_TB5_IOCTL_MAGIC, 0x28, struct odl_tb5_stream_dmabuf_wait)
 
 #define ODL_TB5_IOCTL_GET_PEER         _IOR (ODL_TB5_IOCTL_MAGIC, 0x07, struct odl_tb5_peer_info)
 

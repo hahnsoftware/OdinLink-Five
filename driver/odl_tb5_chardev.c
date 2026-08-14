@@ -283,7 +283,12 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		 * worker returns EAGAIN here forever and the pool never arms. */
 		odl_tb5_rx_arm(dev);
 
-		/* Non-blocking recv: fail if no data available */
+		/* Non-blocking recv: fail if no data available.  The fd's
+		 * O_NONBLOCK applies process-wide (the shared handle is used
+		 * by threads that rely on blocking recv), so the per-call
+		 * ODL_STREAM_XFER_F_NONBLOCK flag opts one call out. */
+		nonblock = nonblock ||
+			   (req.flags & ODL_STREAM_XFER_F_NONBLOCK);
 		if (nonblock && !odl_tb5_stream_can_recv(stream)) {
 			odl_tb5_stream_put(stream);
 			return -EAGAIN;
@@ -396,10 +401,30 @@ static long odl_tb5_ioctl(struct file *filp, unsigned int cmd,
 		if (!stream)
 			return -ENOENT;
 
-		ret = odl_tb5_submit_rx_dmabuf(dev, req.dmabuf_fd,
-					       req.offset, req.len);
+		if (req.flags & ODL_TB5_DMABUF_F_NOWAIT) {
+			ret = odl_tb5_submit_rx_dmabuf_nowait(dev,
+					req.dmabuf_fd, req.offset, req.len,
+					&req.token);
+			if (ret == 0 && copy_to_user(uarg, &req, sizeof(req)))
+				ret = -EFAULT;
+		} else {
+			ret = odl_tb5_submit_rx_dmabuf(dev, req.dmabuf_fd,
+						       req.offset, req.len);
+		}
 		odl_tb5_stream_put(stream);
 		return ret;
+	}
+
+	case ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT: {
+		struct odl_tb5_stream_dmabuf_wait req;
+
+		if (copy_from_user(&req, uarg, sizeof(req)))
+			return -EFAULT;
+		if (dev->loopback_data)
+			return -EOPNOTSUPP;
+
+		return odl_tb5_wait_rx_dmabuf(dev, req.token,
+					      (int)req.timeout_ms);
 	}
 
 	/* ── Legacy ioctls ──────────────────────────────────────────── */

@@ -116,6 +116,21 @@ int odl_tb5_stream_send_dmabuf(odl_tb5_t handle, uint8_t stream_id,
 int odl_tb5_stream_recv_dmabuf(odl_tb5_t handle, uint8_t stream_id,
 			       int dmabuf_fd, uint64_t offset, uint64_t len);
 
+/* Post a DMA-buf receive without waiting; returns a token the caller
+ * polls with odl_tb5_stream_wait_dmabuf (timeout_ms=0 polls once and
+ * returns -EAGAIN while pending).  Lets a control reader service RX
+ * completions without ever blocking in a transfer wait. */
+int odl_tb5_stream_recv_dmabuf_nowait(odl_tb5_t handle, uint8_t stream_id,
+				      int dmabuf_fd, uint64_t offset,
+				      uint64_t len, int *token);
+int odl_tb5_stream_wait_dmabuf(odl_tb5_t handle, int token,
+			       uint32_t timeout_ms);
+
+/* Stream receive with per-call flags (ODL_STREAM_XFER_F_NONBLOCK). */
+int odl_tb5_stream_recv_flags(odl_tb5_t handle, uint8_t stream_id,
+			      void *buf, uint32_t buf_len, uint8_t *src_id,
+			      uint32_t *actual_len, uint8_t flags);
+
 #ifdef __cplusplus
 }
 #endif

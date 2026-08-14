@@ -95,13 +95,31 @@ struct odl_tb5_stream_wait {
 	uint32_t timeout_ms;
 };
 
+/* DMA-BUF submit flags (struct odl_tb5_stream_dmabuf.flags).  NOWAIT
+ * submits the RX cells and returns a token instead of blocking until the
+ * transfer completes; the caller then polls completion with
+ * ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT. */
+#define ODL_TB5_DMABUF_F_NOWAIT        (1 << 0)
+
+/* Per-call stream xfer flag: return -EAGAIN from STREAM_RECV when no
+ * message is queued for this stream, regardless of the fd's O_NONBLOCK. */
+#define ODL_STREAM_XFER_F_NONBLOCK     (1 << 0)
+
 struct odl_tb5_stream_dmabuf {
 	uint8_t  stream_id;
 	uint8_t  dst_id;
-	uint16_t reserved;
+	uint8_t  flags;
+	uint8_t  reserved;
 	int32_t  dmabuf_fd;
 	uint64_t offset;
 	uint64_t len;
+	int32_t  token;      /* out: pending-slot token (NOWAIT only) */
+	int32_t  reserved2;
+};
+
+struct odl_tb5_stream_dmabuf_wait {
+	int32_t  token;      /* token from a NOWAIT submit */
+	uint32_t timeout_ms; /* 0 = poll once, return -EAGAIN if pending */
 };
 
 /* Stream ioctls */
@@ -112,7 +130,8 @@ struct odl_tb5_stream_dmabuf {
 #define ODL_TB5_IOCTL_STREAM_WAIT_TX   _IOW (ODL_TB5_IOCTL_MAGIC, 0x24, struct odl_tb5_stream_wait)
 #define ODL_TB5_IOCTL_STREAM_WAIT_RX   _IOW (ODL_TB5_IOCTL_MAGIC, 0x25, struct odl_tb5_stream_wait)
 #define ODL_TB5_IOCTL_STREAM_SEND_DMABUF _IOW(ODL_TB5_IOCTL_MAGIC, 0x26, struct odl_tb5_stream_dmabuf)
-#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF _IOW(ODL_TB5_IOCTL_MAGIC, 0x27, struct odl_tb5_stream_dmabuf)
+#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF _IOWR(ODL_TB5_IOCTL_MAGIC, 0x27, struct odl_tb5_stream_dmabuf)
+#define ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT _IOWR(ODL_TB5_IOCTL_MAGIC, 0x28, struct odl_tb5_stream_dmabuf_wait)
 
 /* Forward declarations - full definitions in odl_tb5_types.h */
 struct odl_tb5_completion;

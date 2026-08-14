@@ -166,3 +166,77 @@ int odl_tb5_stream_recv_dmabuf(odl_tb5_t handle, uint8_t stream_id,
 
 	return 0;
 }
+
+/* Post the RX cells without waiting; the kernel returns a token that
+ * odl_tb5_stream_wait_dmabuf() later polls to completion.  Used by the
+ * RCCL plugin's control reader, which must never block in a transfer
+ * wait (it would stop servicing the peer's control messages). */
+int odl_tb5_stream_recv_dmabuf_nowait(odl_tb5_t handle, uint8_t stream_id,
+				      int dmabuf_fd, uint64_t offset,
+				      uint64_t len, int *token)
+{
+	struct odl_tb5_stream_dmabuf req;
+
+	if (!handle || !token)
+		return -EINVAL;
+
+	memset(&req, 0, sizeof(req));
+	req.stream_id = stream_id;
+	req.flags = ODL_TB5_DMABUF_F_NOWAIT;
+	req.dmabuf_fd = dmabuf_fd;
+	req.offset = offset;
+	req.len = len;
+
+	if (ioctl(odl_tb5_get_fd(handle), ODL_TB5_IOCTL_STREAM_RECV_DMABUF, &req) < 0)
+		return -errno;
+
+	*token = req.token;
+	return 0;
+}
+
+/* Poll/complete a NOWAIT receive.  timeout_ms == 0 polls once: returns
+ * -EAGAIN while the transfer is still pending, 0 when done. */
+int odl_tb5_stream_wait_dmabuf(odl_tb5_t handle, int token,
+			       uint32_t timeout_ms)
+{
+	struct odl_tb5_stream_dmabuf_wait req;
+
+	if (!handle || token <= 0)
+		return -EINVAL;
+
+	memset(&req, 0, sizeof(req));
+	req.token = token;
+	req.timeout_ms = timeout_ms;
+
+	if (ioctl(odl_tb5_get_fd(handle), ODL_TB5_IOCTL_STREAM_RECV_DMABUF_WAIT, &req) < 0)
+		return -errno;
+
+	return 0;
+}
+
+/* Stream receive with per-call flags (ODL_STREAM_XFER_F_NONBLOCK).  The
+ * device fd may be opened blocking for other threads; this opts one call
+ * out so a poll-driven reader gets -EAGAIN instead of sleeping. */
+int odl_tb5_stream_recv_flags(odl_tb5_t handle, uint8_t stream_id,
+			      void *buf, uint32_t buf_len, uint8_t *src_id,
+			      uint32_t *actual_len, uint8_t flags)
+{
+	struct odl_tb5_stream_xfer req;
+
+	if (!handle || !buf || !actual_len)
+		return -EINVAL;
+
+	memset(&req, 0, sizeof(req));
+	req.stream_id = stream_id;
+	req.flags = flags;
+	req.data = (uint64_t)(uintptr_t)buf;
+	req.len = buf_len;
+
+	if (ioctl(odl_tb5_get_fd(handle), ODL_TB5_IOCTL_STREAM_RECV, &req) < 0)
+		return -errno;
+
+	if (src_id)
+		*src_id = req.src_id;
+	*actual_len = req.actual_len;
+	return 0;
+}

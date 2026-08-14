@@ -387,6 +387,48 @@ struct odl_tb5_stats {
 
 /* ── Main device structure ───────────────────────────────────────────── */
 
+struct odl_tb5_dmabuf_stage;	/* defined in odl_tb5_ring_dma.c */
+
+/* Per-transfer context of a kernel dmabuf submit.  The blocking submit
+ * keeps it on the stack; the NOWAIT submit parks it in a device slot so
+ * the completion wait can run later (and the RCCL plugin's control
+ * reader can poll it without ever blocking in a transfer wait). */
+struct odl_tb5_dmabuf_xfer {
+	u8				state;	/* slot state, see below */
+	bool				is_tx;
+	struct dma_buf			*dmabuf;
+	struct dma_buf_attachment	*attach;
+	struct sg_table			*sgt;
+	struct device			*dma_dev;
+	enum dma_data_direction		dir;
+	int				nps, ndp;
+	long				base[ODL_TB5_MAX_PATHS];
+	long				raw_base[ODL_TB5_MAX_PATHS];
+	int				raw_used[ODL_TB5_MAX_PATHS];
+	int				fidx[ODL_TB5_MAX_PATHS];
+	size_t				len;
+	bool				rx_shared;
+	bool				rx_armed;
+	bool				rx_poll_held;
+	int				rx_pool_posted;
+	struct odl_tb5_dmabuf_stage	*stage;
+	int				stage_count;
+	struct iosys_map		cpu_map;
+	bool				cpu_access;
+	bool				cpu_mapped;
+	bool				raw_ok;
+	int				posted_total;
+};
+
+/* Pending-slot states (dev->dmabuf_rx_pending[].state).  The WAIT ioctl
+ * moves BUSY -> WAITING while it owns the slot, so a second concurrent
+ * WAIT on the same token fails instead of double-finishing it. */
+#define ODL_DMABUF_SLOT_FREE		0
+#define ODL_DMABUF_SLOT_BUSY		1
+#define ODL_DMABUF_SLOT_WAITING		2
+
+#define ODL_TB5_DMABUF_MAX_PENDING	64
+
 struct odl_tb5_device {
 	struct tb_service	*svc;
 	struct tb_xdomain	*xd;
@@ -580,6 +622,11 @@ struct odl_tb5_device {
 	 * arrays/rings.  Separate locks preserve full-duplex operation. */
 	struct mutex			dmabuf_tx_lock;
 	struct mutex			dmabuf_rx_lock;
+	/* NOWAIT RX transfers parked between submit and completion-wait.
+	 * Slot allocation/free and all state transitions run under
+	 * dmabuf_rx_lock; the WAIT ioctl sleeps on the per-ring waitq with
+	 * the lock released (multiple slots can wait concurrently). */
+	struct odl_tb5_dmabuf_xfer	dmabuf_rx_pending[ODL_TB5_DMABUF_MAX_PENDING];
 };
 
 /* TX stripe target for a stream.  Streams are pinned at creation; if the
@@ -656,6 +703,14 @@ int  odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 			      int dmabuf_fd, loff_t offset, size_t len);
 int  odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 			      int dmabuf_fd, loff_t offset, size_t len);
+/* Split RX submit (ODL_TB5_DMABUF_F_NOWAIT): submit posts the cells and
+ * returns a token; wait polls/completes it (timeout_ms == 0 = poll,
+ * -EAGAIN while pending).  The slot is freed when the wait finishes it. */
+int  odl_tb5_submit_rx_dmabuf_nowait(struct odl_tb5_device *dev,
+				     int dmabuf_fd, loff_t offset,
+				     size_t len, int *token);
+int  odl_tb5_wait_rx_dmabuf(struct odl_tb5_device *dev, int token,
+			    int timeout_ms);
 
 /* ── Stream management ───────────────────────────────────────────────── */
 

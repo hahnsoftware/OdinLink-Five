@@ -1595,9 +1595,174 @@ struct odl_tb5_dmabuf_stage {
 	struct ring_frame frame; /* raw posts live here (no pool slot) */
 };
 
+/* Release a parked transfer's mapping, staged frames and pool slots.
+ * @deliver: copy received payload back (success path).  The raw-payload
+ * length validation runs here — with no in-band header the received byte
+ * sum is the only integrity check, and any shortfall fails the transfer
+ * (the framed path cannot hit this: the staged copy is exact by
+ * construction).  Returns -EIO when the validation fails. */
+static int odl_tb5_dmabuf_release(struct odl_tb5_device *dev,
+				  struct odl_tb5_dmabuf_xfer *x, bool deliver)
+{
+	int p;
+
+	if (deliver && x->raw_ok && !x->is_tx) {
+		size_t got = 0;
+
+		for (p = 0; p < x->nps; p++)
+			if (x->raw_used[p])
+				got += (size_t)(atomic_read(
+					&dev->paths[p].rx.rx_raw_bytes) -
+					x->raw_base[p]);
+		if (got != x->len) {
+			pr_warn_ratelimited("odl_tb5: raw RX length mismatch "
+				"(got %zu want %zu)\n", got, x->len);
+			ODL_STAT_INC(dev, raw_rx_len_mismatch);
+			deliver = false;   /* don't copy back unvalidated data */
+		}
+	}
+	if (x->rx_armed) {
+		atomic_dec(&dev->dmabuf_rx_active);
+		x->rx_armed = false;
+	}
+	if (x->rx_poll_held) {
+		atomic_dec(&dev->rx_dmabuf_pending);
+		x->rx_poll_held = false;
+	}
+	/* Raw stages hold no pool slot (the NHI wrote the exporter pages
+	 * directly); only framed stages are copied back and returned. */
+	for (p = 0; p < x->stage_count; p++) {
+		if (!x->stage[p].slot)
+			continue;
+		if (deliver && !x->is_tx)
+			iosys_map_memcpy_to(&x->cpu_map, x->stage[p].offset,
+					    x->stage[p].cpu +
+						ODL_TB5_STREAM_HDR_SIZE,
+					    x->stage[p].len);
+		odl_tb5_frame_pool_put(&dev->frame_pool, x->stage[p].slot);
+		x->stage[p].slot = NULL;
+	}
+	if (x->cpu_mapped)
+		dma_buf_vunmap(x->dmabuf, &x->cpu_map);
+	if (x->cpu_access)
+		dma_buf_end_cpu_access(x->dmabuf, DMA_BIDIRECTIONAL);
+	kfree(x->stage);
+	x->stage = NULL;
+	dma_sync_sgtable_for_cpu(x->dma_dev, x->sgt, x->dir);
+	dma_buf_unmap_attachment(x->attach, x->sgt, x->dir);
+	dma_buf_detach(x->dmabuf, x->attach);
+	dma_buf_put(x->dmabuf);
+	return deliver ? 0 : (x->raw_ok ? -EIO : 0);
+}
+
+/* Wait for every posted cell to complete.  timeout_ms == 0 is a pure
+ * poll: return -EAGAIN while any cell is pending, never sleep — the RCCL
+ * plugin's control reader uses it to service RX completions between
+ * control messages.  The per-path baselines are absolute (captured at
+ * submit), so several NOWAIT transfers can be in flight on the same
+ * rings concurrently and each waits for exactly its own cells. */
+static int odl_tb5_dmabuf_wait(struct odl_tb5_device *dev,
+			       struct odl_tb5_dmabuf_xfer *x, int timeout_ms)
+{
+	int p, ret = 0;
+
+	for (p = 0; p < x->nps; p++) {
+		struct odl_tb5_ring_ctx *rc =
+			x->is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
+		long need = x->base[p] + x->fidx[p];
+
+		if (x->fidx[p] == 0)
+			continue;
+		if (timeout_ms == 0) {
+			if (atomic_read(&rc->completed) < need) {
+				ret = -EAGAIN;
+				break;
+			}
+			continue;
+		}
+		ret = wait_event_interruptible_timeout(rc->waitq,
+			atomic_read(&rc->completed) >= need,
+			msecs_to_jiffies(timeout_ms));
+		if (ret == 0) {
+			/* Bounded wait.  A completion that never lands used to
+			 * pin the ioctl indefinitely (the dmabuf transport
+			 * hang).  Time out, reclaim every posted ring
+			 * (stop+start, in finish) so the DMA mapping is never
+			 * dropped under in-flight frames, and surface
+			 * -ETIMEDOUT so the caller can measure the failure
+			 * instead of hanging forever.  Report the completion-
+			 * pump state, not just the counters: a stalled wait is
+			 * either "the pump was never armed" (poll_active == 0)
+			 * or "it is armed and still sees nothing", and the two
+			 * have different fixes.  tx_inflight is the arming
+			 * input -- odl_tb5_tx_submitted() only kicks the poll
+			 * on the 0->1 edge, so a leaked count silently disables
+			 * arming for every later submit. */
+			pr_warn("odl_tb5: dmabuf %s wait timeout on path %d "
+				"(completed=%d submitted=%d tx_inflight=%d "
+				"poll_active=%d poll_idle_ticks=%u e2e=%d); "
+				"ring_head=%d ring_tail=%d ring_running=%d; "
+				"reclaiming frames via ring stop\n",
+				x->is_tx ? "TX" : "RX", p,
+				atomic_read(&rc->completed),
+				atomic_read(&rc->submitted),
+				atomic_read(&dev->tx_inflight),
+				atomic_read(&dev->poll_active),
+				dev->poll_idle_ticks,
+				odl_e2e ? 1 : 0,
+				READ_ONCE(rc->ring->head),
+				READ_ONCE(rc->ring->tail),
+				rc->ring->running ? 1 : 0);
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (ret == -ERESTARTSYS) {
+			/* A signal arrived mid-DMA.  The release below must not
+			 * race the still in-flight transfer (K3), so wait
+			 * uninterruptibly for it to drain -- but bound the
+			 * wait.  odl_tb5_dmabuf_reclaim drains and keeps the
+			 * ring running; only a wedged ring gets stop+started. */
+			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
+						    x->fidx[p]) &&
+			    x->rx_shared)
+				dev->paths[p].rx_target = 0;
+			ret = 0;
+		}
+	}
+	return ret;
+}
+
+/* Complete a parked transfer.  On error the in-flight frames are drained
+ * (reclaim) before the mapping is dropped so the teardown cannot race
+ * the DMA (teardown UAF (B)); on success the payload is validated and
+ * copied back and the transfer returned clean. */
+static int odl_tb5_dmabuf_finish(struct odl_tb5_device *dev,
+				 struct odl_tb5_dmabuf_xfer *x, int ret)
+{
+	int p;
+
+	if (ret != 0) {
+		for (p = 0; p < x->nps; p++) {
+			struct odl_tb5_ring_ctx *rc =
+				x->is_tx ? &dev->paths[p].tx
+					 : &dev->paths[p].rx;
+
+			if (x->fidx[p] == 0 || !rc->ring || !rc->started)
+				continue;
+			if (!odl_tb5_dmabuf_reclaim(rc, x->base[p],
+						    x->fidx[p]) &&
+			    x->rx_shared)
+				dev->paths[p].rx_target = 0;
+		}
+		odl_tb5_dmabuf_release(dev, x, false);
+		return ret;
+	}
+	return odl_tb5_dmabuf_release(dev, x, true);
+}
+
 static int odl_tb5_submit_dmabuf(struct odl_tb5_device *dev,
 				 int dmabuf_fd, loff_t offset, size_t len,
-				 bool is_tx)
+				 bool is_tx, struct odl_tb5_dmabuf_xfer *x)
 {
 	/* Keep the attachment bidirectional while validating the caller's mapped
 	 * layout.  The actual wire frames are copied through coherent pool slots;
@@ -2082,127 +2247,34 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 			atomic_add(fidx[p], &rc->submitted);
 	}
 
-	/* Wait for completion on every path we posted to. */
-	for (p = 0; p < nps; p++) {
-		struct odl_tb5_ring_ctx *rc =
-			is_tx ? &dev->paths[p].tx : &dev->paths[p].rx;
-
-		if (fidx[p] == 0)
-			continue;
-		ret = wait_event_interruptible_timeout(rc->waitq,
-			atomic_read(&rc->completed) >=
-			atomic_read(&rc->submitted),
-			msecs_to_jiffies(5000));
-		if (ret == 0) {
-			/* Bounded submit wait.  A completion that never lands
-			 * used to pin this ioctl indefinitely (the dmabuf
-			 * transport hang).  Time out, reclaim every posted
-			 * ring (stop+start, err_unmap below) so the DMA
-			 * mapping is never dropped under in-flight frames,
-			 * and surface -ETIMEDOUT so the caller can measure
-			 * the failure instead of hanging forever. */
-			/* Report the completion-pump state, not just the
-			 * counters: a stalled wait is either "the pump was
-			 * never armed" (poll_active == 0) or "it is armed and
-			 * still sees nothing", and the two have different
-			 * fixes.  tx_inflight is the arming input --
-			 * odl_tb5_tx_submitted() only kicks the poll on the
-			 * 0->1 edge, so a leaked count silently disables
-			 * arming for every later submit.  Direction and e2e
-			 * are here because TX under E2E credit fails where RX
-			 * and e2e=0 do not. */
-			pr_warn("odl_tb5: dmabuf %s submit timeout on path %d "
-				"(completed=%d submitted=%d tx_inflight=%d "
-				"poll_active=%d poll_idle_ticks=%u e2e=%d); "
-				"ring_head=%d ring_tail=%d ring_running=%d; "
-				"reclaiming frames via ring stop\n",
-				is_tx ? "TX" : "RX", p,
-				atomic_read(&rc->completed),
-				atomic_read(&rc->submitted),
-				atomic_read(&dev->tx_inflight),
-				atomic_read(&dev->poll_active),
-				dev->poll_idle_ticks,
-				odl_e2e ? 1 : 0,
-				READ_ONCE(rc->ring->head), READ_ONCE(rc->ring->tail),
-				rc->ring->running ? 1 : 0);
-			ret = -ETIMEDOUT;
-			goto err_unmap;
-		}
-		if (ret == -ERESTARTSYS) {
-			/* A signal arrived mid-DMA.  The unmap below must not
-			 * race the still in-flight transfer (K3), so wait
-			 * uninterruptibly for it to drain -- but bound the wait.
-			 * An unbounded wait_event() here pins this task in D
-			 * state forever (holding a module reference) if a
-			 * completion never arrives, e.g. when the DMA engine is
-			 * wedged.  Grace the common case (a completion lands in
-			 * microseconds) while guaranteeing the task can exit.
-			 * odl_tb5_dmabuf_reclaim drains and keeps the ring
-			 * running; only a wedged ring gets stop+started. */
-			if (!odl_tb5_dmabuf_reclaim(rc,
-				atomic_read(&rc->completed),
-				atomic_read(&rc->submitted) -
-				atomic_read(&rc->completed)) &&
-			    rx_shared)
-				dev->paths[p].rx_target = 0;
-			ret = 0;
-		}
-	}
-
-/* Raw-payload validation (RX): the NHI reports the received byte
-	 * count in each completed cell; with no in-band header the sum is
-	 * the only integrity check.  Any shortfall means a frame vanished on
-	 * the wire or the peer's chunking differed — fail the transfer
-	 * loudly; the framed path cannot hit this (the staged copy is
-	 * exact by construction). */
-	if (raw_ok && !is_tx) {
-		size_t got = 0;
-
-		for (p = 0; p < nps; p++)
-			if (raw_used[p])
-				got += (size_t)(atomic_read(
-					&dev->paths[p].rx.rx_raw_bytes) -
-					raw_base[p]);
-		if (got != len) {
-			pr_warn_ratelimited("odl_tb5: raw RX length mismatch "
-				"(got %zu want %zu)\n", got, len);
-			ODL_STAT_INC(dev, raw_rx_len_mismatch);
-			ret = -EIO;
-		}
-	}
-
-	if (rx_armed) {
-		atomic_dec(&dev->dmabuf_rx_active);
-		rx_armed = false;
-	}
-	if (rx_poll_held) {
-		atomic_dec(&dev->rx_dmabuf_pending);
-		rx_poll_held = false;
-	}
-	/* Raw stages hold no pool slot (the NHI wrote the exporter pages
-	 * directly); only framed stages are copied back and returned. */
-	for (p = 0; p < stage_count; p++) {
-		if (!stage[p].slot)
-			continue;
-		if (!is_tx)
-			iosys_map_memcpy_to(&cpu_map, stage[p].offset,
-					    stage[p].cpu +
-						ODL_TB5_STREAM_HDR_SIZE,
-					    stage[p].len);
-		odl_tb5_frame_pool_put(&dev->frame_pool, stage[p].slot);
-		stage[p].slot = NULL;
-	}
-	if (cpu_mapped)
-		dma_buf_vunmap(dmabuf, &cpu_map);
-	if (cpu_access)
-		dma_buf_end_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
-	kfree(stage);
-
-	dma_sync_sgtable_for_cpu(dma_dev, sgt, dir);
-	dma_buf_unmap_attachment(attach, sgt, dir);
-	dma_buf_detach(dmabuf, attach);
-	dma_buf_put(dmabuf);
-	return ret;
+	/* Hand the transfer to the caller: wait() and finish() run later,
+	 * possibly from a different syscall (NOWAIT submit).  Park every
+	 * resource and counter so they never touch this stack frame again. */
+	x->is_tx = is_tx;
+	x->nps = nps;
+	x->ndp = ndp;
+	x->rx_shared = rx_shared;
+	x->rx_armed = rx_armed;
+	x->rx_poll_held = rx_poll_held;
+	x->rx_pool_posted = rx_pool_posted;
+	x->dmabuf = dmabuf;
+	x->attach = attach;
+	x->sgt = sgt;
+	x->dma_dev = dma_dev;
+	x->dir = dir;
+	x->stage = stage;
+	x->stage_count = stage_count;
+	x->cpu_map = cpu_map;
+	x->cpu_access = cpu_access;
+	x->cpu_mapped = cpu_mapped;
+	x->raw_ok = raw_ok;
+	x->len = len;
+	x->posted_total = k;
+	memcpy(x->base, base, sizeof(base));
+	memcpy(x->raw_base, raw_base, sizeof(raw_base));
+	memcpy(x->raw_used, raw_used, sizeof(raw_used));
+	memcpy(x->fidx, fidx, sizeof(fidx));
+	return 0;
 
 err_unmap:
 	/* teardown UAF (B): any frames we already posted are still queued in
@@ -2230,26 +2302,33 @@ err_unmap:
 		if (!odl_tb5_dmabuf_reclaim(rc, base[p], fidx[p]) && rx_shared)
 			dev->paths[p].rx_target = 0;
 	}
-	if (rx_armed) {
-		atomic_dec(&dev->dmabuf_rx_active);
-		rx_armed = false;
-	}
-	if (rx_poll_held) {
-		atomic_dec(&dev->rx_dmabuf_pending);
-		rx_poll_held = false;
-	}
-	for (p = 0; p < stage_count; p++) {
-		if (stage[p].slot)
-			odl_tb5_frame_pool_put(&dev->frame_pool,
-					       stage[p].slot);
-	}
-	if (cpu_mapped)
-		dma_buf_vunmap(dmabuf, &cpu_map);
-	if (cpu_access)
-		dma_buf_end_cpu_access(dmabuf, DMA_BIDIRECTIONAL);
-	kfree(stage);
-	dma_sync_sgtable_for_cpu(dma_dev, sgt, dir);
-	dma_buf_unmap_attachment(attach, sgt, dir);
+	x->is_tx = is_tx;
+	x->nps = nps;
+	x->ndp = ndp;
+	x->rx_shared = rx_shared;
+	x->rx_armed = rx_armed;
+	x->rx_poll_held = rx_poll_held;
+	x->rx_pool_posted = rx_pool_posted;
+	x->dmabuf = dmabuf;
+	x->attach = attach;
+	x->sgt = sgt;
+	x->dma_dev = dma_dev;
+	x->dir = dir;
+	x->stage = stage;
+	x->stage_count = stage_count;
+	x->cpu_map = cpu_map;
+	x->cpu_access = cpu_access;
+	x->cpu_mapped = cpu_mapped;
+	x->raw_ok = raw_ok;
+	x->len = len;
+	x->posted_total = k;
+	memcpy(x->base, base, sizeof(base));
+	memcpy(x->raw_base, raw_base, sizeof(raw_base));
+	memcpy(x->raw_used, raw_used, sizeof(raw_used));
+	memcpy(x->fidx, fidx, sizeof(fidx));
+	odl_tb5_dmabuf_release(dev, x, false);
+	return ret;
+
 err_detach:
 	dma_buf_detach(dmabuf, attach);
 err_put:
@@ -2260,13 +2339,18 @@ err_put:
 int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 			     int dmabuf_fd, loff_t offset, size_t len)
 {
+	struct odl_tb5_dmabuf_xfer x;
 	int ret;
 
-	/* Each synchronous call reuses tx.frames[] from index zero and shares
-	 * the per-ring completion baseline.  Serialize TX callers independently
-	 * from RX so send and receive can still run concurrently. */
+	/* Serialize TX callers independently from RX so send and receive can
+	 * still run concurrently.  The whole transfer stays inside the lock
+	 * (blocking wait), matching the pre-split behavior. */
 	mutex_lock(&dev->dmabuf_tx_lock);
-	ret = odl_tb5_submit_dmabuf(dev, dmabuf_fd, offset, len, true);
+	memset(&x, 0, sizeof(x));
+	ret = odl_tb5_dmabuf_submit(dev, dmabuf_fd, offset, len, true, &x);
+	if (ret == 0)
+		ret = odl_tb5_dmabuf_wait(dev, &x, 5000);
+	ret = odl_tb5_dmabuf_finish(dev, &x, ret);
 	mutex_unlock(&dev->dmabuf_tx_lock);
 	return ret;
 }
@@ -2274,13 +2358,98 @@ int odl_tb5_submit_tx_dmabuf(struct odl_tb5_device *dev,
 int odl_tb5_submit_rx_dmabuf(struct odl_tb5_device *dev,
 			     int dmabuf_fd, loff_t offset, size_t len)
 {
+	struct odl_tb5_dmabuf_xfer x;
 	int ret;
 
-	/* The synchronous path reuses rx.frames[] from index zero and its
-	 * capacity snapshot assumes no second dmabuf receive is posting to the
-	 * same selected rings. */
+	/* The synchronous path's capacity snapshot assumes no second dmabuf
+	 * receive is posting to the same selected rings. */
 	mutex_lock(&dev->dmabuf_rx_lock);
-	ret = odl_tb5_submit_dmabuf(dev, dmabuf_fd, offset, len, false);
+	memset(&x, 0, sizeof(x));
+	ret = odl_tb5_dmabuf_submit(dev, dmabuf_fd, offset, len, false, &x);
+	if (ret == 0)
+		ret = odl_tb5_dmabuf_wait(dev, &x, 5000);
+	ret = odl_tb5_dmabuf_finish(dev, &x, ret);
+	mutex_unlock(&dev->dmabuf_rx_lock);
+	return ret;
+}
+
+/* NOWAIT receive: post the RX cells and return a token; the caller polls
+ * completion with odl_tb5_wait_rx_dmabuf().  Never blocks in the transfer
+ * wait — required by the RCCL plugin's control reader, which would
+ * otherwise stop servicing the peer's control messages (structural
+ * deadlock).  Multiple NOWAIT transfers can be in flight; each waits on
+ * its own per-path baseline. */
+int odl_tb5_submit_rx_dmabuf_nowait(struct odl_tb5_device *dev,
+				    int dmabuf_fd, loff_t offset, size_t len,
+				    int *token)
+{
+	struct odl_tb5_dmabuf_xfer *x;
+	int idx, ret;
+
+	if (!token)
+		return -EINVAL;
+
+	mutex_lock(&dev->dmabuf_rx_lock);
+	for (idx = 0; idx < ODL_TB5_DMABUF_MAX_PENDING; idx++)
+		if (dev->dmabuf_rx_pending[idx].state == ODL_DMABUF_SLOT_FREE)
+			break;
+	if (idx == ODL_TB5_DMABUF_MAX_PENDING) {
+		mutex_unlock(&dev->dmabuf_rx_lock);
+		return -EBUSY;
+	}
+	x = &dev->dmabuf_rx_pending[idx];
+	memset(x, 0, sizeof(*x));
+	x->state = ODL_DMABUF_SLOT_BUSY;
+	ret = odl_tb5_dmabuf_submit(dev, dmabuf_fd, offset, len, false, x);
+	if (ret) {
+		x->state = ODL_DMABUF_SLOT_FREE;
+		mutex_unlock(&dev->dmabuf_rx_lock);
+		return ret;
+	}
+	*token = idx + 1;
+	mutex_unlock(&dev->dmabuf_rx_lock);
+	return 0;
+}
+
+/* Wait for a NOWAIT transfer.  timeout_ms == 0: poll once; -EAGAIN while
+ * pending (the slot stays armed for another poll).  On timeout the slot
+ * is reclaimed (drain + ring stop/start if wedged) and freed, matching
+ * the blocking path's error behavior. */
+int odl_tb5_wait_rx_dmabuf(struct odl_tb5_device *dev, int token,
+			   int timeout_ms)
+{
+	struct odl_tb5_dmabuf_xfer *x;
+	int idx, ret;
+
+	if (token <= 0 || token > ODL_TB5_DMABUF_MAX_PENDING)
+		return -ENOENT;
+	idx = token - 1;
+
+	mutex_lock(&dev->dmabuf_rx_lock);
+	x = &dev->dmabuf_rx_pending[idx];
+	if (x->state == ODL_DMABUF_SLOT_FREE) {
+		mutex_unlock(&dev->dmabuf_rx_lock);
+		return -ENOENT;
+	}
+	if (x->state != ODL_DMABUF_SLOT_BUSY) {
+		/* A WAIT already owns the slot; only one waiter may poll it. */
+		mutex_unlock(&dev->dmabuf_rx_lock);
+		return -EBUSY;
+	}
+	x->state = ODL_DMABUF_SLOT_WAITING;
+	mutex_unlock(&dev->dmabuf_rx_lock);
+
+	ret = odl_tb5_dmabuf_wait(dev, x, timeout_ms);
+	if (ret == -EAGAIN) {
+		mutex_lock(&dev->dmabuf_rx_lock);
+		x->state = ODL_DMABUF_SLOT_BUSY;
+		mutex_unlock(&dev->dmabuf_rx_lock);
+		return -EAGAIN;
+	}
+
+	mutex_lock(&dev->dmabuf_rx_lock);
+	ret = odl_tb5_dmabuf_finish(dev, x, ret);
+	x->state = ODL_DMABUF_SLOT_FREE;
 	mutex_unlock(&dev->dmabuf_rx_lock);
 	return ret;
 }
