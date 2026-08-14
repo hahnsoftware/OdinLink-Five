@@ -1760,7 +1760,7 @@ static int odl_tb5_dmabuf_finish(struct odl_tb5_device *dev,
 	return odl_tb5_dmabuf_release(dev, x, true);
 }
 
-static int odl_tb5_submit_dmabuf(struct odl_tb5_device *dev,
+static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 				 int dmabuf_fd, loff_t offset, size_t len,
 				 bool is_tx, struct odl_tb5_dmabuf_xfer *x)
 {
