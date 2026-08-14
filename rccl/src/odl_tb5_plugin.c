@@ -58,6 +58,7 @@
  *
  * Exposes shared-memory stats at /run/odl_tb5/rccl_stats.
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -818,6 +819,7 @@ static int dmabuf_ensure_reader_locked(void)
 			WARN("dmabuf ctrl: reader thread create failed");
 			return -1;
 		}
+		pthread_setname_np(t, "odl_ctrl_rdr");
 		pthread_detach(t);
 		g_dmabuf_reader_started = 1;
 		DBG(1, "dmabuf ctrl: reader started");
