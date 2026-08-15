@@ -15,8 +15,8 @@
  *
  * The dmabuf is backed by /dev/dma_heap/system (real dmabuf, CPU memory,
  * no GPU needed) so the number is deterministic and reproducible.  A GPU
- * (amdgpu) dmabuf would exercise the same transport with VRAM as the
- * backing store; the DMA path through the NHI is identical.
+ * (amdgpu) dmabuf would exercise the same transport with GPU-allocated
+ * memory as the backing store; the DMA path through the NHI is identical.
  *
  * Coordination is a self-synchronising ping-pong (echo): the client sends
  * `size` bytes and waits for the server to echo them back.  Because each
@@ -49,7 +49,7 @@
 
 /* Allocator selection.  The DMA-heap path is the deterministic CPU one used
  * by the readiness gate's main proof.  The amdgpu/HIP paths export a REAL
- * VRAM DMA-BUF through the ROCm driver stack (libdrm_amdgpu) and optionally
+ * GPU DMA-BUF through the ROCm driver stack (libdrm_amdgpu) and optionally
  * import it into HIP for fill/verify; they are discovered at runtime via
  * dlopen so this binary links nothing GPU-specific and builds everywhere.
  *
@@ -70,7 +70,6 @@ struct amdgpu_bo_alloc_request {
 	uint64_t preferred_heap;
 	uint64_t flags;
 };
-#define AMDGPU_GEM_DOMAIN_VRAM         0x1
 #define AMDGPU_GEM_DOMAIN_GTT          0x2
 #define AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED 0x2000
 #define AMDGPU_BO_HANDLE_TYPE_DMA_BUF_FD 2
@@ -302,9 +301,13 @@ static int probe_hip(void)
 	return 0;
 }
 
-/* Export a VRAM (or, on non-APUs, a CPU-accessible) amdgpu BO as a real
- * DMA-BUF fd through the ROCm driver stack.  Requires amdgpu to be loaded;
- * /dev/dri/cardN (the libdrm device) is enough — /dev/amdgpu is optional. */
+/* Export an amdgpu BO as a real DMA-BUF fd through the ROCm driver stack.
+ * GTT placement is deliberate: amdgpu's exporter refuses to DMA-map a VRAM
+ * BO for a foreign (non-amdgpu) importer — exactly what the OdinLink NHI is —
+ * returning -EINVAL from dma_buf_map_attachment.  GTT (system memory, on an
+ * APU the same memory as VRAM) maps and transports fine.  Requires amdgpu to
+ * be loaded; /dev/dri/cardN (the libdrm device) is enough — /dev/amdgpu is
+ * optional. */
 static int alloc_dmabuf_amdgpu(size_t size)
 {
 	int drmfd = -1;
@@ -333,7 +336,7 @@ static int alloc_dmabuf_amdgpu(size_t size)
 		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
 	};
 	if (g_amd.bo_alloc(dev, &req, &bo) != 0) {
-		fprintf(stderr, "FAIL: amdgpu_bo_alloc(%zu) VRAM failed\n",
+		fprintf(stderr, "FAIL: amdgpu_bo_alloc(%zu) GTT failed\n",
 			size);
 		g_amd.device_deinitialize(dev);
 		close(drmfd);
@@ -353,8 +356,8 @@ static int alloc_dmabuf_amdgpu(size_t size)
 	return (int)out;
 }
 
-/* amdgpu export + HIP import: the fd is real VRAM, the mapped pointer makes
- * it directly usable by HIP kernels/memcpy. */
+/* amdgpu export + HIP import: the fd is a real amdgpu DMA-BUF (GTT-backed),
+ * the mapped pointer makes it directly usable by HIP kernels/memcpy. */
 static int alloc_dmabuf_hip(size_t size)
 {
 	int fd = alloc_dmabuf_amdgpu(size);
@@ -370,7 +373,7 @@ static int alloc_dmabuf_hip(size_t size)
 	void *ext = NULL;
 	if (g_hip.import_ext_mem(&ext, &h) != 0 || !ext) {
 		snprintf(g_skip_reason, sizeof(g_skip_reason),
-			 "hipImportExternalMemory of the exported VRAM dma-buf "
+			 "hipImportExternalMemory of the exported amdgpu dma-buf "
 			 "failed — HIP cannot bind this allocator");
 		g_skip = 1;
 		put_fd(fd);
@@ -693,9 +696,9 @@ static void usage(const char *p)
 		"  --allocator: backing store for the dmabufs.\n"
 		"    dmaheap  system DMA-heap, CPU memory (default; the "
 		"deterministic gate path)\n"
-		"    amdgpu   real VRAM DMA-BUF exported via libdrm_amdgpu "
+		"    amdgpu   amdgpu GTT-backed DMA-BUF exported via libdrm_amdgpu "
 		"(needs a loaded amdgpu DRM device)\n"
-		"    hip      amdgpu VRAM DMA-BUF imported into HIP for "
+		"    hip      amdgpu GTT-backed DMA-BUF imported into HIP for "
 		"fill/verify (needs a ROCm HIP runtime too)\n"
 		"  amdgpu/hip NEVER fall back: when their prerequisites are "
 		"missing the bench prints a reason and exits 3 (SKIP).\n", p);

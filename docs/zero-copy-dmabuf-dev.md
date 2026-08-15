@@ -144,15 +144,15 @@ These are exposed via the device's debugfs/stats; `chardev.c` already prints
 ## Allocators (`odl_tb5_bench_dmabuf --allocator`)
 
 The DMA-heap path is the deterministic CPU backing the readiness gate's main
-proof. Two GPU allocators export a **real VRAM DMA-BUF** through the ROCm
+proof. Two GPU allocators export a **real amdgpu DMA-BUF** through the ROCm
 driver stack, discovered at runtime via `dlopen` (the bench links no GPU
 library and builds anywhere):
 
 | Allocator | Backing | Requires |
 |-----------|---------|----------|
 | `dmaheap` (default) | `/dev/dma_heap/system` | `CONFIG_DMABUF_HEAPS_SYSTEM` |
-| `amdgpu` | VRAM BO via `libdrm_amdgpu` (`amdgpu_bo_alloc` `AMDGPU_GEM_DOMAIN_VRAM` + `amdgpu_bo_export` → dma-buf fd) | amdgpu loaded, `/dev/dri/cardN` (`/dev/amdgpu` is a udev alias, not required) |
-| `hip` | amdgpu VRAM export **imported into HIP** (`hipImportExternalMemory` + `hipExternalMemoryGetMappedBuffer`); fill/verify via `hipMemcpy` through the mapped pointer | amdgpu + a ROCm HIP runtime (`libamdhip64.so`) with ≥1 visible device |
+| `amdgpu` | GTT-domain BO via `libdrm_amdgpu` (`amdgpu_bo_alloc` `AMDGPU_GEM_DOMAIN_GTT` + `amdgpu_bo_export` → dma-buf fd) | amdgpu loaded, `/dev/dri/cardN` (`/dev/amdgpu` is a udev alias, not required) |
+| `hip` | the amdgpu export **imported into HIP** (`hipImportExternalMemory` + `hipExternalMemoryGetMappedBuffer`); fill/verify via `hipMemcpy` through the mapped pointer | amdgpu + a ROCm HIP runtime (`libamdhip64.so`) with ≥1 visible device |
 
 When an allocator's prerequisites are missing the bench prints a SKIP reason
 and exits 3. It **never silently falls back** to DMA-heap or memfd — a passed
@@ -163,20 +163,23 @@ runs an optional second echo round (`--extra-allocator amdgpu|hip`, default
 same raw-counter gate as the main round, and an asymmetric SKIP (one side
 ran, the other skipped) is a failure.
 
-One more SKIP case: the amdgpu exporter may refuse to attach/map its DMA-BUF
+One more SKIP case: the amdgpu exporter refuses to attach/map a **VRAM** BO
 for a **non-amdgpu importer** — exactly what the OdinLink NHI (a USB4 host
 router PCI device) is. On such a kernel/IOMMU stack the very first transfer
 fails cleanly with `-EINVAL` (the driver logs
 `dma_buf_map_attachment(...) failed: -22`). The bench treats that
 first-transfer-only signature as a SKIP with an explicit reason, because it is
 a stack limitation, not an OdinLink bug; anything after the first transfer, or
-any other errno, remains a hard failure. (Observed on a Strix-Halo APU:
-VRAM BOs refuse to map at all; GTT-domain BOs map but the NHI never completes
-RX DMA to them — `completed=0` ring timeouts — so neither domain transports.)
-With ROCm absent, `--allocator hip` always SKIPs on such rigs.
+any other errno, remains a hard failure. (Observed on a Strix-Halo APU: VRAM
+BOs refuse to map regardless of IOMMU mode, while **GTT** placement — system
+memory, on an APU the same memory as VRAM — maps and transports fine, but only
+under a **translated IOMMU** (`iommu=on`): under `iommu=pt`/`off` the NHI never
+completes RX DMA to GTT buffers — `completed=0` ring timeouts. So the bench
+allocates GTT-domain BOs, and the rigs boot `iommu=on`.) With ROCm absent,
+`--allocator hip` always SKIPs on such rigs.
 
-The raw-geometry reasoning applies unchanged: VRAM BOs exported by amdgpu
-carry page-granular SG tables like the DMA heap, so `ODL_TB5_RAW_CELL_MAX`
+The raw-geometry reasoning applies unchanged: amdgpu-exported BOs (GTT or
+VRAM) carry page-granular SG tables like the DMA heap, so `ODL_TB5_RAW_CELL_MAX`
 (2048) keeps them raw-eligible by construction.
 
 ### Single-box starvation (by design)
