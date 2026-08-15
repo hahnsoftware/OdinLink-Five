@@ -199,6 +199,8 @@ static void live_drop(int fd)
 	}
 }
 
+static void put_fd(int fd); /* defined below; used by the hip allocator */
+
 static void *dlopen_any(const char **names, const char **errs,
 			const char *what)
 {
