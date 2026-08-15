@@ -23,6 +23,8 @@ mkdir build && cd build && cmake .. && make -j$(nproc)
 - Verbs provider test: `build/verbs/tests/test_verbs_basic` (link with `-lodl_tb5_verbs -libverbs`).
 - Verbs dmabuf MR test: `build/verbs/tests/test_verbs_dmabuf` (link with `-lodl_tb5_verbs -libverbs -lpthread`). Falls back from DMA heap → CUDA → memfd.
 - RCCL dmabuf test: `build/tests/odl_tb5_test_rccl_dmabuf` (link with `-lodl_tb5 -lpthread`). Tests the same fd-plumbing path the RCCL plugin uses (no verbs layer). Falls back from DMA heap → AMDGPU → memfd.
+- Raw-geometry regression: `build/tests/odl_tb5_raw_geom_test`. No module/peer/device needed — mirrors the kernel `odl_tb5_dmabuf_walk` raw_geom rule over synthetic page-granular SG layouts. Fails if `ODL_TB5_RAW_CELL_MAX` (2048) stops dividing PAGE_SIZE (that silently drops the raw gate to framed fallback + RX length mismatches).
+- Raw-payload readiness gate: `scripts/odl_tb5_dmabuf_readiness.sh` (two hosts, measures counter deltas). Per-size counter correlation: `scripts/odl_tb5_dmabuf_repro.sh`.
 
 ## Architecture
 

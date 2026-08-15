@@ -32,6 +32,17 @@ target_include_directories(odl_tb5_pair_dmabuf PRIVATE
 )
 target_link_libraries(odl_tb5_pair_dmabuf odl_tb5 pthread)
 
+# No module, no peer, no /dev: mirrors the kernel raw_geom rule over synthetic
+# page-granular SG layouts.  Fails if ODL_TB5_RAW_CELL_MAX ever stops dividing
+# PAGE_SIZE (that regressed the raw gate to framed fallback + RX mismatches).
+add_executable(odl_tb5_raw_geom_test
+    odl_tb5_raw_geom_test.c
+)
+
+target_include_directories(odl_tb5_raw_geom_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/driver/uapi
+)
+
 add_executable(odl_tb5_bench_dmabuf
     odl_tb5_bench_dmabuf.c
 )

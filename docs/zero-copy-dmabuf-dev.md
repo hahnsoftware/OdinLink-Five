@@ -60,13 +60,38 @@ When set, the TX submit path:
 - writes **no stream header** and does **no memcpy**;
 - points the frame directly at the buffer: `frame->buffer_phy =
   sg_dma_address(sg) + seg_off`;
+- cuts the payload into `ODL_TB5_RAW_CELL_MAX` (2048) byte cells — a power of
+  two dividing PAGE_SIZE, so every page-granular SG boundary from a DMA-heap
+  or GPU exporter is also a cell boundary and both importers chunk the payload
+  identically (see the geometry gate below);
 - sets `frame->size = chunk` (TX) and advertises `size = 0` on RX (the link
   counts 4096-byte slots, so a `chunk`-byte payload is absorbed);
 - marks the frame end with `frame->eof = ODL_TB5_PDF_EOF_DATA`
-  (`driver/odl_tb5_ring_dma.c:2067`).
+  (`driver/odl_tb5_ring_dma.c:2208`).
 
 RX for a raw frame posts per eligible cell at the exporter page. The advantage
 over the framed path is eliminating the copy through the host double buffer.
+
+### The raw-geometry gate (`odl_tb5_dmabuf_walk`)
+
+Raw eligibility is per-transfer and stricter than negotiation: a transfer is
+raw only if **every cell except the transfer tail is a full cell**.  The raw
+wire has no header, so the two importers must cut the payload at identical
+boundaries; a short mid-transfer cell at an SG boundary on one host can be a
+full cell at the same byte offset on the other (the 64-byte residue of a
+4032-byte cell inside a 4096-byte page), which corrupts or stalls the receive.
+
+The cell size is therefore pinned to `ODL_TB5_RAW_CELL_MAX = 2048`
+(`driver/uapi/odl_tb5_uapi.h`), a power of two dividing PAGE_SIZE.  With
+page-granular SG tables (every entry a multiple of PAGE_SIZE — the layout
+`/dev/dma_heap/system`, amdgpu, and an IOMMU all produce), every SG boundary
+coincides with a cell boundary, so non-tail cells are full by construction and
+the chunking is deterministic in `len` alone.  A cell that does not divide
+PAGE_SIZE makes the gate reject every multi-page buffer (`raw_eligible_reject`
+rises and the transfer goes framed) and, because the hosts allocate
+independently, lets one side stay raw while the other falls back — the
+`raw_rx_len_mismatch` failure mode.  The rule is exercised by the single-box
+regression test `tests/odl_tb5_raw_geom_test.c`.
 
 ### EOF markers — corrected
 
@@ -85,10 +110,10 @@ Raw-path observability (defined in `driver/odl_tb5_core.h`, incremented in
 
 | Counter | Meaning | Site |
 |---------|---------|------|
-| `raw_tx_frames` | raw TX frames submitted | `ring_dma.c:2080` |
-| `raw_rx_len_mismatch` | RX length did not match expected | `ring_dma.c:2198` |
-| `raw_eligible_reject` | eligible raw cell rejected (capability dropped) | `ring_dma.c:1854`, `:1883` |
-| `raw_unaligned_fallback` | unaligned request fell back to framed | `ring_dma.c:1837` |
+| `raw_tx_frames` | raw TX frames submitted | `ring_dma.c:2289` |
+| `raw_rx_len_mismatch` | RX length did not match expected | `ring_dma.c:1660` |
+| `raw_eligible_reject` | eligible raw cell rejected (capability dropped) | `ring_dma.c:2061`, `:2090` |
+| `raw_unaligned_fallback` | unaligned request fell back to framed | `ring_dma.c:2034` |
 
 Loss detection is **message-level**, not per-frame `frag_idx`: a
 sum/count mismatch drops the whole transfer and bumps a counter.
@@ -111,6 +136,7 @@ These are exposed via the device's debugfs/stats; `chardev.c` already prints
 |--------|----------------|------------|
 | `odl_tb5_test` | device, lib_api, plugin (3 suites) | no — single box |
 | `odl_tb5_test_rccl_dmabuf` | DMA-BUF fd-plumbing / registration | no (transfer times out single-box by design) |
+| `odl_tb5_raw_geom_test` | raw-geometry gate invariant (page-granular SG layouts) | no — single box, no module |
 | `odl_tb5_pair_dmabuf` | legacy + stream DMA-BUF e2e, pattern-checked | **yes, two boxes** |
 | `odl_stream_verify` | N streams × M rounds, content-verified | **yes, two boxes** |
 
