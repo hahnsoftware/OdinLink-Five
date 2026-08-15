@@ -328,7 +328,7 @@ static int alloc_dmabuf_amdgpu(size_t size)
 	struct amdgpu_bo_alloc_request req = {
 		.alloc_size = size,
 		.phys_alignment = 0,
-		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
+		.preferred_heap = AMDGPU_GEM_DOMAIN_GTT,
 		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
 	};
 	if (g_amd.bo_alloc(dev, &req, &bo) != 0) {
