@@ -1942,12 +1942,18 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 					   : dev->paths[0].rx.ring);
 	attach = dma_buf_attach(dmabuf, dma_dev);
 	if (IS_ERR(attach)) {
+		pr_warn_ratelimited("odl_tb5: dma_buf_attach(fd=%d dev=%s) failed: %ld\n",
+				    dmabuf_fd, dev_name(dma_dev),
+				    PTR_ERR(attach));
 		ret = PTR_ERR(attach);
 		goto err_put;
 	}
 
 	sgt = dma_buf_map_attachment(attach, dir);
 	if (IS_ERR(sgt)) {
+		pr_warn_ratelimited("odl_tb5: dma_buf_map_attachment(size=%zu dev=%s) failed: %ld\n",
+				    (size_t)dmabuf->size, dev_name(dma_dev),
+				    PTR_ERR(sgt));
 		ret = PTR_ERR(sgt);
 		goto err_detach;
 	}
