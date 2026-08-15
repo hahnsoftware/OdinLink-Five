@@ -151,7 +151,7 @@ library and builds anywhere):
 | Allocator | Backing | Requires |
 |-----------|---------|----------|
 | `dmaheap` (default) | `/dev/dma_heap/system` | `CONFIG_DMABUF_HEAPS_SYSTEM` |
-| `amdgpu` | GTT-domain BO via `libdrm_amdgpu` (`amdgpu_bo_alloc` `AMDGPU_GEM_DOMAIN_GTT` + `amdgpu_bo_export` → dma-buf fd) | amdgpu loaded, `/dev/dri/cardN` (`/dev/amdgpu` is a udev alias, not required) |
+| `amdgpu` | amdgpu BO via `libdrm_amdgpu` (`amdgpu_bo_alloc` + `amdgpu_bo_export` → dma-buf fd); **GEM domain follows GPU kind** — GTT on an iGPU/APU, VRAM on a dGPU | amdgpu loaded, `/dev/dri/cardN` (`/dev/amdgpu` is a udev alias, not required) |
 | `hip` | the amdgpu export **imported into HIP** (`hipImportExternalMemory` + `hipExternalMemoryGetMappedBuffer`); fill/verify via `hipMemcpy` through the mapped pointer | amdgpu + a ROCm HIP runtime (`libamdhip64.so`) with ≥1 visible device |
 
 When an allocator's prerequisites are missing the bench prints a SKIP reason
@@ -163,20 +163,35 @@ runs an optional second echo round (`--extra-allocator amdgpu|hip`, default
 same raw-counter gate as the main round, and an asymmetric SKIP (one side
 ran, the other skipped) is a failure.
 
-One more SKIP case: the amdgpu exporter refuses to attach/map a **VRAM** BO
-for a **non-amdgpu importer** — exactly what the OdinLink NHI (a USB4 host
-router PCI device) is. On such a kernel/IOMMU stack the very first transfer
-fails cleanly with `-EINVAL` (the driver logs
-`dma_buf_map_attachment(...) failed: -22`). The bench treats that
-first-transfer-only signature as a SKIP with an explicit reason, because it is
-a stack limitation, not an OdinLink bug; anything after the first transfer, or
-any other errno, remains a hard failure. (Observed on a Strix-Halo APU: VRAM
-BOs refuse to map regardless of IOMMU mode, while **GTT** placement — system
-memory, on an APU the same memory as VRAM — maps and transports fine, but only
-under a **translated IOMMU** (`iommu=on`): under `iommu=pt`/`off` the NHI never
-completes RX DMA to GTT buffers — `completed=0` ring timeouts. So the bench
-allocates GTT-domain BOs, and the rigs boot `iommu=on`.) With ROCm absent,
-`--allocator hip` always SKIPs on such rigs.
+### GPU kind selects the GEM domain
+
+The amdgpu exporter pins the BO into GTT when a foreign importer (the NHI)
+maps it — so the transport always targets system memory — but the *starting*
+domain must be chosen per GPU kind (`--gpu-kind auto|igpu|dgpu`, default
+auto):
+
+- **iGPU (APU)** — its VRAM heap is a BIOS carve-out (0.5 GiB on the
+  Strix-Halo rigs). Carve-out BOs cannot be pinned to GTT for the NHI; the
+  first map fails `-EINVAL`. The bench allocates **GTT-domain** BOs directly
+  — on an APU the same physical memory as the carve-out, and what ROCm AI
+  frameworks prefer anyway.
+- **dGPU** — dedicated GDDR/HBM. The bench allocates **VRAM-domain** BOs
+  (the real GPU memory an RCCL tensor lives in); amdgpu migrates the BO to
+  GTT on the NHI map. If the exporter still refuses VRAM on the first
+  transfer, the bench retries the run once with GTT placement before
+  declaring SKIP.
+
+The VRAM heap size is the detection signal (`< 4 GiB` → iGPU; the IGP is not
+always at bus 00:00.0 — Strix-Halo hangs it at `0000:c5:00.0`). The
+first-transfer-only `-EINVAL` from a **GTT**-placed BO (a stack limitation,
+not an OdinLink bug) is still a clean SKIP with an explicit reason; anything
+after the first transfer, or any other errno, remains a hard failure.
+(Observed on a Strix-Halo APU: VRAM BOs refuse to map regardless of IOMMU
+mode, while GTT placement maps and transports fine, but only under a
+**translated IOMMU** (`iommu=on`): under `iommu=pt`/`off` the NHI never
+completes RX DMA to GTT buffers — `completed=0` ring timeouts. So the rigs
+boot `iommu=on`.) With ROCm absent, `--allocator hip` always SKIPs on such
+rigs.
 
 The raw-geometry reasoning applies unchanged: amdgpu-exported BOs (GTT or
 VRAM) carry page-granular SG tables like the DMA heap, so `ODL_TB5_RAW_CELL_MAX`

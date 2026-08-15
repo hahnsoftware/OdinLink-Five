@@ -17,6 +17,13 @@
  * no GPU needed) so the number is deterministic and reproducible.  A GPU
  * (amdgpu) dmabuf would exercise the same transport with GPU-allocated
  * memory as the backing store; the DMA path through the NHI is identical.
+ * The amdgpu/HIP allocators pick the GEM domain by GPU kind: an iGPU (APU)
+ * has no PCIe-visible VRAM (its "VRAM" is a small BIOS carve-out whose BOs
+ * the exporter cannot pin to GTT for the NHI — first map fails -EINVAL), so
+ * it allocates GTT-domain BOs directly.  A dGPU requests VRAM-domain BOs
+ * (the real GPU memory an RCCL tensor would live in); amdgpu pins the BO
+ * into GTT when the NHI maps it, so the transport still targets system
+ * memory.  --gpu-kind auto|igpu|dgpu overrides the runtime detection.
  *
  * Coordination is a self-synchronising ping-pong (echo): the client sends
  * `size` bytes and waits for the server to echo them back.  Because each
@@ -53,15 +60,34 @@
  * import it into HIP for fill/verify; they are discovered at runtime via
  * dlopen so this binary links nothing GPU-specific and builds everywhere.
  *
+ * The amdgpu/HIP allocators have two placement codepaths, selected by GPU
+ * kind (see --gpu-kind):
+ *   - iGPU (APU, VRAM heap is a small BIOS carve-out): GTT-domain BOs.
+ *     amdgpu's exporter refuses to pin a carve-out VRAM BO into GTT for the
+ *     NHI importer (-EINVAL on the first map), so GTT is the only working
+ *     domain — and on an APU it is the same physical memory as the carve-out.
+ *   - dGPU (dedicated VRAM): VRAM-domain BOs, the real GPU memory an RCCL
+ *     tensor lives in.  amdgpu pins the BO into GTT when the NHI maps it
+ *     (standard VRAM→GTT migration), so the transport targets system memory
+ *     either way.  If the exporter still refuses VRAM on the first transfer,
+ *     the bench retries the run with GTT placement before declaring SKIP.
+ *
  * When an allocator's prerequisites are missing the bench prints a SKIP
  * reason and exits 3.  It NEVER silently falls back to DMA-heap or memfd —
  * a "passed" run must be backed by the allocator the user asked for. */
 enum { ALLOC_DMAHEAP = 0, ALLOC_AMDGPU = 1, ALLOC_HIP = 2 };
 enum { SKIP_RC = 3 };
+enum { GPU_KIND_AUTO = 0, GPU_KIND_IGPU, GPU_KIND_DGPU };
+enum { AMDGPU_HEAP_VRAM_GiB = 4 }; /* carve-out vs dedicated VRAM threshold */
+#define AMDGPU_GEM_DOMAIN_VRAM         0x1
+#define AMDGPU_GEM_DOMAIN_GTT          0x2
 
 static int g_alloc = ALLOC_DMAHEAP;
 static int g_skip = 0;
 static char g_skip_reason[256];
+static int g_gpu_kind = GPU_KIND_AUTO;
+static uint64_t g_amdgpu_domains = AMDGPU_GEM_DOMAIN_GTT; /* selected GEM domain */
+static char g_kind_label[8] = "auto";
 
 /* ── libdrm_amdgpu via dlopen (no link dependency) ───────────────────── */
 struct amdgpu_bo_alloc_request {
@@ -70,9 +96,15 @@ struct amdgpu_bo_alloc_request {
 	uint64_t preferred_heap;
 	uint64_t flags;
 };
-#define AMDGPU_GEM_DOMAIN_GTT          0x2
 #define AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED 0x2000
 #define AMDGPU_BO_HANDLE_TYPE_DMA_BUF_FD 2
+
+struct amdgpu_heap_info {
+	uint64_t heap_size;
+	uint64_t max_allocation;
+	uint64_t phys_alignment;
+	uint64_t bus_flags;
+};
 
 struct amdgpu_api {
 	void *dl;
@@ -81,6 +113,8 @@ struct amdgpu_api {
 	int (*bo_alloc)(void *, struct amdgpu_bo_alloc_request *, void **);
 	void (*bo_free)(void *);
 	int (*bo_export)(void *, int, uint32_t *);
+	int (*query_heap_info)(void *, uint32_t, uint32_t,
+			       struct amdgpu_heap_info *);
 };
 static struct amdgpu_api g_amd;
 
@@ -227,6 +261,8 @@ static void *dlsym_or_skip(void *dl, const char *sym, const char *what)
 	return fn;
 }
 
+static void detect_gpu_kind(void *dev);
+
 /* Load libdrm_amdgpu and validate there is a live amdgpu DRM device.
  * /dev/amdgpu is a udev alias of the card node; the DRM card is what
  * libdrm actually consumes, so we probe /dev/dri/card{0..3}. */
@@ -244,6 +280,7 @@ static int probe_amdgpu(void)
 	g_amd.bo_alloc = dlsym_or_skip(g_amd.dl, "amdgpu_bo_alloc", "amdgpu");
 	g_amd.bo_free = dlsym_or_skip(g_amd.dl, "amdgpu_bo_free", "amdgpu");
 	g_amd.bo_export = dlsym_or_skip(g_amd.dl, "amdgpu_bo_export", "amdgpu");
+	g_amd.query_heap_info = dlsym_or_skip(g_amd.dl, "amdgpu_query_heap_info", "amdgpu");
 	if (g_skip)
 		return -1;
 
@@ -257,6 +294,8 @@ static int probe_amdgpu(void)
 		if (drmfd < 0)
 			continue;
 		if (g_amd.device_initialize(drmfd, &maj, &min, &dev) == 0) {
+			if (g_gpu_kind == GPU_KIND_AUTO)
+				detect_gpu_kind(dev);
 			g_amd.device_deinitialize(dev);
 			close(drmfd);
 			return 0;
@@ -267,6 +306,35 @@ static int probe_amdgpu(void)
 		 "no amdgpu DRM device (/dev/dri/card0..3)");
 	g_skip = 1;
 	return -1;
+}
+
+/* Classify the amdgpu device as an iGPU (APU) or dGPU by its VRAM heap size.
+ * An APU's VRAM heap is a BIOS carve-out — small by construction (0.5 GiB on
+ * the Strix-Halo rigs) and its BOs are not pin-able to GTT for a foreign
+ * importer.  A dGPU's VRAM heap is the full dedicated GDDR/HBM.  The VRAM
+ * heap size is the only reliable runtime signal (the IGP is not always at
+ * bus 00:00.0 — Strix-Halo hangs it at 0000:c5:00.0).  --gpu-kind overrides. */
+static void detect_gpu_kind(void *dev)
+{
+	struct amdgpu_heap_info vram = { 0 }, gtt = { 0 };
+
+	if (g_amd.query_heap_info(dev, AMDGPU_GEM_DOMAIN_VRAM, 0, &vram) != 0)
+		vram.heap_size = 0;
+	if (g_amd.query_heap_info(dev, AMDGPU_GEM_DOMAIN_GTT, 0, &gtt) != 0)
+		gtt.heap_size = 0;
+
+	if (vram.heap_size < (uint64_t)AMDGPU_HEAP_VRAM_GiB * 1024 * 1024 * 1024)
+		g_gpu_kind = GPU_KIND_IGPU;
+	else
+		g_gpu_kind = GPU_KIND_DGPU;
+	snprintf(g_kind_label, sizeof(g_kind_label),
+		 g_gpu_kind == GPU_KIND_IGPU ? "igpu" : "dgpu");
+	g_amdgpu_domains = g_gpu_kind == GPU_KIND_DGPU ?
+			  AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT;
+	printf("[detect] amdgpu heap: vram=%llu MiB gtt=%llu MiB -> %s\n",
+	       (unsigned long long)(vram.heap_size / (1024 * 1024)),
+	       (unsigned long long)(gtt.heap_size / (1024 * 1024)),
+	       g_kind_label);
 }
 
 /* Load HIP and confirm at least one device is visible. */
@@ -302,12 +370,12 @@ static int probe_hip(void)
 }
 
 /* Export an amdgpu BO as a real DMA-BUF fd through the ROCm driver stack.
- * GTT placement is deliberate: amdgpu's exporter refuses to DMA-map a VRAM
- * BO for a foreign (non-amdgpu) importer — exactly what the OdinLink NHI is —
- * returning -EINVAL from dma_buf_map_attachment.  GTT (system memory, on an
- * APU the same memory as VRAM) maps and transports fine.  Requires amdgpu to
- * be loaded; /dev/dri/cardN (the libdrm device) is enough — /dev/amdgpu is
- * optional. */
+ * Placement follows the GPU kind (see detect_gpu_kind): an iGPU/APU allocates
+ * GTT — its carve-out VRAM cannot be pinned to GTT for the NHI importer, and
+ * on an APU GTT is the same physical memory anyway; a dGPU allocates VRAM,
+ * the real GPU memory an RCCL tensor lives in (amdgpu migrates the BO to GTT
+ * when the NHI maps it).  Requires amdgpu to be loaded; /dev/dri/cardN (the
+ * libdrm device) is enough — /dev/amdgpu is optional. */
 static int alloc_dmabuf_amdgpu(size_t size)
 {
 	int drmfd = -1;
@@ -332,12 +400,13 @@ static int alloc_dmabuf_amdgpu(size_t size)
 	struct amdgpu_bo_alloc_request req = {
 		.alloc_size = size,
 		.phys_alignment = 0,
-		.preferred_heap = AMDGPU_GEM_DOMAIN_GTT,
+		.preferred_heap = g_amdgpu_domains,
 		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
 	};
 	if (g_amd.bo_alloc(dev, &req, &bo) != 0) {
-		fprintf(stderr, "FAIL: amdgpu_bo_alloc(%zu) GTT failed\n",
-			size);
+		fprintf(stderr, "FAIL: amdgpu_bo_alloc(%zu) %s failed\n",
+			size, g_amdgpu_domains == AMDGPU_GEM_DOMAIN_VRAM ?
+			      "VRAM" : "GTT");
 		g_amd.device_deinitialize(dev);
 		close(drmfd);
 		return -1;
@@ -356,8 +425,9 @@ static int alloc_dmabuf_amdgpu(size_t size)
 	return (int)out;
 }
 
-/* amdgpu export + HIP import: the fd is a real amdgpu DMA-BUF (GTT-backed),
- * the mapped pointer makes it directly usable by HIP kernels/memcpy. */
+/* amdgpu export + HIP import: the fd is a real amdgpu DMA-BUF (GTT on an
+ * iGPU, VRAM on a dGPU), the mapped pointer makes it directly usable by HIP
+ * kernels/memcpy. */
 static int alloc_dmabuf_hip(size_t size)
 {
 	int fd = alloc_dmabuf_amdgpu(size);
@@ -442,6 +512,29 @@ static int is_exporter_refusal(int size_idx, int iter, int ret)
 	       size_idx == 0 && iter == 0 && ret == -EINVAL;
 }
 
+/* A first-transfer -EINVAL under amdgpu/hip means the exporter could not pin
+ * the BO's GEM domain for the NHI importer.  On a dGPU this should not
+ * happen (VRAM→GTT migration is the normal CPU-access path), but a carve-out
+ * APU misdetected as a dGPU refuses exactly like this.  When VRAM placement
+ * was requested, flip to GTT (known-good on every amdgpu) and retry the size
+ * instead of skipping; only if GTT is ALSO refused do we report the clean
+ * SKIP.  Anything after the first transfer, or any other errno, stays a hard
+ * failure. */
+static int placement_fallback(int size_idx, int iter, int ret)
+{
+	if (!(g_alloc == ALLOC_AMDGPU || g_alloc == ALLOC_HIP))
+		return 0;
+	if (!(size_idx == 0 && iter == 0 && ret == -EINVAL))
+		return 0;
+	if (g_amdgpu_domains != AMDGPU_GEM_DOMAIN_VRAM)
+		return 0;
+
+	g_amdgpu_domains = AMDGPU_GEM_DOMAIN_GTT;
+	printf("[retry] amdgpu exporter refused VRAM for the NHI — "
+	       "re-running size %zu with GTT placement\n", g_sizes[0]);
+	return 1;
+}
+
 static void mark_exporter_skip(void)
 {
 	if (g_skip)
@@ -468,17 +561,22 @@ static int run_server(odl_tb5_t h)
 			continue;
 		}
 
+		int total = g_warmup + g_iters;
+retry_size:
 		int fd = alloc_dmabuf(size);
 		if (fd < 0)
 			return 1;
 
-		int total = g_warmup + g_iters;
 		for (int i = 0; i < total; i++) {
 			int ret = odl_tb5_recv_dmabuf(h, fd, 0, size);
 			if (ret < 0) {
 				fprintf(stderr,
 					"[server] recv_dmabuf size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
+				if (placement_fallback(s, i, ret)) {
+					put_fd(fd);
+					goto retry_size;
+				}
 				if (is_exporter_refusal(s, i, ret))
 					mark_exporter_skip();
 				put_fd(fd);
@@ -489,6 +587,10 @@ static int run_server(odl_tb5_t h)
 				fprintf(stderr,
 					"[server] send_dmabuf size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
+				if (placement_fallback(s, i, ret)) {
+					put_fd(fd);
+					goto retry_size;
+				}
 				if (is_exporter_refusal(s, i, ret))
 					mark_exporter_skip();
 				put_fd(fd);
@@ -595,8 +697,10 @@ static int run_client(odl_tb5_t h)
 		size_t size = g_sizes[s];
 		unsigned char pat = (unsigned char)(0x41 + s); /* per-size */
 
-		int sfd = alloc_dmabuf(size);
-		int rfd = alloc_dmabuf(size);
+		int sfd, rfd;
+retry_size:
+		sfd = alloc_dmabuf(size);
+		rfd = alloc_dmabuf(size);
 		if (sfd < 0 || rfd < 0) {
 			free(rtt);
 			return 1;
@@ -612,6 +716,11 @@ static int run_client(odl_tb5_t h)
 				fprintf(stderr,
 					"[client] send size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
+				if (placement_fallback(s, i, ret)) {
+					put_fd(sfd);
+					put_fd(rfd);
+					goto retry_size;
+				}
 				if (is_exporter_refusal(s, i, ret))
 					mark_exporter_skip();
 				fail = 1;
@@ -622,6 +731,11 @@ static int run_client(odl_tb5_t h)
 				fprintf(stderr,
 					"[client] recv size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
+				if (placement_fallback(s, i, ret)) {
+					put_fd(sfd);
+					put_fd(rfd);
+					goto retry_size;
+				}
 				if (is_exporter_refusal(s, i, ret))
 					mark_exporter_skip();
 				fail = 1;
@@ -687,7 +801,7 @@ static void usage(const char *p)
 	fprintf(stderr,
 		"usage: %s <server|client> [--dev N] [--iters N] "
 		"[--warmup N] [--sizes a,b,c] [--expect-reject a,b,c] "
-		"[--allocator dmaheap|amdgpu|hip]\n"
+		"[--allocator dmaheap|amdgpu|hip] [--gpu-kind auto|igpu|dgpu]\n"
 		"  --sizes accepts K/M/G suffixes (1024-based), e.g. "
 		"64K,1M,8M — or plain byte counts.\n"
 		"  --expect-reject: sizes to probe ONCE (client) before the "
@@ -696,12 +810,18 @@ static void usage(const char *p)
 		"  --allocator: backing store for the dmabufs.\n"
 		"    dmaheap  system DMA-heap, CPU memory (default; the "
 		"deterministic gate path)\n"
-		"    amdgpu   amdgpu GTT-backed DMA-BUF exported via libdrm_amdgpu "
+		"    amdgpu   amdgpu DMA-BUF exported via libdrm_amdgpu "
 		"(needs a loaded amdgpu DRM device)\n"
-		"    hip      amdgpu GTT-backed DMA-BUF imported into HIP for "
+		"    hip      amdgpu DMA-BUF imported into HIP for "
 		"fill/verify (needs a ROCm HIP runtime too)\n"
-		"  amdgpu/hip NEVER fall back: when their prerequisites are "
-		"missing the bench prints a reason and exits 3 (SKIP).\n", p);
+		"  --gpu-kind: GEM domain for amdgpu/hip (auto = detected).\n"
+		"    igpu     APU — GTT domain (carve-out VRAM can't be pinned "
+		"to GTT for the NHI)\n"
+		"    dgpu     dedicated VRAM — VRAM domain, falls back to GTT "
+		"if the exporter refuses\n"
+		"  amdgpu/hip NEVER fall back to another allocator: when their "
+		"prerequisites are missing the bench prints a reason and exits "
+		"3 (SKIP).\n", p);
 }
 
 /*
@@ -828,6 +948,26 @@ int main(int argc, char **argv)
 					"dmaheap|amdgpu|hip)\n", a);
 				return 2;
 			}
+		} else if (!strcmp(argv[i], "--gpu-kind") && i + 1 < argc) {
+			const char *k = argv[++i];
+			if (!strcmp(k, "igpu")) {
+				g_gpu_kind = GPU_KIND_IGPU;
+				snprintf(g_kind_label, sizeof(g_kind_label),
+					 "igpu");
+			} else if (!strcmp(k, "dgpu")) {
+				g_gpu_kind = GPU_KIND_DGPU;
+				snprintf(g_kind_label, sizeof(g_kind_label),
+					 "dgpu");
+			} else if (!strcmp(k, "auto")) {
+				g_gpu_kind = GPU_KIND_AUTO;
+				snprintf(g_kind_label, sizeof(g_kind_label),
+					 "auto");
+			} else {
+				fprintf(stderr,
+					"--gpu-kind: unknown '%s' (expected "
+					"auto|igpu|dgpu)\n", k);
+				return 2;
+			}
 		} else {
 			usage(argv[0]);
 			return 2;
@@ -846,6 +986,14 @@ int main(int argc, char **argv)
 	if (g_skip)
 		goto skip;
 
+	/* A forced --gpu-kind overrides auto-detection (detect_gpu_kind only
+	 * runs on AUTO); a dGPU placement request that the exporter refuses
+	 * falls back to GTT at the first transfer. */
+	if (g_gpu_kind == GPU_KIND_IGPU)
+		g_amdgpu_domains = AMDGPU_GEM_DOMAIN_GTT;
+	else if (g_gpu_kind == GPU_KIND_DGPU)
+		g_amdgpu_domains = AMDGPU_GEM_DOMAIN_VRAM;
+
 	odl_tb5_t h = NULL;
 	int ret = odl_tb5_open(&h, g_dev);
 	if (ret < 0) {
@@ -861,9 +1009,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	printf("[%s] device %d open, peer ready — iters=%d warmup=%d "
-	       "allocator=%s\n",
+	       "allocator=%s gpu-kind=%s domain=%s\n",
 	       is_server ? "server" : "client", g_dev, g_iters, g_warmup,
-	       alloc_name);
+	       alloc_name, g_kind_label,
+	       g_amdgpu_domains == AMDGPU_GEM_DOMAIN_VRAM ? "VRAM" : "GTT");
 
 	ret = is_server ? run_server(h) : run_client(h);
 
