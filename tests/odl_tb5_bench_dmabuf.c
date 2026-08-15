@@ -40,11 +40,91 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <dlfcn.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <linux/dma-heap.h>
 
 #include <odl_tb5/odl_tb5.h>
+
+/* Allocator selection.  The DMA-heap path is the deterministic CPU one used
+ * by the readiness gate's main proof.  The amdgpu/HIP paths export a REAL
+ * VRAM DMA-BUF through the ROCm driver stack (libdrm_amdgpu) and optionally
+ * import it into HIP for fill/verify; they are discovered at runtime via
+ * dlopen so this binary links nothing GPU-specific and builds everywhere.
+ *
+ * When an allocator's prerequisites are missing the bench prints a SKIP
+ * reason and exits 3.  It NEVER silently falls back to DMA-heap or memfd —
+ * a "passed" run must be backed by the allocator the user asked for. */
+enum { ALLOC_DMAHEAP = 0, ALLOC_AMDGPU = 1, ALLOC_HIP = 2 };
+enum { SKIP_RC = 3 };
+
+static int g_alloc = ALLOC_DMAHEAP;
+static int g_skip = 0;
+static char g_skip_reason[256];
+
+/* ── libdrm_amdgpu via dlopen (no link dependency) ───────────────────── */
+struct amdgpu_bo_alloc_request {
+	uint64_t alloc_size;
+	uint64_t phys_alignment;
+	uint64_t preferred_heap;
+	uint64_t flags;
+};
+#define AMDGPU_GEM_DOMAIN_VRAM         0x1
+#define AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED 0x2000
+#define AMDGPU_BO_HANDLE_TYPE_DMA_BUF_FD 2
+
+struct amdgpu_api {
+	void *dl;
+	int (*device_initialize)(int, uint32_t *, uint32_t *, void **);
+	void (*device_deinitialize)(void *);
+	int (*bo_alloc)(void *, struct amdgpu_bo_alloc_request *, void **);
+	void (*bo_free)(void *);
+	int (*bo_export)(void *, int, uint32_t *);
+};
+static struct amdgpu_api g_amd;
+
+/* ── HIP runtime via dlopen (mirrors the CUDA external-memory ABI HIP
+ *    guarantees; only reached when libamdhip64 is present) ───────────── */
+struct hip_ext_mem_handle {
+	int type;
+	union { int fd; void *win32; const void *name; } handle;
+	size_t size;
+	unsigned int flags;
+};
+struct hip_ext_mem_buffer {
+	size_t offset;
+	size_t size;
+	unsigned int flags;
+};
+#define HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD 1
+#define HIP_MEMCPY_HOST_TO_DEVICE 0
+#define HIP_MEMCPY_DEVICE_TO_HOST 1
+
+struct hip_api {
+	void *dl;
+	int (*get_device_count)(int *);
+	int (*import_ext_mem)(void **, const struct hip_ext_mem_handle *);
+	int (*ext_mem_get_mapped)(void **, void *,
+				  const struct hip_ext_mem_buffer *);
+	int (*destroy_ext_mem)(void *);
+	int (*memcpy)(void *, const void *, size_t, int);
+	int (*sync)(void);
+};
+static struct hip_api g_hip;
+
+/* Live exported fds: for amdgpu/HIP allocators close must also release the
+ * amdgpu BO / HIP external-memory binding, not just the fd. */
+struct live_fd {
+	int fd;
+	int drmfd;
+	void *dev;    /* amdgpu_device_handle */
+	void *bo;     /* amdgpu_bo_handle */
+	void *ext;    /* hipExternalMemory_t */
+	void *map;    /* mapped HIP device pointer */
+};
+static struct live_fd g_live[16];
+static int g_live_n = 0;
 
 /* Default size sweep (bytes) and iteration counts.  Capacity is 16 to match
  * the --sizes parser's cap; sizing it to the initializer (5) let >5 sizes
@@ -65,7 +145,7 @@ static uint64_t now_ns(void)
 }
 
 /* Allocate a real dmabuf from the system dma-heap (CPU-backed, no GPU). */
-static int alloc_dmabuf(size_t size)
+static int alloc_dmabuf_heap(size_t size)
 {
 	int heap = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
 	if (heap < 0) {
@@ -89,6 +169,248 @@ static int alloc_dmabuf(size_t size)
 	}
 	close(heap);
 	return (int)data.fd;
+}
+
+static void live_register(int fd, int drmfd, void *dev, void *bo,
+			  void *ext, void *map)
+{
+	if (g_live_n < (int)(sizeof(g_live) / sizeof(g_live[0])))
+		g_live[g_live_n++] =
+			(struct live_fd){ fd, drmfd, dev, bo, ext, map };
+}
+
+static struct live_fd *live_lookup(int fd)
+{
+	for (int i = 0; i < g_live_n; i++)
+		if (g_live[i].fd == fd)
+			return &g_live[i];
+	return NULL;
+}
+
+static void live_drop(int fd)
+{
+	for (int i = 0; i < g_live_n; i++) {
+		if (g_live[i].fd != fd)
+			continue;
+		for (int j = i; j < g_live_n - 1; j++)
+			g_live[j] = g_live[j + 1];
+		g_live_n--;
+		return;
+	}
+}
+
+static void *dlopen_any(const char **names, const char **errs,
+			const char *what)
+{
+	for (int i = 0; names[i]; i++) {
+		void *dl = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+		if (dl)
+			return dl;
+	}
+	snprintf(g_skip_reason, sizeof(g_skip_reason),
+		 "%s library not found (%s)", what, errs[0]);
+	g_skip = 1;
+	return NULL;
+}
+
+static void *dlsym_or_skip(void *dl, const char *sym, const char *what)
+{
+	void *fn = dlsym(dl, sym);
+	if (!fn) {
+		snprintf(g_skip_reason, sizeof(g_skip_reason),
+			 "%s symbol %s missing: %s", what, sym,
+			 dlerror() ? dlerror() : "?");
+		g_skip = 1;
+	}
+	return fn;
+}
+
+/* Load libdrm_amdgpu and validate there is a live amdgpu DRM device.
+ * /dev/amdgpu is a udev alias of the card node; the DRM card is what
+ * libdrm actually consumes, so we probe /dev/dri/card{0..3}. */
+static int probe_amdgpu(void)
+{
+	static const char *libs[] = { "libdrm_amdgpu.so.1",
+				      "libdrm_amdgpu.so", NULL };
+	const char *errs[] = { "libdrm_amdgpu.so.1", "libdrm_amdgpu.so" };
+	g_amd.dl = dlopen_any(libs, errs, "amdgpu");
+	if (!g_amd.dl)
+		return -1;
+
+	g_amd.device_initialize = dlsym_or_skip(g_amd.dl, "amdgpu_device_initialize", "amdgpu");
+	g_amd.device_deinitialize = dlsym_or_skip(g_amd.dl, "amdgpu_device_deinitialize", "amdgpu");
+	g_amd.bo_alloc = dlsym_or_skip(g_amd.dl, "amdgpu_bo_alloc", "amdgpu");
+	g_amd.bo_free = dlsym_or_skip(g_amd.dl, "amdgpu_bo_free", "amdgpu");
+	g_amd.bo_export = dlsym_or_skip(g_amd.dl, "amdgpu_bo_export", "amdgpu");
+	if (g_skip)
+		return -1;
+
+	for (int card = 0; card < 4; card++) {
+		char path[32];
+		uint32_t maj, min;
+		void *dev = NULL;
+
+		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+		int drmfd = open(path, O_RDWR | O_CLOEXEC);
+		if (drmfd < 0)
+			continue;
+		if (g_amd.device_initialize(drmfd, &maj, &min, &dev) == 0) {
+			g_amd.device_deinitialize(dev);
+			close(drmfd);
+			return 0;
+		}
+		close(drmfd);
+	}
+	snprintf(g_skip_reason, sizeof(g_skip_reason),
+		 "no amdgpu DRM device (/dev/dri/card0..3)");
+	g_skip = 1;
+	return -1;
+}
+
+/* Load HIP and confirm at least one device is visible. */
+static int probe_hip(void)
+{
+	static const char *libs[] = { "libamdhip64.so.6", "libamdhip64.so.5",
+				      "libamdhip64.so.4", "libamdhip64.so",
+				      NULL };
+	const char *errs[] = { "libamdhip64.so.6", "libamdhip64.so.5",
+			       "libamdhip64.so.4", "libamdhip64.so" };
+	g_hip.dl = dlopen_any(libs, errs, "HIP runtime");
+	if (!g_hip.dl)
+		return -1;
+
+	g_hip.get_device_count = dlsym_or_skip(g_hip.dl, "hipGetDeviceCount", "HIP");
+	g_hip.import_ext_mem = dlsym_or_skip(g_hip.dl, "hipImportExternalMemory", "HIP");
+	g_hip.ext_mem_get_mapped = dlsym_or_skip(g_hip.dl, "hipExternalMemoryGetMappedBuffer", "HIP");
+	g_hip.destroy_ext_mem = dlsym_or_skip(g_hip.dl, "hipDestroyExternalMemory", "HIP");
+	g_hip.memcpy = dlsym_or_skip(g_hip.dl, "hipMemcpy", "HIP");
+	g_hip.sync = dlsym_or_skip(g_hip.dl, "hipDeviceSynchronize", "HIP");
+	if (g_skip)
+		return -1;
+
+	int count = 0;
+	if (g_hip.get_device_count(&count) != 0 || count < 1) {
+		snprintf(g_skip_reason, sizeof(g_skip_reason),
+			 "HIP installed but no HIP-visible device (hipGetDeviceCount=%d)",
+			 count);
+		g_skip = 1;
+		return -1;
+	}
+	return 0;
+}
+
+/* Export a VRAM (or, on non-APUs, a CPU-accessible) amdgpu BO as a real
+ * DMA-BUF fd through the ROCm driver stack.  Requires amdgpu to be loaded;
+ * /dev/dri/cardN (the libdrm device) is enough — /dev/amdgpu is optional. */
+static int alloc_dmabuf_amdgpu(size_t size)
+{
+	int drmfd = -1;
+	void *dev = NULL, *bo = NULL;
+	uint32_t maj, min;
+
+	for (int card = 0; card < 4; card++) {
+		char path[32];
+
+		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+		drmfd = open(path, O_RDWR | O_CLOEXEC);
+		if (drmfd < 0)
+			continue;
+		if (g_amd.device_initialize(drmfd, &maj, &min, &dev) == 0)
+			break;
+		close(drmfd);
+		drmfd = -1;
+	}
+	if (drmfd < 0 || !dev)
+		return -1;
+
+	struct amdgpu_bo_alloc_request req = {
+		.alloc_size = size,
+		.phys_alignment = 0,
+		.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM,
+		.flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+	};
+	if (g_amd.bo_alloc(dev, &req, &bo) != 0) {
+		fprintf(stderr, "FAIL: amdgpu_bo_alloc(%zu) VRAM failed\n",
+			size);
+		g_amd.device_deinitialize(dev);
+		close(drmfd);
+		return -1;
+	}
+
+	uint32_t out = 0;
+	if (g_amd.bo_export(bo, AMDGPU_BO_HANDLE_TYPE_DMA_BUF_FD, &out) != 0) {
+		fprintf(stderr, "FAIL: amdgpu_bo_export dma-buf failed\n");
+		g_amd.bo_free(bo);
+		g_amd.device_deinitialize(dev);
+		close(drmfd);
+		return -1;
+	}
+
+	live_register((int)out, drmfd, dev, bo, NULL, NULL);
+	return (int)out;
+}
+
+/* amdgpu export + HIP import: the fd is real VRAM, the mapped pointer makes
+ * it directly usable by HIP kernels/memcpy. */
+static int alloc_dmabuf_hip(size_t size)
+{
+	int fd = alloc_dmabuf_amdgpu(size);
+	if (fd < 0)
+		return -1;
+	struct live_fd *lf = live_lookup(fd);
+
+	struct hip_ext_mem_handle h = {
+		.type = HIP_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+		.handle.fd = fd,
+		.size = size,
+	};
+	void *ext = NULL;
+	if (g_hip.import_ext_mem(&ext, &h) != 0 || !ext) {
+		snprintf(g_skip_reason, sizeof(g_skip_reason),
+			 "hipImportExternalMemory of the exported VRAM dma-buf "
+			 "failed — HIP cannot bind this allocator");
+		g_skip = 1;
+		put_fd(fd);
+		return -1;
+	}
+	struct hip_ext_mem_buffer b = { .offset = 0, .size = size };
+	lf->ext = ext; /* put_fd destroys it on any failure path below */
+	void *map = NULL;
+	if (g_hip.ext_mem_get_mapped(&map, ext, &b) != 0 || !map) {
+		snprintf(g_skip_reason, sizeof(g_skip_reason),
+			 "hipExternalMemoryGetMappedBuffer failed");
+		g_skip = 1;
+		put_fd(fd);
+		return -1;
+	}
+	lf->map = map;
+	return fd;
+}
+
+/* Dispatch allocator.  Prerequisite failures set g_skip; per-allocation
+ * runtime failures are hard errors (return -1 without g_skip). */
+static int alloc_dmabuf(size_t size)
+{
+	if (g_alloc == ALLOC_AMDGPU)
+		return alloc_dmabuf_amdgpu(size);
+	if (g_alloc == ALLOC_HIP)
+		return alloc_dmabuf_hip(size);
+	return alloc_dmabuf_heap(size);
+}
+
+/* Release an allocated fd: for amdgpu/HIP also drop the BO + HIP binding. */
+static void put_fd(int fd)
+{
+	struct live_fd *lf = live_lookup(fd);
+	if (lf) {
+		if (lf->ext)
+			g_hip.destroy_ext_mem(lf->ext);
+		g_amd.bo_free(lf->bo);
+		g_amd.device_deinitialize(lf->dev);
+		close(lf->drmfd);
+		live_drop(fd);
+	}
+	close(fd);
 }
 
 static int cmp_u64(const void *a, const void *b)
@@ -129,7 +451,7 @@ static int run_server(odl_tb5_t h)
 				fprintf(stderr,
 					"[server] recv_dmabuf size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
-				close(fd);
+				put_fd(fd);
 				return 1;
 			}
 			ret = odl_tb5_send_dmabuf(h, fd, 0, size);
@@ -137,20 +459,33 @@ static int run_server(odl_tb5_t h)
 				fprintf(stderr,
 					"[server] send_dmabuf size=%zu i=%d: %s\n",
 					size, i, strerror(-ret));
-				close(fd);
+				put_fd(fd);
 				return 1;
 			}
 		}
-		close(fd);
+		put_fd(fd);
 		printf("[server] size=%zu done (%d transfers)\n", size, total);
 	}
 	printf("[server] all sizes done\n");
 	return 0;
 }
 
-/* Fill / check a dmabuf via a CPU mapping (dma_heap buffers are mappable). */
+/* Fill a dmabuf.  DMA-heap buffers are CPU-mappable; amdgpu VRAM is filled
+ * through the exported fd's mmap (amdgpu GEM maps VRAM for CPU access), and
+ * the HIP path copies through the imported device pointer. */
 static int fill_fd(int fd, size_t size, unsigned char byte)
 {
+	if (g_alloc == ALLOC_HIP) {
+		struct live_fd *lf = live_lookup(fd);
+		unsigned char *h = malloc(size);
+		if (!h)
+			return -1;
+		memset(h, byte, size);
+		g_hip.memcpy(lf->map, h, size, HIP_MEMCPY_HOST_TO_DEVICE);
+		g_hip.sync();
+		free(h);
+		return 0;
+	}
 	void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (m == MAP_FAILED)
 		return -1;
@@ -162,6 +497,20 @@ static int fill_fd(int fd, size_t size, unsigned char byte)
 /* Returns count of mismatching bytes (0 = clean round-trip). */
 static size_t verify_fd(int fd, size_t size, unsigned char expect)
 {
+	if (g_alloc == ALLOC_HIP) {
+		struct live_fd *lf = live_lookup(fd);
+		unsigned char *h = malloc(size);
+		size_t bad = 0;
+		if (!h)
+			return size;
+		g_hip.memcpy(h, lf->map, size, HIP_MEMCPY_DEVICE_TO_HOST);
+		g_hip.sync();
+		for (size_t i = 0; i < size; i++)
+			if (h[i] != expect)
+				bad++;
+		free(h);
+		return bad;
+	}
 	void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
 	if (m == MAP_FAILED)
 		return size; /* can't verify → treat as all-bad */
@@ -207,7 +556,7 @@ static int run_client(odl_tb5_t h)
 		int ret = odl_tb5_send_dmabuf(h, fd, 0, sz);
 		printf("[client] pre-reject probe size=%zu: %s\n", sz,
 		       ret < 0 ? strerror(-ret) : "submitted (ring had room)");
-		close(fd);
+		put_fd(fd);
 	}
 
 	for (int s = 0; s < g_num_sizes; s++) {
@@ -247,8 +596,8 @@ static int run_client(odl_tb5_t h)
 		}
 
 		size_t bad = fail ? size : verify_fd(rfd, size, pat);
-		close(sfd);
-		close(rfd);
+		put_fd(sfd);
+		put_fd(rfd);
 		if (fail) {
 			free(rtt);
 			return 1;
@@ -301,12 +650,22 @@ static void usage(const char *p)
 {
 	fprintf(stderr,
 		"usage: %s <server|client> [--dev N] [--iters N] "
-		"[--warmup N] [--sizes a,b,c] [--expect-reject a,b,c]\n"
+		"[--warmup N] [--sizes a,b,c] [--expect-reject a,b,c] "
+		"[--allocator dmaheap|amdgpu|hip]\n"
 		"  --sizes accepts K/M/G suffixes (1024-based), e.g. "
 		"64K,1M,8M — or plain byte counts.\n"
 		"  --expect-reject: sizes to probe ONCE (client) before the "
 		"sizes loop, to arm a ring-full capacity reject before the "
-		"real transfers (F2 trigger shape).\n", p);
+		"real transfers (F2 trigger shape).\n"
+		"  --allocator: backing store for the dmabufs.\n"
+		"    dmaheap  system DMA-heap, CPU memory (default; the "
+		"deterministic gate path)\n"
+		"    amdgpu   real VRAM DMA-BUF exported via libdrm_amdgpu "
+		"(needs a loaded amdgpu DRM device)\n"
+		"    hip      amdgpu VRAM DMA-BUF imported into HIP for "
+		"fill/verify (needs a ROCm HIP runtime too)\n"
+		"  amdgpu/hip NEVER fall back: when their prerequisites are "
+		"missing the bench prints a reason and exits 3 (SKIP).\n", p);
 }
 
 /*
@@ -419,11 +778,37 @@ int main(int argc, char **argv)
 				g_reject[g_reject_n++] = sz;
 				tok = strtok(NULL, ",");
 			}
+		} else if (!strcmp(argv[i], "--allocator") && i + 1 < argc) {
+			const char *a = argv[++i];
+			if (!strcmp(a, "dmaheap"))
+				g_alloc = ALLOC_DMAHEAP;
+			else if (!strcmp(a, "amdgpu"))
+				g_alloc = ALLOC_AMDGPU;
+			else if (!strcmp(a, "hip"))
+				g_alloc = ALLOC_HIP;
+			else {
+				fprintf(stderr,
+					"--allocator: unknown '%s' (expected "
+					"dmaheap|amdgpu|hip)\n", a);
+				return 2;
+			}
 		} else {
 			usage(argv[0]);
 			return 2;
 		}
 	}
+
+	/* Early capability probe: amdgpu/HIP allocators skip cleanly (exit 3)
+	 * before touching the device when their stack is missing. */
+	const char *alloc_name = g_alloc == ALLOC_DMAHEAP ? "dmaheap" :
+				(g_alloc == ALLOC_AMDGPU ? "amdgpu" : "hip");
+	if (g_alloc == ALLOC_AMDGPU && probe_amdgpu() < 0)
+		goto skip;
+	if (g_alloc == ALLOC_HIP &&
+	    (probe_amdgpu() < 0 || probe_hip() < 0))
+		goto skip;
+	if (g_skip)
+		goto skip;
 
 	odl_tb5_t h = NULL;
 	int ret = odl_tb5_open(&h, g_dev);
@@ -439,11 +824,23 @@ int main(int argc, char **argv)
 		odl_tb5_close(h);
 		return 1;
 	}
-	printf("[%s] device %d open, peer ready — iters=%d warmup=%d\n",
-	       is_server ? "server" : "client", g_dev, g_iters, g_warmup);
+	printf("[%s] device %d open, peer ready — iters=%d warmup=%d "
+	       "allocator=%s\n",
+	       is_server ? "server" : "client", g_dev, g_iters, g_warmup,
+	       alloc_name);
 
 	ret = is_server ? run_server(h) : run_client(h);
 
 	odl_tb5_close(h);
+	if (ret != 0 && g_skip) {
+		printf("[%s] SKIP: %s\n", is_server ? "server" : "client",
+		       g_skip_reason);
+		return SKIP_RC;
+	}
 	return ret;
+
+skip:
+	printf("[%s] SKIP: %s\n", is_server ? "server" : "client",
+	       g_skip_reason[0] ? g_skip_reason : "allocator unavailable");
+	return SKIP_RC;
 }

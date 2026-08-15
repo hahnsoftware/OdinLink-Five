@@ -51,7 +51,7 @@ target_include_directories(odl_tb5_bench_dmabuf PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/include
     ${CMAKE_SOURCE_DIR}/driver/uapi
 )
-target_link_libraries(odl_tb5_bench_dmabuf odl_tb5 pthread)
+target_link_libraries(odl_tb5_bench_dmabuf odl_tb5 pthread dl)
 
 add_executable(odl_stream_verify
     odl_stream_verify.c

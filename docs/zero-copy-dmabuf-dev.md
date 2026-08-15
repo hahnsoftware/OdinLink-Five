@@ -139,6 +139,33 @@ These are exposed via the device's debugfs/stats; `chardev.c` already prints
 | `odl_tb5_raw_geom_test` | raw-geometry gate invariant (page-granular SG layouts) | no — single box, no module |
 | `odl_tb5_pair_dmabuf` | legacy + stream DMA-BUF e2e, pattern-checked | **yes, two boxes** |
 | `odl_stream_verify` | N streams × M rounds, content-verified | **yes, two boxes** |
+| `odl_tb5_bench_dmabuf` | echo bench, `--allocator dmaheap\|amdgpu\|hip` | **yes, two boxes** |
+
+## Allocators (`odl_tb5_bench_dmabuf --allocator`)
+
+The DMA-heap path is the deterministic CPU backing the readiness gate's main
+proof. Two GPU allocators export a **real VRAM DMA-BUF** through the ROCm
+driver stack, discovered at runtime via `dlopen` (the bench links no GPU
+library and builds anywhere):
+
+| Allocator | Backing | Requires |
+|-----------|---------|----------|
+| `dmaheap` (default) | `/dev/dma_heap/system` | `CONFIG_DMABUF_HEAPS_SYSTEM` |
+| `amdgpu` | VRAM BO via `libdrm_amdgpu` (`amdgpu_bo_alloc` `AMDGPU_GEM_DOMAIN_VRAM` + `amdgpu_bo_export` → dma-buf fd) | amdgpu loaded, `/dev/dri/cardN` (`/dev/amdgpu` is a udev alias, not required) |
+| `hip` | amdgpu VRAM export **imported into HIP** (`hipImportExternalMemory` + `hipExternalMemoryGetMappedBuffer`); fill/verify via `hipMemcpy` through the mapped pointer | amdgpu + a ROCm HIP runtime (`libamdhip64.so`) with ≥1 visible device |
+
+When an allocator's prerequisites are missing the bench prints a SKIP reason
+and exits 3. It **never silently falls back** to DMA-heap or memfd — a passed
+run must be backed by the allocator the user asked for. The readiness gate
+runs an optional second echo round (`--extra-allocator amdgpu|hip`, default
+`hip`): a clean SKIP on **both** hosts is recorded and does not fail the gate
+(the DMA-heap round is the pass criterion), but a real run must satisfy the
+same raw-counter gate as the main round, and an asymmetric SKIP (one side
+ran, the other skipped) is a failure.
+
+The raw-geometry reasoning applies unchanged: VRAM BOs exported by amdgpu
+carry page-granular SG tables like the DMA heap, so `ODL_TB5_RAW_CELL_MAX`
+(2048) keeps them raw-eligible by construction.
 
 ### Single-box starvation (by design)
 

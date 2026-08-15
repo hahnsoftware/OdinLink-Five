@@ -25,12 +25,14 @@ DEV=0
 ITERS=25
 WARMUP=5
 SIZES="4K,64K,1M,4M"
+EXTRA_ALLOC=hip
 DEBUGFS_ROOT=/sys/kernel/debug/odl_tb5
 TIMEOUT_SECS=180
 KEEP_LOGS=0
 RUN_ID="odl-dmabuf-readiness-${USER:-root}-$$"
 LOCAL_LOG_DIR="${TMPDIR:-/tmp}/$RUN_ID"
 REMOTE_LOG_DIR="/tmp/$RUN_ID"
+SKIP_RC=3
 
 usage() {
     cat <<'EOF'
@@ -46,6 +48,10 @@ Options:
   --iters N              Counted echo iterations per size (default: 25)
   --warmup N             Echo warm-up iterations per size (default: 5)
   --sizes LIST           Comma-separated sizes, e.g. 4K,64K,1M,4M
+  --extra-allocator NAME  Second echo round with this bench allocator:
+                         amdgpu (VRAM DMA-BUF via libdrm_amdgpu), hip
+                         (amdgpu + HIP import), or none (default: hip).
+                         A clean SKIP on both hosts is recorded, not a fail.
   --timeout SEC          Per-test timeout (default: 180)
   --debugfs-root DIR     Debugfs OdinLink root (default: /sys/kernel/debug/odl_tb5)
   --keep-logs            Preserve local and peer logs after success
@@ -78,6 +84,7 @@ while (($#)); do
         --iters) ITERS=${2:?--iters requires a value}; shift 2 ;;
         --warmup) WARMUP=${2:?--warmup requires a value}; shift 2 ;;
         --sizes) SIZES=${2:?--sizes requires a value}; shift 2 ;;
+        --extra-allocator) EXTRA_ALLOC=${2:?--extra-allocator requires a value}; shift 2 ;;
         --timeout) TIMEOUT_SECS=${2:?--timeout requires a value}; shift 2 ;;
         --debugfs-root) DEBUGFS_ROOT=${2:?--debugfs-root requires a value}; shift 2 ;;
         --keep-logs) KEEP_LOGS=1; shift ;;
@@ -213,6 +220,71 @@ wait_local_background() {
     cat "$LOCAL_LOG_DIR/$label.local.log"
 }
 
+# Soft variants used by the extra-allocator round: record the exit code in
+# a global instead of dying, so a clean SKIP (3) can be distinguished from
+# a failure.  Both return 0 so set -e never fires on the child's rc.
+LOCAL_RC=
+run_local_rc() {
+    local label=$1; shift
+    if timeout "$TIMEOUT_SECS" "$@" >"$LOCAL_LOG_DIR/$label.local.log" 2>&1; then
+        LOCAL_RC=0
+    else
+        LOCAL_RC=$?
+    fi
+    cat "$LOCAL_LOG_DIR/$label.local.log"
+    return 0
+}
+
+# Soft variant used by the extra-allocator round: record PEER_RC instead of
+# dying, so a clean SKIP (3) can be distinguished from a failure.
+PEER_RC=
+wait_peer_rc() {
+    local label=$1 elapsed=0
+    while ((elapsed < TIMEOUT_SECS + 15)); do
+        if peer_run "test -f $(printf '%q' "$REMOTE_LOG_DIR/$label.rc")"; then
+            PEER_RC=$(peer_run "cat $(printf '%q' "$REMOTE_LOG_DIR/$label.rc")")
+            peer_run "cat $(printf '%q' "$REMOTE_LOG_DIR/$label.log")" | tee "$LOCAL_LOG_DIR/$label.peer.log"
+            return 0
+        fi
+        sleep 1
+        ((++elapsed))
+    done
+    die "timed out waiting for peer test $label"
+}
+
+# Second echo round with a GPU allocator.  A clean SKIP on BOTH hosts is
+# reported and does not fail the gate (the DMA-heap round is the pass
+# criterion); a real run must satisfy the same counter gate as the main
+# round.  Asymmetric SKIP (one side ran, the other skipped) is a failure.
+extra_allocator_round() {
+    local alloc=$1
+    local label="extra_${alloc}"
+    note "DMA-BUF echo stress (extra allocator: $alloc): peer server, local client"
+    snapshot before
+    start_peer "$label" "$(printf '%q' "$REMOTE_BIN_DIR/odl_tb5_bench_dmabuf") server --dev $(printf '%q' "$DEV") --iters $(printf '%q' "$ITERS") --warmup $(printf '%q' "$WARMUP") --sizes $(printf '%q' "$SIZES") --allocator $(printf '%q' "$alloc")"
+    sleep 1
+    local local_rc peer_rc
+    run_local_rc "$label" "$BIN_DIR/odl_tb5_bench_dmabuf" client --dev "$DEV" --iters "$ITERS" --warmup "$WARMUP" --sizes "$SIZES" --allocator "$alloc"
+    local_rc=$LOCAL_RC
+    wait_peer_rc "$label"
+    peer_rc=$PEER_RC
+
+    local local_skip=0 peer_skip=0
+    grep -q 'SKIP:' "$LOCAL_LOG_DIR/$label.local.log" && local_skip=1
+    grep -q 'SKIP:' "$LOCAL_LOG_DIR/$label.peer.log" && peer_skip=1
+
+    if ((local_skip || peer_skip)); then
+        ((local_skip == 1 && peer_skip == 1)) || die "extra allocator $alloc: asymmetric SKIP (one side ran, the other skipped)"
+        note "extra allocator $alloc: SKIP on both hosts — recorded, not counted toward the gate"
+        grep -m1 'SKIP:' "$LOCAL_LOG_DIR/$label.local.log"
+        return 0
+    fi
+    ((local_rc == 0 && peer_rc == 0)) || die "extra allocator $alloc round failed (local rc=$local_rc peer rc=$peer_rc)"
+    grep -q 'integrity OK' "$LOCAL_LOG_DIR/$label.local.log" || die "extra allocator $alloc did not report integrity OK"
+    assert_counter_gate
+    note "extra allocator $alloc: PASS — raw proof above"
+}
+
 assert_pair_receiver_real_dmabuf() {
     local peer_label=$1
     grep -q 'real=1' "$LOCAL_LOG_DIR/$peer_label.peer.log" || die "$peer_label did not obtain a real DMA-BUF on the peer"
@@ -277,4 +349,9 @@ wait_peer bench_server
 grep -q 'integrity OK' "$LOCAL_LOG_DIR/bench_client.local.log" || die 'echo benchmark did not report integrity OK'
 
 assert_counter_gate
+case "$EXTRA_ALLOC" in
+    none) note 'extra allocator round disabled (--extra-allocator none)' ;;
+    amdgpu|hip) extra_allocator_round "$EXTRA_ALLOC" ;;
+    *) die "invalid --extra-allocator: $EXTRA_ALLOC (expected amdgpu|hip|none)" ;;
+esac
 note 'PASS: direct raw DMA-BUF readiness gate passed (no vLLM/Ray/RCCL selection involved)'
