@@ -1688,10 +1688,14 @@ static int odl_tb5_dmabuf_release(struct odl_tb5_device *dev,
 		dma_buf_end_cpu_access(x->dmabuf, DMA_BIDIRECTIONAL);
 	kfree(x->stage);
 	x->stage = NULL;
-	dma_sync_sgtable_for_cpu(x->dma_dev, x->sgt, x->dir);
-	dma_buf_unmap_attachment(x->attach, x->sgt, x->dir);
-	dma_buf_detach(x->dmabuf, x->attach);
-	dma_buf_put(x->dmabuf);
+	if (x->mapped) {
+		dma_sync_sgtable_for_cpu(x->dma_dev, x->sgt, x->dir);
+		dma_buf_unmap_attachment(x->attach, x->sgt, x->dir);
+	}
+	if (x->attach)
+		dma_buf_detach(x->dmabuf, x->attach);
+	if (x->dmabuf)
+		dma_buf_put(x->dmabuf);
 	return deliver ? 0 : (x->raw_ok ? -EIO : 0);
 }
 
@@ -1839,6 +1843,7 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 	int nps, ndp, p, k = 0;
 	int nents_i;
 	int ret = 0;
+	bool mapped = false;	/* attach+map completed; guards release() */
 	bool rx_shared = false;	/* single-path fallback: dmabuf shares ctrl path */
 	bool rx_armed = false;	/* dmabuf_rx_active incremented for this call */
 	bool rx_poll_held = false; /* rx_dmabuf_pending incremented for this call */
@@ -1947,6 +1952,7 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 		goto err_detach;
 	}
 	dma_sync_sgtable_for_device(dma_dev, sgt, dir);
+	mapped = true;
 
 	/* Hold the completion pump before the first RX frame can be posted.
 	 * This also covers partial-post failures: err_unmap may need to wait for
@@ -2324,6 +2330,7 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_RAW_CELL_MAX
 	 * possibly from a different syscall (NOWAIT submit).  Park every
 	 * resource and counter so they never touch this stack frame again. */
 	x->is_tx = is_tx;
+	x->mapped = mapped;
 	x->nps = nps;
 	x->ndp = ndp;
 	x->rx_shared = rx_shared;
@@ -2376,6 +2383,7 @@ err_unmap:
 			dev->paths[p].rx_target = 0;
 	}
 	x->is_tx = is_tx;
+	x->mapped = mapped;
 	x->nps = nps;
 	x->ndp = ndp;
 	x->rx_shared = rx_shared;

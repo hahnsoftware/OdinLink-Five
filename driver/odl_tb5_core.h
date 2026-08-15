@@ -401,6 +401,7 @@ struct odl_tb5_dmabuf_stage;	/* defined in odl_tb5_ring_dma.c */
 struct odl_tb5_dmabuf_xfer {
 	u8				state;	/* slot state, see below */
 	bool				is_tx;
+	bool				mapped;	/* attach+map established */
 	struct dma_buf			*dmabuf;
 	struct dma_buf_attachment	*attach;
 	struct sg_table			*sgt;
