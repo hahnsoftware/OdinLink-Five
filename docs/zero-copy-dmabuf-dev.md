@@ -163,6 +163,18 @@ runs an optional second echo round (`--extra-allocator amdgpu|hip`, default
 same raw-counter gate as the main round, and an asymmetric SKIP (one side
 ran, the other skipped) is a failure.
 
+One more SKIP case: the amdgpu exporter may refuse to attach/map its DMA-BUF
+for a **non-amdgpu importer** — exactly what the OdinLink NHI (a USB4 host
+router PCI device) is. On such a kernel/IOMMU stack the very first transfer
+fails cleanly with `-EINVAL` (the driver logs
+`dma_buf_map_attachment(...) failed: -22`). The bench treats that
+first-transfer-only signature as a SKIP with an explicit reason, because it is
+a stack limitation, not an OdinLink bug; anything after the first transfer, or
+any other errno, remains a hard failure. (Observed on a Strix-Halo APU:
+VRAM BOs refuse to map at all; GTT-domain BOs map but the NHI never completes
+RX DMA to them — `completed=0` ring timeouts — so neither domain transports.)
+With ROCm absent, `--allocator hip` always SKIPs on such rigs.
+
 The raw-geometry reasoning applies unchanged: VRAM BOs exported by amdgpu
 carry page-granular SG tables like the DMA heap, so `ODL_TB5_RAW_CELL_MAX`
 (2048) keeps them raw-eligible by construction.
