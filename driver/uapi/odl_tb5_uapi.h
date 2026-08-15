@@ -89,6 +89,24 @@ typedef int64_t  __s64;
 #define ODL_TB5_FRAME_LEN_MAX        (ODL_TB5_FRAME_SIZE - ODL_TB5_FRAME_TAIL_RESERVE)
 #define ODL_TB5_STREAM_PAYLOAD_MAX   (ODL_TB5_FRAME_LEN_MAX - ODL_TB5_STREAM_HDR_SIZE)
 
+/*
+ * Raw zero-copy DMA-buf cell size.
+ *
+ * The raw path points the NHI directly at the exporter's pages, so a cell
+ * can never merge across two SG entries that are not physically contiguous.
+ * DMA-heap and GPU exporters hand back SG tables whose entries are
+ * page-granular (every entry a multiple of PAGE_SIZE).  A raw cell must be a
+ * power of two that divides PAGE_SIZE: only then is every SG boundary also a
+ * cell boundary, the "all cells full except the tail" raw-geometry gate holds
+ * for real heap layouts, and both importers chunk deterministically in `len`
+ * alone.  The full 4096-byte frame cannot be a cell (the 12-bit NHI length
+ * field wraps 4096 to 0 and transmits empty), so 2048 is the largest valid
+ * power-of-two cell.  A 4032-byte cell (FRAME_LEN_MAX) leaves a 64-byte
+ * residue per 4K page, which the geometry gate rejects — see the regression
+ * test tests/odl_tb5_raw_geom_test.c.
+ */
+#define ODL_TB5_RAW_CELL_MAX        (ODL_TB5_FRAME_SIZE / 2)
+
 #define ODL_TB5_STREAM_ID_CTRL       0
 #define ODL_TB5_STREAM_ID_MAX        255
 

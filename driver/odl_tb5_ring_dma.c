@@ -1896,11 +1896,14 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 	 * an impossible transfer here: mapping a grossly oversized buffer can
 	 * invalidate live NHI translations even though no ring descriptor is
 	 * eventually posted.  The SG-layout preflight below still handles
-	 * smaller buffers whose segment boundaries need extra descriptors. */
+	 * smaller buffers whose segment boundaries need extra descriptors.
+	 * FRAME_LEN_MAX is the largest payload a single ring slot has ever
+	 * carried (raw cells are RAW_CELL_MAX, framed payload cells
+	 * STREAM_PAYLOAD_MAX, both smaller), so it is a valid per-slot bound
+	 * regardless of the negotiated raw mode. */
 	{
 		u64 capacity = 0;
-		size_t frame_max = raw ? ODL_TB5_FRAME_LEN_MAX
-				      : ODL_TB5_STREAM_PAYLOAD_MAX;
+		size_t frame_max = ODL_TB5_FRAME_LEN_MAX;
 		int first = ndp ? 1 : 0;
 		int last = ndp ? ndp : 0;
 
@@ -2017,7 +2020,7 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 	}
 
 	/* Capacity preflight over the mapped layout.  DMA segments can end
-	 * before FRAME_LEN_MAX, so DIV_ROUND_UP(len, FRAME_LEN_MAX) undercounts when a
+	 * mid-cell, so DIV_ROUND_UP(len, cell-max) undercounts when a
 	 * transfer crosses scatterlist boundaries.  Mirror the real chunking and
 	 * block-stripe choice, then compare each selected direction/ring before
 	 * posting even one descriptor.  In the shared RX fallback the admission
@@ -2031,8 +2034,8 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 		ODL_STAT_INC(dev, raw_unaligned_fallback);
 	}
 	{
-		/* First pass: candidate raw chunking (4032 cells).  The gate
-		 * verdict and the descriptor counts must come from the SAME
+		/* First pass: candidate raw chunking (RAW_CELL_MAX cells).  The
+		 * gate verdict and the descriptor counts must come from the SAME
 		 * geometry that the submit loop will actually use, so when the
 		 * gate fails we re-walk with the framed cap instead of
 		 * patching counts after the fact. */
@@ -2040,10 +2043,20 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 			ret = odl_tb5_dmabuf_walk(sgt, offset, len, ndp,
 						  is_tx, dev, rx_pool_posted,
 						  rx_shared,
-						  ODL_TB5_FRAME_LEN_MAX,
+						  ODL_TB5_RAW_CELL_MAX,
 						  needed, &raw_ok);
-			if (ret)
+			if (ret == -ENOSPC) {
+				/* Raw cells are half the size of framed payload
+				 * cells, so a ring that cannot hold the raw
+				 * descriptor count may still fit the same
+				 * transfer framed.  Fall back rather than
+				 * failing a transfer that would otherwise go
+				 * through (the shared `if (!raw_ok)` path below
+				 * re-walks with the framed cap). */
+				raw_ok = false;
+			} else if (ret) {
 				goto err_unmap;
+			}
 			if (!raw_ok) {
 				ODL_STAT_INC(dev, raw_eligible_reject);
 				memset(needed, 0, sizeof(needed));
@@ -2162,9 +2175,9 @@ static int odl_tb5_dmabuf_submit(struct odl_tb5_device *dev,
 				goto err_unmap;
 			}
 
-chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
-					    : (size_t)ODL_TB5_STREAM_PAYLOAD_MAX,
-				     sg_remaining, total_remaining);
+chunk = min3(raw_ok ? (size_t)ODL_TB5_RAW_CELL_MAX
+				    : (size_t)ODL_TB5_STREAM_PAYLOAD_MAX,
+			     sg_remaining, total_remaining);
 			bounce = &stage[stage_count];
 			if (stage_count >= total_needed) {
 				/* The submit loop must never outrun the walk's
@@ -2204,8 +2217,9 @@ chunk = min3(raw_ok ? (size_t)ODL_TB5_FRAME_LEN_MAX
 					/* Advertise the complete 4096-byte cell
 					 * (encoded as zero in the 12-bit NHI
 					 * descriptor).  The peer transmits at
-					 * most FRAME_LEN_MAX, so the 64-byte
-					 * residue margin matches pool slots. */
+					 * most RAW_CELL_MAX (2048), well inside
+					 * the advertised slot, so the descriptor
+					 * cannot be overrun. */
 					bounce->frame.size = 0;
 					bounce->frame.callback =
 						odl_tb5_rx_dmabuf_raw_callback;
