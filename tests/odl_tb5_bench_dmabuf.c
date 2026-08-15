@@ -71,7 +71,6 @@ struct amdgpu_bo_alloc_request {
 	uint64_t flags;
 };
 #define AMDGPU_GEM_DOMAIN_VRAM         0x1
-#define AMDGPU_GEM_DOMAIN_GTT          0x2
 #define AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED 0x2000
 #define AMDGPU_BO_HANDLE_TYPE_DMA_BUF_FD 2
 
